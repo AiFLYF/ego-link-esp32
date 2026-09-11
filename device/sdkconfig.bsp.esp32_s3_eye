@@ -1,0 +1,62 @@
+# This file was generated using idf.py save-defconfig. It can be edited manually.
+# Espressif IoT Development Framework (ESP-IDF) Project Minimal Configuration
+#
+CONFIG_IDF_TARGET="esp32s3"
+CONFIG_BSP_SELECT_ESP32_S3_EYE=y
+
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+CONFIG_BSP_DISPLAY_LVGL_TICK=5
+CONFIG_BSP_DISPLAY_LVGL_MAX_SLEEP=500
+CONFIG_CODEC_I2C_BACKWARD_COMPATIBLE=n
+
+# Custom partition table (3 MB app for WiFi + LVGL)
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# PSRAM (Octal) - used for LVGL canvas framebuffer
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+
+# FreeRTOS / main task headroom for the fluid + render task
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=6144
+CONFIG_FREERTOS_HZ=1000
+
+# Allow multiple SNTP servers (Aliyun primary + fallbacks)
+CONFIG_LWIP_SNTP_MAX_SERVERS=3
+
+# Newlib float printf (digital clock / debug)
+CONFIG_NEWLIB_NANO_FORMAT=n
+
+## LVGL9 ##
+CONFIG_LV_CONF_SKIP=y
+CONFIG_LV_BUILD_EXAMPLES=n
+
+#CLIB default
+CONFIG_LV_USE_CLIB_MALLOC=y
+CONFIG_LV_USE_CLIB_SPRINTF=y
+CONFIG_LV_USE_CLIB_STRING=y
+
+# Fonts used by the watch face
+CONFIG_LV_FONT_MONTSERRAT_12=y
+CONFIG_LV_FONT_MONTSERRAT_14=y
+CONFIG_LV_FONT_MONTSERRAT_16=y
+CONFIG_LV_FONT_MONTSERRAT_20=y
+CONFIG_LV_FONT_MONTSERRAT_28=y
+
+# Performance monitor (overlay disabled: no on-screen FPS/CPU counter)
+CONFIG_LV_USE_OBSERVER=y
+CONFIG_LV_USE_SYSMON=y
+# CONFIG_LV_USE_PERF_MONITOR is not set
+
+## LVGL8 - uncomment, when using LVGL8 ##
+# CONFIG_LV_USE_PERF_MONITOR=y
+# CONFIG_LV_COLOR_16_SWAP=y
+# CONFIG_LV_MEM_CUSTOM=y
+# CONFIG_LV_MEMCPY_MEMSET_STD=y
+# CONFIG_LV_SPRINTF_CUSTOM=y
+
+
+# CJK font so the UI can show Chinese AI replies (LVGL built-in)
+CONFIG_LV_USE_TINY_TTF=y

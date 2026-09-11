@@ -1,0 +1,5 @@
+description: ESP32-S3-EYE custom watch face with FLIP fluid simulation
+
+dependencies:
+  espressif/esp32_s3_eye:
+    version: '*'

@@ -1,0 +1,34 @@
+menu "RW1 AI Interaction (board to PC server)"
+
+    config RW1_WIFI_SSID
+        string "WiFi SSID"
+        default "your-ssid"
+        help
+            SSID of the network the board joins. The PC running server.py
+            must be reachable on this network. Set your own value via
+            `idf.py menuconfig` (kept in the local, git-ignored sdkconfig).
+
+    config RW1_WIFI_PASSWORD
+        string "WiFi Password"
+        default "your-password"
+        help
+            WiFi password. Leave empty for an open network.
+
+    config RW1_WIFI_MAX_RETRY
+        int "Maximum connection retries"
+        default 8
+
+    config RW1_SERVER_URL
+        string "PC server base URL"
+        default "http://192.168.1.100:8000"
+        help
+            Base URL of the PC server (server.py). Use the PC's LAN IPv4
+            (ipconfig -> WLAN), NOT 127.0.0.1. Set your own via menuconfig.
+
+    config RW1_TELEMETRY_PERIOD_MS
+        int "Telemetry period (ms)"
+        default 500
+        help
+            How often the board POSTs an IMU sample to the server.
+
+endmenu

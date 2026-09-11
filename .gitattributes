@@ -1,0 +1,12 @@
+# Windows batch scripts need CRLF; everything else normalises to LF.
+*.bat text eol=crlf
+*.py  text eol=lf
+*.c   text eol=lf
+*.h   text eol=lf
+*.md  text eol=lf
+*.yml text eol=lf
+*.txt text eol=lf
+*.csv text eol=lf
+*.lock text eol=lf
+sdkconfig.* text eol=lf
+* binary

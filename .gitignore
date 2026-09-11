@@ -1,0 +1,22 @@
+# ---- ESP-IDF build system -------------------------------------------
+device/build/
+device/managed_components/
+device/sdkconfig
+device/sdkconfig.old
+device/.cache/
+
+# generated CJK font subset (run tools/gen_font.py to recreate;
+# see NOTICE about system-font licensing — never commit it)
+device/main/rw1_font.c
+device/main/rw1_font.h
+
+# ---- Python ----------------------------------------------------------
+__pycache__/
+*.pyc
+*.tmp
+
+# ---- editor / OS noise ------------------------------------------------
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini

@@ -1,0 +1,19 @@
+Third-party notices
+===================
+
+This project links against components that carry their own licenses:
+
+- ESP-IDF (Espressif Systems)            Apache-2.0
+- LVGL 9.x                                MIT
+- espressif/esp32_s3_eye BSP, esp_lvgl_port, button, led_* (ESP Component
+  Registry managed components)             Apache-2.0 / MIT (see each component)
+
+CJK font (IMPORTANT)
+--------------------
+`tools/gen_font.py` subsets a font **from your own machine**
+(default: C:\Windows\Fonts\simhei.ttf, Microsoft copyright; the resulting
+`device/main/rw1_font.c` is therefore GIT-IGNORED and must NOT be published).
+Commercial/redistributable use: point FONT_IN at an open-license font you
+download instead, e.g. Source Han Sans SC / Noto Sans SC (SIL OFL 1.1) or
+WenQuanYi (GPL+font-exception), and re-run the script. The firmware only
+requires the generated file to be present at build time.
