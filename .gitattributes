@@ -10,3 +10,16 @@
 *.lock text eol=lf
 sdkconfig.* text eol=lf
 * binary
+
+# ---- web assets（GitHub Pages 站点根目录 docs/）--------------------------
+# 注意：必须放在 `* binary` 之后才会生效（gitattributes 后写覆盖先写）
+*.html text diff eol=lf
+*.css  text diff eol=lf
+*.js   text diff eol=lf
+*.json text diff eol=lf
+*.svg  text diff eol=lf
+.gitattributes text diff eol=lf
+.gitignore text diff eol=lf
+
+# vendored 第三方产物不参与文本 diff（three.js + 自托管字体）
+docs/vendor/** binary

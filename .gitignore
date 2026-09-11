@@ -20,3 +20,6 @@ __pycache__/
 .idea/
 Thumbs.db
 Desktop.ini
+
+# ---- assistant workspace data ----------------------------------------
+.workbuddy-ai/
