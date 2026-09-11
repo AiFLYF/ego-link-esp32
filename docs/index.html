@@ -9,6 +9,12 @@
 <link rel="icon" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><circle cx='16' cy='16' r='6' fill='%232ee6c5'/><circle cx='16' cy='16' r='12' fill='none' stroke='%234aa8ff' stroke-width='1.5' opacity='.7'/><circle cx='16' cy='16' r='2' fill='%23ffb454'/></svg>">
 
 <link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin>
+<noscript><style>
+/* JS 被禁用时不要让加载遮罩把页面永久盖住 */
+#loader{display:none!important}
+body.is-loading{overflow:auto}
+body.is-loading .rv{opacity:1!important;transform:none!important;filter:none!important}
+</style></noscript>
 <style>
 /* ===================== fonts (self-hosted) ===================== */
 @font-face{font-family:"Sora";src:url("vendor/fonts/sora-400.woff2") format("woff2");font-weight:400;font-display:swap}
@@ -73,6 +79,31 @@ section{padding:104px 0;position:relative;z-index:2}
 .sec-head h2 .g{background:linear-gradient(96deg,#eaf2fb 10%,var(--teal) 55%,var(--cyan) 95%);
   -webkit-background-clip:text;background-clip:text;color:transparent}
 .sec-lede{color:var(--dim);max-width:64ch;font-size:15.5px}
+
+/* ===================== loader ===================== */
+#loader{position:fixed;inset:0;z-index:200;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:22px;
+  background:radial-gradient(900px 600px at 50% 42%,#0b141f,var(--bg) 72%);
+  transition:opacity .75s var(--ease),transform .75s var(--ease),visibility .75s}
+#loader.done{opacity:0;transform:scale(1.04);pointer-events:none;visibility:hidden}
+.l-core{position:relative;width:76px;height:76px;display:grid;place-items:center}
+.l-core i{position:absolute;border-radius:50%;border:1px solid rgba(150,190,225,.10)}
+.l-core .r1{inset:0;border-top-color:var(--teal);border-right-color:rgba(46,230,197,.32);animation:spin 1.05s linear infinite}
+.l-core .r2{inset:12px;border-bottom-color:var(--cyan);border-left-color:rgba(74,168,255,.32);animation:spin 1.6s linear infinite reverse}
+.l-core .d{width:10px;height:10px;border-radius:50%;background:var(--teal);box-shadow:0 0 20px var(--teal);animation:blink 1.4s ease-in-out infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+.l-brand{font:800 18px/1 var(--font-display);letter-spacing:.05em;color:var(--ink)}
+.l-brand b{color:var(--teal)}
+.l-bar{position:relative;width:232px;height:2px;background:rgba(150,190,225,.14);border-radius:2px;overflow:hidden}
+.l-bar i{position:absolute;inset:0;transform-origin:0 50%;transform:scaleX(0);border-radius:2px;
+  background:linear-gradient(90deg,var(--teal),var(--cyan));box-shadow:0 0 12px rgba(46,230,197,.55)}
+.l-meta{display:flex;align-items:center;gap:9px;font:500 11px/1 var(--font-mono);letter-spacing:.2em;
+  text-transform:uppercase;color:var(--faint)}
+.l-meta .n{color:var(--teal);font-variant-numeric:tabular-nums;min-width:30px;text-align:right}
+.l-meta .s{opacity:.4}
+body.is-loading{overflow:hidden}
+body.is-loading #scene{opacity:0}
+body.is-loading .rv{opacity:0!important;transform:translateY(24px)!important;filter:blur(8px)!important;transition:none!important}
+#scene{transition:opacity 1.2s var(--ease) .05s}
 
 /* ===================== nav ===================== */
 nav{position:fixed;top:0;left:0;right:0;z-index:70;display:flex;align-items:center;gap:22px;
@@ -297,7 +328,15 @@ footer .note{max-width:72ch;line-height:1.75;margin-top:18px;font-size:12.5px;co
 }
 </style>
 </head>
-<body>
+<body class="is-loading">
+
+<!-- ================= 加载过渡 ================= -->
+<div id="loader" role="status" aria-label="页面加载中">
+  <div class="l-core" aria-hidden="true"><i class="r1"></i><i class="r2"></i><i class="d"></i></div>
+  <div class="l-brand">Ego<b>·</b>Link</div>
+  <div class="l-bar" aria-hidden="true"><i></i></div>
+  <div class="l-meta" aria-hidden="true"><span class="n">0</span><span class="s">%</span><span class="s">·</span><span class="t">BOOT</span></div>
+</div>
 
 <div class="amb" aria-hidden="true">
   <div class="orb a"></div><div class="orb b"></div><div class="orb c"></div>
@@ -499,6 +538,57 @@ if (typeof THREE === 'undefined') {
   var reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
   var root = document.documentElement;
 
+  /* ---- 首屏加载过渡：进度由真实信号驱动（字体 / load / 首帧渲染） ---- */
+  (function () {
+    var L = document.getElementById('loader');
+    if (!L) return;
+    var pct = L.querySelector('.l-meta .n'), bar = L.querySelector('.l-bar i'), txt = L.querySelector('.l-meta .t');
+    var p = 0, target = 0, finished = false, t0 = performance.now();
+    var MIN = reduce ? 0 : 900;                 /* 最短展示时长，避免一闪而过 */
+    function bump(v) { if (v > target) target = v; }
+    function label(v) { return v < 45 ? 'BOOT' : (v < 85 ? 'ASSETS' : 'RENDER'); }
+    function paint() {
+      if (bar) bar.style.transform = 'scaleX(' + (p / 100) + ')';
+      if (pct) pct.textContent = Math.round(p);
+      if (txt) txt.textContent = label(p);
+    }
+    function finish() {
+      if (finished) return; finished = true;
+      p = 100; paint();
+      document.body.classList.remove('is-loading');
+      document.body.classList.add('loaded');
+      L.classList.add('done');
+      setTimeout(function () { if (L.parentNode) L.parentNode.removeChild(L); }, 950);
+    }
+    if (document.fonts && document.fonts.ready) document.fonts.ready.then(function () { bump(45); });
+    else bump(45);
+    window.addEventListener('load', function () { bump(78); });
+    window.addEventListener('hero:ready', function () { bump(100); });   /* 3D 场景画完第一帧 */
+    setTimeout(function () { bump(55); }, 500);                          /* 兜底：防止信号不来卡死 */
+    setTimeout(function () { bump(88); }, 1500);
+    setTimeout(function () { bump(100); }, 3200);
+
+    /* 进度推进必须与帧率无关：页面空闲时 rAF 会被节流到个位数帧率，
+       按帧固定步长推进会导致加载条卡在 90% 迟迟不收场。 */
+    var last = performance.now();
+    function frame(now) {
+      if (finished) return;
+      var dt = Math.min(0.25, (now - last) / 1000); last = now;
+      if (reduce) p = target;                                  /* 尊重减少动效：不做缓动 */
+      else {
+        var k = 1 - Math.pow(1 - 0.12, dt * 60);               /* 与帧率无关的指数逼近 */
+        p += (target - p) * k;
+      }
+      if (target >= 100 && p > 98) p = 100;
+      paint();
+      var elapsed = performance.now() - t0;
+      if (p >= 100 && elapsed >= MIN) { finish(); return; }
+      if (elapsed > 5200) { finish(); return; }                /* 硬上限：绝不把用户困住 */
+      requestAnimationFrame(frame);
+    }
+    requestAnimationFrame(frame);
+  })();
+
   /* ---- 揭示动画 ---- */
   var rvs = document.querySelectorAll('.rv');
   if ('IntersectionObserver' in window && !reduce) {
@@ -597,11 +687,18 @@ if (typeof THREE === 'undefined') {
    自实现 bloom（亮部提取 → 两级高斯 → 合成 + 暗角 + 颗粒）
    ================================================================ */
 (function () {
+  function boot() {
   var canvas = document.getElementById('scene');
   if (!canvas) return;
   var reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 
-  if (typeof THREE === 'undefined' || !window.WebGLRenderingContext) { document.documentElement.classList.add('no-webgl'); return; }
+  /* 通知加载遮罩：场景已就绪（或已降级），可以收起来了 */
+  function heroReady() {
+    try { window.dispatchEvent(new CustomEvent('hero:ready')); }
+    catch (e) { var ev = document.createEvent('Event'); ev.initEvent('hero:ready', true, true); window.dispatchEvent(ev); }
+  }
+
+  if (typeof THREE === 'undefined' || !window.WebGLRenderingContext) { document.documentElement.classList.add('no-webgl'); heroReady(); return; }
 
   var renderer, scene, camera, root, clock, W = 0, H = 0, running = true, visible = true;
   var uniforms = [];
@@ -609,7 +706,7 @@ if (typeof THREE === 'undefined') {
 
   try {
     renderer = new THREE.WebGLRenderer({ canvas: canvas, antialias: false, alpha: false, powerPreference: 'high-performance' });
-  } catch (e) { document.documentElement.classList.add('no-webgl'); return; }
+  } catch (e) { document.documentElement.classList.add('no-webgl'); heroReady(); return; }
 
   var DPR = Math.min(window.devicePixelRatio || 1, 1.75);
   renderer.setPixelRatio(DPR);
@@ -977,6 +1074,7 @@ if (typeof THREE === 'undefined') {
     matComp.uniforms.uTime.value = t;
     renderer.setRenderTarget(null);
     blit(matComp, null);
+    if (!draw.fired) { draw.fired = true; heroReady(); }   /* 第一帧真正上屏 */
   }
 
   function loop() {
@@ -999,6 +1097,13 @@ if (typeof THREE === 'undefined') {
   } else {
     loop();
   }
+  }
+
+  /* 让加载遮罩先画出一帧再做重量级 WebGL 初始化：
+     否则 three.js 编译着色器会占满主线程，进度条会僵在 0% 然后突然跳到 100%。 */
+  function start() { requestAnimationFrame(function () { requestAnimationFrame(boot); }); }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start);
+  else start();
 })();
 </script>
 
