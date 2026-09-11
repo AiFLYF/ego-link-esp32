@@ -1,0 +1,447 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Ego Link 教学版：ESP32-S3-EYE 板载 IMU 与电脑服务器的实时 AI 交互闭环 —— 《AI交互原型与用户体验设计》18 周课程项目主页。">
+<title>Ego Link · 随身智能终端教学版</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Sora:wght@400;600;700;800&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<style>
+/* ============ tokens ============ */
+:root{
+  --bg:#0a0e14; --panel:#10161f; --panel-2:#0d131b; --line:rgba(148,180,214,.14);
+  --ink:#e6edf3; --dim:#93a1b0; --faint:#5c6b7a;
+  --teal:#37c8b0; --teal-dim:rgba(55,200,176,.16); --amber:#e8a33d; --amber-dim:rgba(232,163,61,.14);
+  --code-bg:#0b1018; --chip:#141c27;
+  --font-display:"Sora","PingFang SC","Microsoft YaHei","Noto Sans CJK SC",sans-serif;
+  --font-body:"Sora","PingFang SC","Microsoft YaHei","Noto Sans CJK SC",sans-serif;
+  --font-mono:"IBM Plex Mono","Cascadia Mono",Consolas,"PingFang SC","Microsoft YaHei",monospace;
+  --maxw:1060px;
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{
+  margin:0; background:var(--bg); color:var(--ink);
+  font:400 16px/1.75 var(--font-body);
+  -webkit-font-smoothing:antialiased;
+}
+::selection{background:var(--teal);color:#04241e}
+a{color:var(--teal);text-decoration:none}
+a:focus-visible{outline:2px solid var(--amber);outline-offset:3px;border-radius:2px}
+h1,h2,h3{font-family:var(--font-display);text-wrap:balance;margin:0}
+p{margin:0}
+code,kbd{font-family:var(--font-mono)}
+.eyebrow{font:600 12px/1 var(--font-mono);letter-spacing:.18em;text-transform:uppercase;color:var(--teal)}
+.wrap{max-width:var(--maxw);margin:0 auto;padding:0 24px}
+section{padding:88px 0}
+section+section{border-top:1px solid var(--line)}
+.sec-head{display:flex;align-items:baseline;gap:16px;margin-bottom:14px}
+.sec-head h2{font-size:clamp(24px,3.4vw,32px);font-weight:700;letter-spacing:-.01em}
+.sec-lede{color:var(--dim);max-width:62ch;margin-bottom:44px}
+
+/* ============ nav ============ */
+nav{position:sticky;top:0;z-index:50;display:flex;align-items:center;gap:22px;
+  padding:13px 24px;background:rgba(10,14,20,.82);backdrop-filter:blur(10px);
+  border-bottom:1px solid var(--line)}
+nav .brand{font:800 17px/1 var(--font-display);letter-spacing:.01em;color:var(--ink)}
+nav .brand b{color:var(--teal)}
+nav .links{display:flex;gap:20px;margin-left:auto;overflow-x:auto;scrollbar-width:none}
+nav .links::-webkit-scrollbar{display:none}
+nav .links a{font:500 12.5px/1 var(--font-mono);color:var(--dim);white-space:nowrap;padding:4px 0}
+nav .links a:hover{color:var(--ink)}
+nav .gh{font:600 12.5px/1 var(--font-mono);color:#04241e!important;background:var(--teal);
+  padding:8px 14px;border-radius:6px;white-space:nowrap}
+nav .gh:hover{filter:brightness(1.12)}
+
+/* ============ hero ============ */
+.hero{position:relative;min-height:640px;display:flex;align-items:flex-end;overflow:hidden;
+  background:radial-gradient(1200px 620px at 70% 18%,#0e1621 0%,var(--bg) 62%);
+  padding:0;border-top:none}
+#scene{position:absolute;inset:0;width:100%;height:100%;display:block}
+.hero-copy{position:relative;z-index:2;max-width:var(--maxw);margin:0 auto;padding:120px 24px 30px;width:100%}
+.hero h1{font-size:clamp(34px,6vw,60px);font-weight:800;letter-spacing:-.02em;line-height:1.16;margin:18px 0 20px}
+.hero h1 em{font-style:normal;color:var(--teal)}
+.hero .lead{color:var(--dim);font-size:clamp(15px,1.7vw,18px);max-width:56ch}
+.stats{display:flex;flex-wrap:wrap;gap:10px;margin-top:30px}
+.stat{border:1px solid var(--line);border-radius:8px;padding:10px 16px;background:rgba(13,19,27,.72)}
+.stat b{display:block;font:600 20px/1.2 var(--font-mono);color:var(--ink);font-variant-numeric:tabular-nums}
+.stat span{font:500 11px/1.5 var(--font-mono);letter-spacing:.08em;color:var(--faint);text-transform:uppercase}
+.hero-fallback{position:absolute;inset:0;display:none;align-items:center;justify-content:center;
+  font:500 13px/1.6 var(--font-mono);color:var(--faint);text-align:center;padding:24px}
+.no3d #scene{display:none}.no3d .hero-fallback{display:flex}
+
+/* ============ loop steps ============ */
+.flow{display:grid;grid-template-columns:repeat(5,1fr);gap:14px;margin-bottom:44px}
+.fstep{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:18px 16px;position:relative}
+.fstep .no{font:600 11px/1 var(--font-mono);color:var(--faint);letter-spacing:.14em}
+.fstep h3{font-size:15.5px;font-weight:600;margin:10px 0 6px}
+.fstep p{font-size:13px;color:var(--dim);line-height:1.65}
+.fstep.up{border-bottom:2px solid var(--teal)}
+.fstep.down{border-bottom:2px solid var(--amber)}
+.fstep:not(:last-child)::after{content:"→";position:absolute;right:-13px;top:50%;transform:translateY(-50%);
+  color:var(--faint);font-size:14px;z-index:1}
+.payloads{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+pre{margin:0;background:var(--code-bg);border:1px solid var(--line);border-radius:10px;
+  padding:16px 18px;font:400 12.5px/1.8 var(--font-mono);color:#c9d7e4;overflow-x:auto}
+pre .k{color:var(--teal)} pre .s{color:var(--amber)} pre .c{color:var(--faint)}
+.plabel{display:flex;align-items:center;gap:8px;margin-bottom:8px;
+  font:600 11px/1 var(--font-mono);letter-spacing:.14em;text-transform:uppercase;color:var(--faint)}
+.plabel i{width:8px;height:8px;border-radius:50%;background:var(--teal)}
+.plabel.ret i{background:var(--amber)}
+
+/* ============ features ============ */
+.feats{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}
+.feat{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:22px 20px}
+.feat h3{font-size:16px;font-weight:600;margin:0 0 8px}
+.feat p{font-size:13.5px;color:var(--dim)}
+.feat code{font-size:12px;background:var(--chip);border:1px solid var(--line);border-radius:4px;padding:1px 6px;color:#bcd2e2}
+.feat .tag{display:inline-block;font:600 10.5px/1 var(--font-mono);letter-spacing:.12em;text-transform:uppercase;
+  color:var(--teal);background:var(--teal-dim);border-radius:4px;padding:5px 8px;margin-bottom:14px}
+.feat.a .tag{color:var(--amber);background:var(--amber-dim)}
+
+/* ============ quickstart ============ */
+.qs{counter-reset:qs;display:grid;gap:14px}
+.qs-item{display:grid;grid-template-columns:44px 1fr;gap:16px;align-items:start}
+.qs-item .n{width:36px;height:36px;border:1px solid var(--line);border-radius:8px;display:flex;align-items:center;justify-content:center;
+  font:600 15px/1 var(--font-mono);color:var(--teal);background:var(--panel)}
+.qs-item h3{font-size:15px;font-weight:600;margin:8px 0 8px}
+.qs-item pre{padding:12px 16px;line-height:1.9}
+
+/* ============ api table ============ */
+.tbl-scroll{overflow-x:auto;border:1px solid var(--line);border-radius:10px}
+table{border-collapse:collapse;width:100%;min-width:640px;background:var(--panel-2)}
+th,td{text-align:left;padding:12px 16px;border-bottom:1px solid var(--line);font-size:13.5px}
+th{font:600 11px/1.5 var(--font-mono);letter-spacing:.12em;text-transform:uppercase;color:var(--faint)}
+tr:last-child td{border-bottom:none}
+td.m{font:600 12.5px/1.6 var(--font-mono);color:var(--teal);white-space:nowrap}
+td.p{font:500 13px/1.6 var(--font-mono);color:#c9d7e4;white-space:nowrap}
+td{color:var(--dim)}
+
+/* ============ roadmap ============ */
+.tl{display:grid;gap:0;border-left:1px solid var(--line);margin-left:8px}
+.tl .row{display:grid;grid-template-columns:120px 1fr;gap:18px;padding:14px 0 14px 26px;position:relative}
+.tl .row::before{content:"";position:absolute;left:-4.5px;top:22px;width:8px;height:8px;border-radius:50%;
+  background:var(--bg);border:1.5px solid var(--faint)}
+.tl .row.done::before{background:var(--teal);border-color:var(--teal);box-shadow:0 0 12px rgba(55,200,176,.5)}
+.tl .w{font:600 12px/2 var(--font-mono);letter-spacing:.1em;color:var(--faint);text-transform:uppercase}
+.tl .row.done .w{color:var(--teal)}
+.tl .t{font-size:14.5px;color:var(--dim)}
+.tl .row.done .t{color:var(--ink);font-weight:600}
+.tl .chip{display:inline-block;margin-left:10px;font:600 10.5px/1 var(--font-mono);letter-spacing:.1em;
+  color:#04241e;background:var(--teal);border-radius:4px;padding:4px 8px;vertical-align:1px}
+
+/* ============ footer ============ */
+footer{border-top:1px solid var(--line);padding:36px 0 56px;color:var(--faint);font-size:13px}
+footer .cols{display:flex;flex-wrap:wrap;gap:14px 34px;justify-content:space-between;align-items:baseline}
+footer .note{max-width:70ch;line-height:1.7;margin-top:14px;font-size:12.5px}
+
+/* ============ motion & responsive ============ */
+@media (prefers-reduced-motion: reduce){html{scroll-behavior:auto}*{animation:none!important;transition:none!important}}
+@media (max-width:900px){
+  .flow{grid-template-columns:1fr 1fr}.fstep::after{display:none}
+  .feats{grid-template-columns:1fr 1fr}.payloads{grid-template-columns:1fr}
+}
+@media (max-width:600px){
+  section{padding:60px 0}
+  .flow,.feats{grid-template-columns:1fr}
+  .hero{min-height:560px}.hero-copy{padding-top:96px}
+  .qs-item{grid-template-columns:36px 1fr}
+  .tl .row{grid-template-columns:1fr;gap:4px}
+}
+</style>
+</head>
+<body>
+
+<nav>
+  <span class="brand">Ego<b>·</b>Link</span>
+  <div class="links">
+    <a href="#loop">闭环</a><a href="#features">亮点</a><a href="#quickstart">上手</a><a href="#api">接口</a><a href="#roadmap">18周路线</a>
+  </div>
+  <a class="gh" href="https://github.com/AiFLYF/ego-link-esp32">GitHub ↗</a>
+</nav>
+
+<!-- ================= HERO ================= -->
+<header class="hero">
+  <canvas id="scene" aria-hidden="true"></canvas>
+  <div class="hero-fallback">three.js 未能加载 —— 数据闭环示意请见下方「闭环」一节。</div>
+  <div class="hero-copy">
+    <p class="eyebrow">AI交互原型与用户体验设计 · 18 周课程项目 · ESP32-S3-EYE</p>
+    <h1>板子动一下，<br>屏幕<em>就有回应</em>。</h1>
+    <p class="lead">板载 SC7A20 加速度计每 500ms 上报真实姿态，你自己的电脑就是 AI 服务器：识别倾斜、晃动、步行与疑似跌落，把分析结果发回 240×240 的 LVGL 小屏 —— 不需要 VPS，服务器只用 Python 标准库。</p>
+    <div class="stats">
+      <div class="stat"><b>500 ms</b><span>上报周期</span></div>
+      <div class="stat"><b>±16 g</b><span>SC7A20 量程</span></div>
+      <div class="stat"><b>8 方向</b><span>姿态识别</span></div>
+      <div class="stat"><b>0 依赖</b><span>服务器 pip 包</span></div>
+      <div class="stat"><b>104 KB</b><span>中文字体子集</span></div>
+    </div>
+  </div>
+</header>
+
+<!-- ================= LOOP ================= -->
+<section id="loop">
+  <div class="wrap">
+    <div class="sec-head"><span class="eyebrow">01 · Data Loop</span><h2>一条真实数据的闭环旅程</h2></div>
+    <p class="sec-lede">每一帧都是板子上真实传感器读出的 g 值 —— 下面两段就是抓包级别的真实载荷。</p>
+    <div class="flow">
+      <div class="fstep up"><span class="no">① 采集</span><h3>IMU 采样</h3><p>SC7A20 三轴读数（WHO_AM_I=0x11 自动识别），换算为 g 并做死区滤波。</p></div>
+      <div class="fstep up"><span class="no">② 上行</span><h3>POST /api/telemetry</h3><p>esp_http_client 每 500ms 一帧；断网无限重试，恢复即续传。</p></div>
+      <div class="fstep down"><span class="no">③ 分析</span><h3>服务器 AI</h3><p>8s 滑动窗口：倾角八方向、峰值计步、方差判晃动 → 活动标签。</p></div>
+      <div class="fstep down"><span class="no">④ 回屏</span><h3>响应即下行</h3><p>activity + AI 回复随响应返回，UTF-8 安全截断后渲染上屏。</p></div>
+      <div class="fstep down"><span class="no">⑤ 旁观</span><h3>SSE 仪表盘</h3><p>浏览器 GET /：姿态球、|a| 曲线、事件流实时推送，零刷新。</p></div>
+    </div>
+    <div class="payloads">
+      <div>
+        <div class="plabel"><i></i>上行 · board → server（500ms 一帧）</div>
+<pre>{ <span class="k">"x"</span>: 0.02, <span class="k">"y"</span>: -0.98, <span class="k">"z"</span>: 0.11,
+  <span class="k">"source"</span>: <span class="s">"sc7a20"</span>, <span class="k">"ask"</span>: 0 }
+<span class="c">// 按下 BOOT 键 → ask:1, 附提问文本</span>
+<span class="c">// 服务器回 {activity, reply} 供屏显</span></pre>
+      </div>
+      <div>
+        <div class="plabel ret"><i></i>下行 · server → board（同一次请求的响应）</div>
+<pre>{ <span class="k">"ok"</span>: true,
+  <span class="k">"activity"</span>: <span class="s">"步行 · 峰值 4 次/8s"</span>,
+  <span class="k">"reply"</span>: <span class="s">"检测到节律性冲击，像步行。"</span> }
+<span class="c">// 未接大模型时 reply 为规则引擎真实摘要</span>
+<span class="c">// 配 RW1_LLM_API_KEY 自动升级成真 LLM</span></pre>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ================= FEATURES ================= -->
+<section id="features">
+  <div class="wrap">
+    <div class="sec-head"><span class="eyebrow">02 · Highlights</span><h2>六个值得看的工程决定</h2></div>
+    <div class="feats">
+      <div class="feat"><span class="tag">零依赖服务器</span><h3>Python 标准库全家桶</h3><p><code>ThreadingHTTPServer</code> + SSE，不装一个 pip 包就有接收、存储、查询、推送四件套。拿到任何一台电脑 <code>python server.py</code> 即跑。</p></div>
+      <div class="feat a"><span class="tag">可升级的 AI</span><h3>规则先行，大模型即插</h3><p>倾斜/计步/晃动/疑似跌落由滑动窗口规则引擎判定（8s 窗口、阈值可调）；配三个环境变量就换成任意 OpenAI 兼容端点生成回复。</p></div>
+      <div class="feat"><span class="tag">显示工程</span><h3>104KB 字体子集治好乱码</h3><p>LVGL 自带 CJK 演示字体缺字严重。<code>gen_font.py</code> 扫描源码+服务器文案，用 fontTools 从本机字体裁子集，tiny_ttf 运行时渲染 —— 屏显中文一个方块都没有。</p></div>
+      <div class="feat a"><span class="tag">网络鲁棒</span><h3>断网是常态，恢复是自动</h3><p>WiFi 掉线事件驱动重连：前 8 次每 2s、之后每 15s 无限重试；HTTP 失败静默退避。路由器恢复，板子两秒内自己回来，不用碰烧录线。</p></div>
+      <div class="feat"><span class="tag">协议细节</span><h3>响应即通道，不另开连接</h3><p>AI 回复搭载在遥测 POST 的响应体返回（HTTP/1.0 兼容坑已填：ON_DATA 累积器读 body），板端一条连接完成双向通信。</p></div>
+      <div class="feat a"><span class="tag">隐私设计</span><h3>凭据永远不进 git</h3><p>Kconfig 默认值是占位符，真实 WiFi/密码/IP 只存本地 <code>sdkconfig</code>（gitignored）；系统字体产物同样排除 —— clone 即安全，配置走 menuconfig。</p></div>
+    </div>
+  </div>
+</section>
+
+<!-- ================= QUICKSTART ================= -->
+<section id="quickstart">
+  <div class="wrap">
+    <div class="sec-head"><span class="eyebrow">03 · Quickstart</span><h2>四步跑通全流程</h2></div>
+    <p class="sec-lede">需要：一块 ESP32-S3 系开发板（本工程按 S3-EYE 的 240×240 屏写）、ESP-IDF v5.4.x、任意 Python 3.10+。</p>
+    <div class="qs">
+      <div class="qs-item"><span class="n">1</span><div><h3>生成中文字体子集（从你本机字体裁，版权安全）</h3>
+<pre>python tools/gen_font.py</pre></div></div>
+      <div class="qs-item"><span class="n">2</span><div><h3>配置你的 WiFi 与电脑 IP（存在本地 sdkconfig，不会被提交）</h3>
+<pre>cd device
+idf.py -D SDKCONFIG_DEFAULTS=sdkconfig.bsp.esp32_s3_eye menuconfig</pre></div></div>
+      <div class="qs-item"><span class="n">3</span><div><h3>编译烧录（S3-EYE 默认 COM10，按设备管理器改）</h3>
+<pre>cd ..   &amp;   build_device.bat
+flash_device.bat COM10 30</pre></div></div>
+      <div class="qs-item"><span class="n">4</span><div><h3>启动服务器，打开仪表盘，晃一晃板子</h3>
+<pre>python server\server.py
+# 浏览器 http://localhost:8000/ ; 板子屏幕 2s 内同步出活动标签</pre></div></div>
+    </div>
+  </div>
+</section>
+
+<!-- ================= API ================= -->
+<section id="api">
+  <div class="wrap">
+    <div class="sec-head"><span class="eyebrow">04 · Interface</span><h2>服务器接口一览</h2></div>
+    <div class="tbl-scroll"><table>
+      <thead><tr><th>方法 · 路径</th><th>作用</th><th>载荷 / 返回</th></tr></thead>
+      <tbody>
+        <tr><td class="m">POST /api/telemetry</td><td>板端上报一帧，顺带取回 AI 结果</td><td class="p">{x,y,z,source,ask,q} → {ok,activity,reply}</td></tr>
+        <tr><td class="m">GET /api/latest</td><td>状态快照（供轮询/排错）</td><td class="p">状态 + 8s 样本 + 事件流 JSON</td></tr>
+        <tr><td class="m">GET /api/stream</td><td>SSE 长连接，仪表盘推送</td><td class="p">event: telemetry / activity / ai</td></tr>
+        <tr><td class="m">GET /</td><td>网页仪表盘（深色，零构建）</td><td class="p">HTML</td></tr>
+      </tbody>
+    </table></div>
+  </div>
+</section>
+
+<!-- ================= ROADMAP ================= -->
+<section id="roadmap">
+  <div class="wrap">
+    <div class="sec-head"><span class="eyebrow">05 · Course Roadmap</span><h2>18 周，一个仓库长出来</h2></div>
+    <p class="sec-lede">课程贯穿样例「Ego Link 随身智能终端」：从传感闭环出发，每周叠加一层交互能力，直到期末原型验收。</p>
+    <div class="tl">
+      <div class="row done"><span class="w">Week 1–3</span><span class="t">最小交互闭环与设备反馈 —— 传感采集 / Web 展示 / 远程指令 / 按键物理反馈<span class="chip">W1 ✔ 已跑通</span></span></div>
+      <div class="row"><span class="w">Week 4–6</span><span class="t">自然语言与语音任务交互 —— NL 查询采集、按键说话、澄清与停止</span></div>
+      <div class="row"><span class="w">Week 7–9</span><span class="t">视觉感知与事件反馈 —— 按需取图、推理结果表达、主动询问</span></div>
+      <div class="row"><span class="w">Week 10–12</span><span class="t">多源状态与主动交互 —— 观测 vs 状态、上下文组织、纠错记忆</span></div>
+      <div class="row"><span class="w">Week 13–15</span><span class="t">端云协同与异常恢复 —— 端侧推理、断网补传、迟到任务</span></div>
+      <div class="row"><span class="w">Week 16–18</span><span class="t">体验测试与原型迭代 —— 任务测试、个人项目迁移、现场验收</span></div>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <div class="cols">
+      <span>Ego Link 教学版实现 · FLYF</span>
+      <a href="https://github.com/AiFLYF/ego-link-esp32">github.com/AiFLYF/ego-link-esp32</a>
+      <span>MIT License · ESP-IDF Apache-2.0 · LVGL MIT</span>
+    </div>
+    <p class="note">字体授权说明：固件内的中文字体子集由使用者本机字体生成、不随仓库分发（见 NOTICE）；发布正式固件前请改用开源授权字体（思源黑体 / Noto Sans SC，SIL OFL）重新生成。</p>
+  </div>
+</footer>
+
+<script>
+/* ============ three.js：数据闭环 ============
+   节点=真实部件；上行包节奏 1:1 对应 500ms 遥测周期；
+   |a| 波形为真实尺度合成（静置≈1g，步行峰值≈1.8g）。*/
+(function(){
+  var canvas=document.getElementById('scene');
+  var reduce=window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  function fallback(){document.body.classList.add('no3d');}
+  if(typeof THREE==='undefined'){fallback();return;}
+  var renderer;
+  try{renderer=new THREE.WebGLRenderer({canvas:canvas,antialias:true,alpha:true});}
+  catch(e){fallback();return;}
+  var DPR=Math.min(window.devicePixelRatio||1,2);
+  renderer.setPixelRatio(DPR);
+
+  var scene=new THREE.Scene();
+  scene.fog=new THREE.FogExp2(0x0a0e14,0.0016);
+  var camera=new THREE.PerspectiveCamera(50,1,1,2000);
+  camera.position.set(0,-30,520);
+
+  var root=new THREE.Group();scene.add(root);
+  var TEAL=0x37c8b0,AMBER=0xe8a33d,CYAN=0x59b7e8;
+
+  function label(text,sub,color){
+    var c=document.createElement('canvas');c.width=512;c.height=160;
+    var x=c.getContext('2d');
+    x.textAlign='center';x.textBaseline='middle';
+    x.fillStyle='#dfe9f2';x.font='600 44px "Sora","Microsoft YaHei",sans-serif';
+    x.fillText(text,256,sub?58:80);
+    if(sub){x.fillStyle=color;x.font='500 27px "IBM Plex Mono",Consolas,monospace';x.fillText(sub,256,112);}
+    var t=new THREE.CanvasTexture(c);t.anisotropy=4;
+    var s=new THREE.Sprite(new THREE.SpriteMaterial({map:t,transparent:true,depthWrite:false}));
+    s.scale.set(256,80,1);return s;
+  }
+  function glowTex(hex){
+    var c=document.createElement('canvas');c.width=c.height=128;
+    var x=c.getContext('2d');var g=x.createRadialGradient(64,64,4,64,64,64);
+    var col=new THREE.Color(hex);
+    g.addColorStop(0,'rgba('+col.r*255+','+col.g*255+','+col.b*255+',.9)');
+    g.addColorStop(.35,'rgba('+col.r*255+','+col.g*255+','+col.b*255+',.25)');
+    g.addColorStop(1,'rgba(0,0,0,0)');
+    x.fillStyle=g;x.fillRect(0,0,128,128);return new THREE.CanvasTexture(c);
+  }
+  function node(pos,r,color,txt,sub){
+    var g=new THREE.Group();g.position.copy(pos);
+    g.add(new THREE.Mesh(new THREE.SphereGeometry(r,24,24),
+      new THREE.MeshBasicMaterial({color:0x0e1520})));
+    g.add(new THREE.Mesh(new THREE.SphereGeometry(r*.55,20,20),
+      new THREE.MeshBasicMaterial({color:color})));
+    g.add(new THREE.Mesh(new THREE.RingGeometry(r,r+1.6,48),
+      new THREE.MeshBasicMaterial({color:color,transparent:true,opacity:.45,side:THREE.DoubleSide})));
+    var s=new THREE.Sprite(new THREE.SpriteMaterial({map:glowTex(color),transparent:true,
+      blending:THREE.AdditiveBlending,depthWrite:false}));
+    s.scale.set(r*7,r*7,1);g.add(s);
+    var l=label(txt,sub,'#8fa3b6');l.position.set(0,-r-46,0);g.add(l);
+    root.add(g);return g;
+  }
+  var N={
+    board: node(new THREE.Vector3(-210,110,40),13,TEAL,'ESP32-S3-EYE','SC7A20 · LVGL'),
+    server:new THREE.Vector3(150,140,-30),
+    browser:new THREE.Vector3(210,-80,20),
+    llm:new THREE.Vector3(-60,-170,-80)
+  };
+  node(N.server,15,AMBER,'你的电脑 = 服务器','server.py · stdlib');
+  node(N.browser,11,CYAN,'浏览器仪表盘','SSE · :8000');
+  node(N.llm,9,0x8d6fd1,'大模型（可选）','OpenAI 兼容');
+
+  function edge(a,b,color,curve,up){
+    var m=a.clone().lerp(b,.5);m.z+=curve*(up?1:-1);m.y+=(b.y-a.y)*0+(up?18:-14);
+    var q=new THREE.QuadraticBezierCurve3(a.clone(),m,b.clone());
+    var pts=q.getPoints(48);
+    root.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts),
+      new THREE.LineBasicMaterial({color:color,transparent:true,opacity:.22})));
+    return q;
+  }
+  var E={
+    up:   edge(N.board.position,N.server,TEAL,60,true),      // 遥测 500ms
+    down: edge(N.server,N.board.position,AMBER,60,false),    // 响应回屏
+    sse:  edge(N.server,N.browser,CYAN,-36,true),            // SSE 推送
+    ask:  edge(N.browser,N.server,0x9aa7b4,-36,false),       // 页面操作
+    llmU: edge(N.server,N.llm,0x8d6fd1,-26,true),
+    llmD: edge(N.llm,N.server,0x8d6fd1,-26,false)
+  };
+  function packets(curve,color,count,speed,r){
+    var g=new THREE.Group();root.add(g);var ps=[];
+    var geo=new THREE.SphereGeometry(r||3.4,10,10);
+    var mat=new THREE.MeshBasicMaterial({color:color});
+    for(var i=0;i<count;i++){var m=new THREE.Mesh(geo,mat);m.userData.t=i/count;g.add(m);ps.push(m);}
+    return {ps:ps,curve:curve,speed:speed};
+  }
+  var streams=[
+    packets(E.up,TEAL,3,.0022,3.6),      // 500ms/帧 ≈ 一屏时长3包
+    packets(E.down,AMBER,1,.0009,3.6),
+    packets(E.sse,CYAN,2,.0016,2.6),
+    packets(E.ask,0x7f8b98,1,.0007,2.2),
+    packets(E.llmU,0x8d6fd1,1,.0006,2.0),
+    packets(E.llmD,0x8d6fd1,1,.0006,2.0)
+  ];
+
+  /* |a| 波形：1g 基线 + 步行峰值 bursts */
+  var WPTS=200,wave=new Float32Array(WPTS),waveGeo=new THREE.BufferGeometry();
+  var wpos=new Float32Array(WPTS*3);
+  waveGeo.setAttribute('position',new THREE.BufferAttribute(wpos,3));
+  var wline=new THREE.Line(waveGeo,new THREE.LineBasicMaterial({color:TEAL,transparent:true,opacity:.5}));
+  var wgrp=new THREE.Group();wgrp.position.set(0,-250,-60);wgrp.add(wline);root.add(wgrp);
+  function waveVal(t){
+    var v=1+Math.sin(t*2.1)*.015+(Math.random()-.5)*.02;
+    var cyc=t%4.2;
+    if(cyc<1.4)v+=.55*Math.pow(Math.sin(cyc/1.4*Math.PI),2)+Math.random()*.08; /* 步频冲击≈1.8g峰 */
+    return v;
+  }
+  for(var i=0;i<WPTS;i++)wave[i]=waveVal(i*.06);
+
+  /* 尘埃 */
+  (function(){var n=220,pos=new Float32Array(n*3);
+    for(var i=0;i<n;i++){pos[i*3]=(Math.random()-.5)*1300;pos[i*3+1]=(Math.random()-.5)*800;pos[i*3+2]=(Math.random()-.5)*500-150;}
+    var g=new THREE.BufferGeometry();g.setAttribute('position',new THREE.BufferAttribute(pos,3));
+    scene.add(new THREE.Points(g,new THREE.PointsMaterial({color:0x3c4c5e,size:1.6,sizeAttenuation:true})));})();
+
+  function resize(){var w=canvas.clientWidth,h=canvas.clientHeight;
+    renderer.setSize(w,h,false);camera.aspect=w/h;
+    var near=w<760?680:520;camera.position.z=Math.min(near*(760/w>1?1:Math.max(.82,760/w)),760)*(w<760?1.25:1);
+    camera.updateProjectionMatrix();}
+  window.addEventListener('resize',resize);resize();
+
+  var mx=0,my=0;
+  canvas.parentElement.addEventListener('pointermove',function(e){
+    mx=e.clientX/window.innerWidth-.5;my=e.clientY/window.innerHeight-.5;});
+
+  var t=0;
+  function place(st){for(var i=0;i<st.ps.length;i++){var p=st.ps[i];
+    var pos=st.curve.getPointAt(p.userData.t%1);p.position.copy(pos);
+    p.material.opacity=p.userData.t%1;}}
+  function frame(){
+    t+=1/60;
+    root.rotation.y+=(mx*.16-root.rotation.y)*.035;
+    root.rotation.x+=(-my*.10+Math.sin(t*.18)*.02-root.rotation.x)*.035;
+    for(var i=WPTS-1;i>0;i--)wave[i]=wave[i-1];
+    wave[0]=waveVal(t);
+    for(i=0;i<WPTS;i++){wpos[i*3]=(i/(WPTS-1)-.5)*560;wpos[i*3+1]=(wave[i]-1)*90+0;wpos[i*3+2]=0;}
+    waveGeo.attributes.position.needsUpdate=true;
+    if(!reduce){for(i=0;i<streams.length;i++){var st=streams[i];
+      for(var j=0;j<st.ps.length;j++){st.ps[j].userData.t=(st.ps[j].userData.t+st.speed*1.2)%1;}
+      place(st);}}
+    else if(!frame.once){place(streams[0]);place(streams[1]);frame.once=1;}
+    renderer.render(scene,camera);
+    if(!reduce)requestAnimationFrame(frame);
+  }
+  frame();
+})();
+</script>
+</body>
+</html>
