@@ -71,6 +71,17 @@ def post_raw(url, raw, timeout=8):
         return json.loads(r.read().decode("utf-8"))
 
 
+def _expect_400(url, payload):
+    """POST 一个应当被拒绝的载荷，返回 True 表示确实拿到了 HTTP 400。"""
+    try:
+        post_json(url, payload)
+        return False
+    except urllib.error.HTTPError as e:
+        return e.code == 400
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def firmware_body(samples, source="SC7A20", ask=False, question=None):
     """逐字节复刻 device/main/transport.c build_body() 的输出。
 
@@ -149,7 +160,8 @@ def main():
     print("=" * 70)
 
     srv = subprocess.Popen([PY, "-u", SERVER_PY, "--port", str(port),
-                            "--data-dir", data_dir, "--retain-days", "0"],
+                            "--data-dir", data_dir, "--retain-days", "0",
+                            "--cmd-timeout", "5"],
                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                            text=True, env=env, cwd=ROOT)
     mock = ThreadingHTTPServer(("127.0.0.1", llm_port), MockLLM)
@@ -240,7 +252,8 @@ def main():
         env2["RW1_LLM_BASE_URL"] = "http://127.0.0.1:%d/v1" % llm_port
         env2["RW1_LLM_MODEL"] = "mock"
         srv = subprocess.Popen([PY, "-u", SERVER_PY, "--port", str(port),
-                                "--data-dir", data_dir, "--retain-days", "0"],
+                                "--data-dir", data_dir, "--retain-days", "0",
+                                "--cmd-timeout", "5"],
                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                text=True, env=env2, cwd=ROOT)
         for _ in range(50):
@@ -333,6 +346,84 @@ def main():
         out7 = post_raw("http://127.0.0.1:%d/api/telemetry" % port, raw_src)
         check("source 字段被正确读取", latest(port).get("source") == "QMA7981",
               "实际: %s" % latest(port).get("source"))
+
+        # ---- 12. 远程指令往返（第 2 周）------------------------------------
+        print("\n[12] 远程指令 capture_once 往返")
+        check("非法指令名被拒绝", _expect_400(
+            "http://127.0.0.1:%d/api/command" % port, {"name": "rm -rf /"}))
+
+        board = subprocess.Popen(
+            [PY, os.path.join(HERE, "fake_board.py"),
+             "--url", "http://127.0.0.1:%d" % port,
+             "--scenario", "tilt", "--seconds", "14", "--quiet"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        time.sleep(2.0)                    # 先让它报一帧，服务器才知道设备在线
+
+        r = post_json("http://127.0.0.1:%d/api/command" % port, {"name": "capture_once"})
+        cid = r.get("id")
+        check("下发指令返回 request_id", bool(cid), "实际: %s" % cid)
+        check("下发响应带设备在线状态", r.get("device_online") is True,
+              "实际: %s" % r.get("device_online"))
+
+        states, rec = [], None
+        deadline = time.time() + 14
+        while time.time() < deadline:
+            cmds = get_json("http://127.0.0.1:%d/api/commands" % port).get("commands", [])
+            rec = next((c for c in cmds if c["id"] == cid), None)
+            if rec and (not states or states[-1] != rec["state"]):
+                states.append(rec["state"])
+            if rec and rec["state"] in ("done", "failed", "timeout"):
+                break
+            time.sleep(0.3)
+        board.wait(timeout=25)
+
+        check("指令最终走到 done", rec is not None and rec["state"] == "done",
+              "实际: %s（经历 %s）" % (rec and rec["state"], "→".join(states)))
+        check("中间经过了 sent 状态", "sent" in states, "实际: %s" % states)
+        if rec and rec.get("result"):
+            res = rec["result"]
+            check("回传里带着同一个 request_id", res.get("id") == cid)
+            check("回传了样本数", (res.get("n") or 0) >= 1, "n=%s" % res.get("n"))
+            check("回传了耗时", (res.get("ms") or 0) > 0, "ms=%s" % res.get("ms"))
+            check("回传的 z 分量接近 0.70（tilt 场景）",
+                  abs((res.get("z") or 0) - 0.70) < 0.15, "z=%s" % res.get("z"))
+            check("回传了标准差", (res.get("std") or -1) >= 0, "std=%s" % res.get("std"))
+        else:
+            check("回传里带着同一个 request_id", False, "没有 result")
+        check("命令事件进了事件流",
+              any("capture_once" in (e.get("text") or "") for e in latest(port).get("events", [])))
+
+        # ---- 13. 指令超时看护 ---------------------------------------------
+        print("\n[13] 指令超时（板子故意不执行）")
+        deaf = subprocess.Popen(
+            [PY, os.path.join(HERE, "fake_board.py"),
+             "--url", "http://127.0.0.1:%d" % port,
+             "--scenario", "idle", "--seconds", "12", "--no-cmd", "--quiet"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        time.sleep(2.0)
+        r2 = post_json("http://127.0.0.1:%d/api/command" % port, {"name": "capture_once"})
+        cid2 = r2.get("id")
+        rec2, st2 = None, None
+        deadline = time.time() + 12
+        while time.time() < deadline:
+            cmds = get_json("http://127.0.0.1:%d/api/commands" % port).get("commands", [])
+            rec2 = next((c for c in cmds if c["id"] == cid2), None)
+            st2 = rec2 and rec2["state"]
+            if st2 == "timeout":
+                break
+            time.sleep(0.4)
+        deaf.wait(timeout=25)
+        check("板子不执行时被判超时", st2 == "timeout", "实际: %s" % st2)
+        check("超时事件进了事件流",
+              any("超时" in (e.get("text") or "") for e in latest(port).get("events", [])))
+
+        # ---- 14. 命令历史有上限 --------------------------------------------
+        print("\n[14] 命令历史不无限增长")
+        for _ in range(25):
+            post_json("http://127.0.0.1:%d/api/command" % port, {"name": "capture_once"})
+        n = len(get_json("http://127.0.0.1:%d/api/commands" % port).get("commands", []))
+        check("命令条数被限制在 20 条以内", n <= 20, "实际: %d 条" % n)
+
 
     finally:
         for p in (srv,):

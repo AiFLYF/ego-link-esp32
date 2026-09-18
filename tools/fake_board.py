@@ -120,6 +120,10 @@ def main():
                     help="在第 N 秒发一次 ask（等价于按 BOOT），可重复")
     ap.add_argument("--expect-steps", type=int, default=None,
                     help="结束时断言服务端窗口内步数 >= 该值")
+    ap.add_argument("--capture-n", type=int, default=20,
+                    help="执行 capture_once 时累积多少个样本（对应固件的 CAPTURE_N）")
+    ap.add_argument("--no-cmd", action="store_true",
+                    help="收到指令故意不执行（用于验证服务端的超时判定）")
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args()
 
@@ -137,6 +141,9 @@ def main():
     ok = fail = 0
     last_activity = None
     replies = []
+    pending_cmd = None          # 已收到、待下一帧执行的指令 id
+    cmds_received = 0
+    results_sent = 0
 
     for b in range(batches):
         # 让模拟时间跟上真实时间，服务端靠"到达间隔/样本数"推算采样率
@@ -165,6 +172,28 @@ def main():
         if b in ask_marks:
             payload["q"] = "我现在的运动状态怎么样？"
 
+        # 模拟板端执行远程指令：上一帧收到 cmd，就用**本帧**的样本算结果，本帧带回。
+        # 与固件时序一致——cmd 挂在第 N 帧响应上，第 N+1 帧请求里带 result。
+        if pending_cmd is not None:
+            n = min(args.capture_n, len(batch))
+            head = batch[:n]
+            mx = sum(p[0] for p in head) / n
+            my = sum(p[1] for p in head) / n
+            mz = sum(p[2] for p in head) / n
+            mags = [math.sqrt(p[0] ** 2 + p[1] ** 2 + p[2] ** 2) for p in head]
+            mm = sum(mags) / n
+            std = math.sqrt(sum((m - mm) ** 2 for m in mags) / n)
+            payload["result"] = {
+                "id": pending_cmd, "ok": True,
+                "ms": round(n / args.sample_hz * 1000, 1), "n": n,
+                "x": round(mx, 4), "y": round(my, 4), "z": round(mz, 4),
+                "std": round(std, 4),
+            }
+            print("  t=%5.1fs  执行指令 %s → 回传 x=%+.3f y=%+.3f z=%+.3f (%d 样本, σ=%.4f)"
+                  % (time.time() - t0, pending_cmd, mx, my, mz, n, std))
+            pending_cmd = None
+            results_sent += 1
+
         try:
             out = post(args.url, payload)
             ok += 1
@@ -176,13 +205,24 @@ def main():
                 replies.append(out["reply"])
             if out.get("pending"):
                 print("  t=%5.1fs  AI 生成中…" % (time.time() - t0))
+            cmd = out.get("cmd")
+            if cmd:
+                cmds_received += 1
+                if args.no_cmd:
+                    print("  t=%5.1fs  收到指令 %s 但按 --no-cmd 故意忽略（用于测超时）"
+                          % (time.time() - t0, cmd.get("id")))
+                else:
+                    print("  t=%5.1fs  收到指令 %s（%s），下一帧执行"
+                          % (time.time() - t0, cmd.get("id"), cmd.get("name")))
+                    pending_cmd = cmd["id"]
         except (urllib.error.URLError, OSError, ValueError) as exc:
             fail += 1
             if fail <= 3:
                 print("  POST 失败: %s" % exc)
 
     print("-" * 66)
-    print("上报 %d 成功 / %d 失败" % (ok, fail))
+    print("上报 %d 成功 / %d 失败；收到指令 %d 条，回传结果 %d 条"
+          % (ok, fail, cmds_received, results_sent))
     if replies:
         print("最后一次 AI 回复：%s" % replies[-1][:120])
 
