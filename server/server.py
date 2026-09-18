@@ -500,6 +500,9 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.send_header("Cache-Control", "no-store")
+        # 每个请求一连接就关：板端本来就是一次 POST 一个 client，浏览器这边请求也
+        # 很少。省掉 keep-alive 的状态机，行为对两端都最好预测。
+        self.send_header("Connection", "close")
         for k, v in (extra or {}).items():
             self.send_header(k, v)
         self.end_headers()

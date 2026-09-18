@@ -1,18 +1,21 @@
 /*
- * SPDX-License-Identifier: CC0-1.0
+ * SPDX-License-Identifier: MIT
  *
  * AI交互课 第1周 · 开发板端应用
  *
- * Flow:  on-board IMU --(HTTP POST /api/telemetry)--> PC server (server.py)
+ * Flow:  on-board IMU --(HTTP POST /api/telemetry, batched)--> PC server (server.py)
  *        PC server classifies the motion ("AI") and answers --> shown here.
- *        BOOT single click  =>  next telemetry frame carries ask=true, the
- *        server returns a fresh AI summary/reply.
+ *        BOOT single click  => next telemetry frame carries ask=true; the server
+ *                              replies immediately with "正在思考…" and delivers
+ *                              the real answer on a later frame.
+ *        BOOT long press    => cycle the tilt calibration (which way is "up"),
+ *                              persisted in NVS, no rebuild needed.
  *
  *   - bsp_display_start():   LCD + LVGL
  *   - accel_input_init():    SC7A20/LIS3DH/MPU6050/QMA7981 auto-detect
  *   - ui_init():             status/activity/AI-reply screen
  *   - wifi_link_start():     WiFi STA (+ Aliyun SNTP for log timestamps)
- *   - transport_start():     telemetry task talking to the PC server
+ *   - transport_start():     IMU sampling + batched telemetry to the PC server
  *
  * Reuses the battle-tested accel_input module of the parent biaopan project.
  */
@@ -37,6 +40,18 @@ static void on_ask_click(void *btn, void *arg)
     transport_request_ask("我现在的运动状态怎么样？");
 }
 
+/* If the reported tilt direction runs the wrong way, long-press BOOT until the
+ * screen and the dashboard agree. The choice is stored in NVS and is also
+ * applied to the telemetry, so the server's labels stay consistent with it. */
+static void on_orient_long_press(void *btn, void *arg)
+{
+    (void)btn;
+    (void)arg;
+    accel_input_cycle_orientation();
+    ESP_LOGI(TAG, "tilt calibration -> orientation %d (long-press BOOT to cycle)",
+             accel_input_get_orientation());
+}
+
 static void setup_ask_button(void)
 {
     button_handle_t ask_btn = NULL;
@@ -53,7 +68,8 @@ static void setup_ask_button(void)
         return;
     }
     iot_button_register_cb(ask_btn, BUTTON_SINGLE_CLICK, NULL, on_ask_click, NULL);
-    ESP_LOGI(TAG, "BOOT click -> ask the PC server AI");
+    iot_button_register_cb(ask_btn, BUTTON_LONG_PRESS_START, NULL, on_orient_long_press, NULL);
+    ESP_LOGI(TAG, "BOOT: click -> ask the PC server AI, long-press -> cycle tilt calibration");
 }
 
 void app_main(void)
@@ -65,7 +81,10 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(ret);
 
-    bsp_display_start();
+    if (bsp_display_start() == NULL) {
+        ESP_LOGE(TAG, "display init failed");
+        return;
+    }
     bsp_display_backlight_on();
 
     ESP_ERROR_CHECK_WITHOUT_ABORT(accel_input_init());
@@ -76,5 +95,7 @@ void app_main(void)
     wifi_link_start();
     transport_start();
 
-    ESP_LOGI(TAG, "rw1 board app: IMU -> %s%s", CONFIG_RW1_SERVER_URL, "/api/telemetry");
+    ESP_LOGI(TAG, "rw1 board app: IMU %dHz -> batch -> %s%s",
+             (int)(1000 / CONFIG_RW1_SAMPLE_PERIOD_MS),
+             CONFIG_RW1_SERVER_URL, "/api/telemetry");
 }

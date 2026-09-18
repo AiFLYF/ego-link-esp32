@@ -1,5 +1,5 @@
 /*
- * SPDX-License-Identifier: CC0-1.0
+ * SPDX-License-Identifier: MIT
  *
  * Small LVGL status screen for the RW1 board app: link state, current activity
  * classified by the PC server, live G values, and the latest AI reply.

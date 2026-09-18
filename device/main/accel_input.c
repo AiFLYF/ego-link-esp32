@@ -1,5 +1,5 @@
 /*
- * SPDX-License-Identifier: CC0-1.0
+ * SPDX-License-Identifier: MIT
  *
  * Accelerometer auto-detection driver for the ESP32-S3-EYE.
  * See accel_input.h for the supported parts and detection strategy.
@@ -22,20 +22,6 @@
 
 #define ACCEL_I2C_TIMEOUT_MS 30
 #define ACCEL_I2C_FREQ_HZ 400000
-#define ACCEL_ALT_I2C_PORT I2C_NUM_1
-
-/* Complementary filter / conditioning of the raw sensor.
- *  - GRAV_ALPHA: low-pass weight for the gravity estimate at ~30 fps. Smaller =
- *    smoother + more lag. The on-board SC7A20 measures very cleanly (±0.01 g of
- *    noise at rest), so 0.15 (~190 ms settle) stays smooth while tracking the
- *    hand promptly.
- *  - DEAD_G:     in-plane gravity below this (sensor bias/noise on a flat board)
- *    is squelched to zero so a level pool sits perfectly still.
- *  - DEAD_MOTION: motion residual below this is ignored, so only a deliberate
- *    flick sloshes the water — gentle tilts don't. */
-#define ACCEL_GRAV_ALPHA  0.15f
-#define ACCEL_DEAD_G      0.045f
-#define ACCEL_DEAD_MOTION 0.060f
 
 #define ACCEL_NVS_NS  "accel"
 #define ACCEL_NVS_KEY "orient"
@@ -77,11 +63,8 @@ static qma_format_t s_qma_format = {
     .ready = false,
 };
 
-/* Motion-filter state (screen frame). */
+/* Sensor→screen orientation (persisted in NVS). */
 static int   s_orient = ACCEL_ORIENT_DEFAULT;
-static float s_grav_x = 0.0f;   /* low-pass gravity estimate */
-static float s_grav_y = 0.0f;
-static bool  s_primed = false;  /* seed the filter on the first real sample */
 
 static void accel_input_remove_device(void)
 {
@@ -482,7 +465,6 @@ int accel_input_get_orientation(void)
 void accel_input_set_orientation(int idx)
 {
     s_orient = idx & 7;
-    s_primed = false; /* re-seed the filter so the flip doesn't cause a slosh */
     accel_orient_save();
     ESP_LOGI(TAG, "accel orientation set to %d", s_orient);
 }
@@ -490,6 +472,20 @@ void accel_input_set_orientation(int idx)
 void accel_input_cycle_orientation(void)
 {
     accel_input_set_orientation((s_orient + 1) & 7);
+}
+
+void accel_input_map_to_screen(float x_g, float y_g, float *out_x, float *out_y)
+{
+    if (out_x == NULL || out_y == NULL) {
+        return;
+    }
+    /* Button fallback already reports in screen convention. */
+    if (s_source == ACCEL_SOURCE_BUTTONS) {
+        *out_x = x_g;
+        *out_y = y_g;
+        return;
+    }
+    accel_apply_orientation(x_g, y_g, out_x, out_y);
 }
 
 esp_err_t accel_input_init(void)
@@ -566,61 +562,3 @@ button_handle_t accel_input_button(int idx)
     return s_buttons[idx];
 }
 
-void accel_input_read_motion(accel_motion_t *out)
-{
-    if (out == NULL) {
-        return;
-    }
-    memset(out, 0, sizeof(*out));
-
-    accel_input_sample_t s;
-    accel_input_poll(&s);
-    out->valid = s.valid;
-    out->source_name = s.source_name;
-
-    /* Map the raw reading into screen axes. The button fallback already reports
-     * in screen convention, so it bypasses the (sensor-only) orientation map. */
-    float sx, sy;
-    if (s_source == ACCEL_SOURCE_BUTTONS) {
-        sx = s.x_g;
-        sy = s.y_g;
-    } else {
-        accel_apply_orientation(s.x_g, s.y_g, &sx, &sy);
-    }
-
-    /* Complementary split: slow low-pass = gravity, fast residual = motion. */
-    if (!s_primed) {
-        s_grav_x = sx;
-        s_grav_y = sy;
-        s_primed = true;
-    } else {
-        s_grav_x += ACCEL_GRAV_ALPHA * (sx - s_grav_x);
-        s_grav_y += ACCEL_GRAV_ALPHA * (sy - s_grav_y);
-    }
-
-    /* Gravity with a radial dead zone (a flat board reads ~0 and sits still). */
-    float gx = s_grav_x;
-    float gy = s_grav_y;
-    const float gm = sqrtf(gx * gx + gy * gy);
-    if (gm < ACCEL_DEAD_G) {
-        gx = 0.0f;
-        gy = 0.0f;
-    } else {
-        const float k = (gm - ACCEL_DEAD_G) / gm;
-        gx *= k;
-        gy *= k;
-    }
-    out->grav_x = gx;
-    out->grav_y = gy;
-    out->tilt = gm;
-
-    /* Motion residual (device shake), also dead-zoned so noise doesn't slosh. */
-    float mx = sx - s_grav_x;
-    float my = sy - s_grav_y;
-    if (sqrtf(mx * mx + my * my) < ACCEL_DEAD_MOTION) {
-        mx = 0.0f;
-        my = 0.0f;
-    }
-    out->motion_x = mx;
-    out->motion_y = my;
-}
