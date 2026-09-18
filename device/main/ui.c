@@ -84,9 +84,16 @@ static void ui_timer_cb(lv_timer_t *timer)
 
     lv_label_set_text(s_lbl_act, st.activity[0] ? st.activity : "等待服务器…");
 
-    snprintf(buf, sizeof(buf), "%s  o%d  %d/批\nX%+.2f Y%+.2f Z%+.2f",
-             st.source, st.orient, st.batch_last, st.x_g, st.y_g, st.z_g);
+    /* 远程指令状态：让现场能直接看见「网页下发的指令到了、正在采、采完了」 */
+    static const char *CMD_MARK[] = {"", " 采集中", " 采集OK", " 采集NG"};
+    const char *mark = CMD_MARK[(st.cmd_state < 4) ? st.cmd_state : 0];
+    snprintf(buf, sizeof(buf), "%s  o%d  %d/批%s\nX%+.2f Y%+.2f Z%+.2f",
+             st.source, st.orient, st.batch_last, mark, st.x_g, st.y_g, st.z_g);
     lv_label_set_text(s_lbl_data, buf);
+    /* 指令失败时把数据行染红，现场一眼能看出来 */
+    lv_obj_set_style_text_color(s_lbl_data,
+                                lv_color_hex(st.cmd_state == TRANSPORT_CMD_FAILED
+                                             ? 0xf85149 : 0x79c0ff), 0);
 
     /* Only rewrite the reply label when the text actually changed. */
     if (strcmp(st.reply, s_last_reply) != 0 || st.ai_pending != s_last_pending) {

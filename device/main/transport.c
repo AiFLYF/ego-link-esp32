@@ -13,6 +13,7 @@
  */
 #include "transport.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -50,6 +51,36 @@ static const char *TAG = "transport";
  * counted as a link failure. */
 #define TX_RESP_BUF 4096
 
+/* Remote command (week 2): how many samples one "capture_once" averages.
+ * Reuses the ordinary 10 ms sampling tick, so a capture takes 200 ms and never
+ * blocks the loop. If the samples cannot be gathered in time we report a failure
+ * rather than leaving the web page spinning. */
+#define CAPTURE_N 20
+#define CAPTURE_TIMEOUT_MS 2000
+
+/* Remote-command state. Only touched from the transport task, so no lock. */
+typedef struct {
+    /* command being executed right now */
+    char       id[TRANSPORT_CMD_ID_LEN];
+    bool       running;
+    uint8_t    state;          /* transport_cmd_state_t，给 UI 看（不随 ready 复位） */
+    TickType_t started;
+    int        n;
+    float      sum[3];         /* Σx, Σy, Σz (screen frame) */
+    float      mag_sum;        /* Σ|a|   —— 用来算 |a| 的标准差 */
+    float      mag_sq_sum;     /* Σ|a|² */
+
+    /* result waiting to be uploaded on the next frame */
+    bool       ready;
+    bool       ok;
+    char       rid[TRANSPORT_CMD_ID_LEN];
+    float      ms;
+    int        rn;
+    float      xyz[3];
+    float      std;
+    char       err[48];
+} cmd_ctx_t;
+
 static transport_status_t s_st;
 static SemaphoreHandle_t s_lock;
 static volatile bool s_ask_pending;
@@ -60,15 +91,7 @@ static uint32_t s_post_count;
 /* [(x,y,z)] in screen frame, filled by the sampling loop. */
 static float s_batch[TX_BATCH_MAX][3];
 
-static void status_lock(void)
-{
-    xSemaphoreTake(s_lock, portMAX_DELAY);
-}
-
-static void status_unlock(void)
-{
-    xSemaphoreGive(s_lock);
-}
+static cmd_ctx_t s_cmd;
 
 /* Like strlcpy but never cuts a multi-byte UTF-8 character in half (a torn
  * trailing sequence renders as garbage at the end of LVGL labels). */
@@ -86,6 +109,98 @@ static void utf8_strlcpy(char *dst, const char *src, size_t cap)
     }
     memcpy(dst, src, n);
     dst[n] = '\0';
+}
+
+static void status_lock(void)
+{
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+}
+
+static void status_unlock(void)
+{
+    xSemaphoreGive(s_lock);
+}
+
+/* ---------------- remote commands (week 2) -------------------------------- */
+
+static void start_capture(const char *id)
+{
+    if (s_cmd.running) {
+        /* The server only has one command in flight at a time, so this can only
+         * happen if the previous frame was lost. Ignore the duplicate. */
+        ESP_LOGW(TAG, "cmd %s ignored: %s still running", id, s_cmd.id);
+        return;
+    }
+    utf8_strlcpy(s_cmd.id, id, sizeof(s_cmd.id));
+    s_cmd.running = true;
+    s_cmd.state = TRANSPORT_CMD_RUNNING;
+    s_cmd.started = xTaskGetTickCount();
+    s_cmd.n = 0;
+    s_cmd.sum[0] = s_cmd.sum[1] = s_cmd.sum[2] = 0.0f;
+    s_cmd.mag_sum = 0.0f;
+    s_cmd.mag_sq_sum = 0.0f;
+    status_lock();
+    s_st.cmd_count++;
+    status_unlock();
+    ESP_LOGI(TAG, "cmd %s: capture_once started (%d samples)", s_cmd.id, CAPTURE_N);
+}
+
+/* Turn the accumulated samples into a result ready for the next upload. */
+static void finish_capture(bool ok, const char *err)
+{
+    s_cmd.ready = true;
+    s_cmd.ok = ok;
+    strlcpy(s_cmd.rid, s_cmd.id, sizeof(s_cmd.rid));
+    s_cmd.rn = s_cmd.n;
+    s_cmd.ms = (float)pdTICKS_TO_MS(xTaskGetTickCount() - s_cmd.started);
+
+    if (ok && s_cmd.n > 0) {
+        const float inv = 1.0f / (float)s_cmd.n;
+        s_cmd.xyz[0] = s_cmd.sum[0] * inv;
+        s_cmd.xyz[1] = s_cmd.sum[1] * inv;
+        s_cmd.xyz[2] = s_cmd.sum[2] * inv;
+        const float mean_mag = s_cmd.mag_sum * inv;
+        const float var = s_cmd.mag_sq_sum * inv - mean_mag * mean_mag;   /* E[|a|²]-E[|a|]² */
+        s_cmd.std = (var > 0.0f) ? sqrtf(var) : 0.0f;
+        strlcpy(s_cmd.err, "", sizeof(s_cmd.err));
+    } else {
+        s_cmd.xyz[0] = s_cmd.xyz[1] = s_cmd.xyz[2] = 0.0f;
+        s_cmd.std = 0.0f;
+        strlcpy(s_cmd.err, err ? err : "capture failed", sizeof(s_cmd.err));
+    }
+
+    s_cmd.running = false;
+    s_cmd.state = ok ? TRANSPORT_CMD_DONE : TRANSPORT_CMD_FAILED;
+    ESP_LOGI(TAG, "cmd %s: %s (%d samples, %.0f ms, std %.4f g)%s",
+             s_cmd.rid, ok ? "done" : "failed", s_cmd.rn, s_cmd.ms, s_cmd.std,
+             ok ? "" : s_cmd.err);
+}
+
+/* Feed one freshly sampled point into the running capture. */
+static void feed_capture(const float xyz[3])
+{
+    if (!s_cmd.running) {
+        return;
+    }
+    s_cmd.sum[0] += xyz[0];
+    s_cmd.sum[1] += xyz[1];
+    s_cmd.sum[2] += xyz[2];
+    const float mag = sqrtf(xyz[0] * xyz[0] + xyz[1] * xyz[1] + xyz[2] * xyz[2]);
+    s_cmd.mag_sum += mag;
+    s_cmd.mag_sq_sum += mag * mag;
+
+    if (++s_cmd.n >= CAPTURE_N) {
+        finish_capture(true, NULL);
+    }
+}
+
+/* Give up on a capture that is not getting its samples (e.g. IMU went quiet). */
+static void check_capture_timeout(void)
+{
+    if (s_cmd.running &&
+        pdTICKS_TO_MS(xTaskGetTickCount() - s_cmd.started) > CAPTURE_TIMEOUT_MS) {
+        finish_capture(false, "not enough samples");
+    }
 }
 
 /* Append src to buf[off..cap) with JSON escaping. Returns false if it did not
@@ -134,7 +249,8 @@ static char *build_body(int n, bool ask, const char *source)
     if (n <= 0) {
         return NULL;
     }
-    size_t cap = 256 + (size_t)n * 28 + strlen(s_ask_text) * 2 + 64;
+    size_t cap = 256 + (size_t)n * 28 + strlen(s_ask_text) * 2 + 64
+                 + (s_cmd.ready ? 320 : 0);
     char *buf = malloc(cap);
     if (buf == NULL) {
         return NULL;
@@ -179,6 +295,35 @@ static char *build_body(int n, bool ask, const char *source)
         off += snprintf(buf + off, cap - (size_t)off, "\"");
     }
 
+    /* 远程指令的执行结果（带同一个 request_id 回传给服务器） */
+    if (s_cmd.ready) {
+        if ((size_t)off + 288 > cap) {
+            free(buf);
+            return NULL;
+        }
+        off += snprintf(buf + off, cap - (size_t)off, ",\"result\":{\"id\":\"");
+        if (!json_escape_append(buf, cap, &off, s_cmd.rid)) {
+            free(buf);
+            return NULL;
+        }
+        off += snprintf(buf + off, cap - (size_t)off,
+                        "\",\"ok\":%s,\"ms\":%.1f,\"n\":%d",
+                        s_cmd.ok ? "true" : "false", s_cmd.ms, s_cmd.rn);
+        if (s_cmd.ok) {
+            off += snprintf(buf + off, cap - (size_t)off,
+                            ",\"x\":%.4f,\"y\":%.4f,\"z\":%.4f,\"std\":%.4f",
+                            s_cmd.xyz[0], s_cmd.xyz[1], s_cmd.xyz[2], s_cmd.std);
+        } else {
+            off += snprintf(buf + off, cap - (size_t)off, ",\"err\":\"");
+            if (!json_escape_append(buf, cap, &off, s_cmd.err)) {
+                free(buf);
+                return NULL;
+            }
+            off += snprintf(buf + off, cap - (size_t)off, "\"");
+        }
+        off += snprintf(buf + off, cap - (size_t)off, "}");
+    }
+
     /* Close with an explicit write (not snprintf) so a full buffer can never
      * silently drop the brace and hand the server truncated JSON. */
     if ((size_t)off + 2 > cap) {
@@ -194,6 +339,7 @@ static void apply_response(const char *body, size_t len)
 {
     char activity[TRANSPORT_ACTIVITY_LEN] = "";
     char reply[TRANSPORT_REPLY_LEN] = "";
+    char cmd_id[TRANSPORT_CMD_ID_LEN] = "";
     bool ok = false;
     bool pending = false;
 
@@ -212,6 +358,17 @@ static void apply_response(const char *body, size_t len)
             if (cJSON_IsString(jrep) && jrep->valuestring != NULL) {
                 utf8_strlcpy(reply, jrep->valuestring, sizeof(reply));
             }
+            /* 远程指令：只认白名单里的名字，不认识的静默忽略，别把板子搞乱 */
+            const cJSON *jcmd = cJSON_GetObjectItemCaseSensitive(root, "cmd");
+            if (cJSON_IsObject(jcmd)) {
+                const cJSON *jid = cJSON_GetObjectItemCaseSensitive(jcmd, "id");
+                const cJSON *jname = cJSON_GetObjectItemCaseSensitive(jcmd, "name");
+                if (cJSON_IsString(jid) && jid->valuestring != NULL &&
+                    cJSON_IsString(jname) && jname->valuestring != NULL &&
+                    strcmp(jname->valuestring, "capture_once") == 0) {
+                    utf8_strlcpy(cmd_id, jid->valuestring, sizeof(cmd_id));
+                }
+            }
             cJSON_Delete(root);
         }
     }
@@ -229,6 +386,11 @@ static void apply_response(const char *body, size_t len)
         strlcpy(s_st.reply, reply, sizeof(s_st.reply));
     }
     status_unlock();
+
+    /* 在锁外启动采集：start_capture 只碰 s_cmd，且不能拖住状态锁 */
+    if (cmd_id[0] != '\0') {
+        start_capture(cmd_id);
+    }
 }
 
 /* Response body is collected during esp_http_client_perform() via the
@@ -258,7 +420,7 @@ static esp_err_t http_event_handler(esp_http_client_event_t *evt)
     return ESP_OK;
 }
 
-static void post_batch(int n, bool ask)
+static bool post_batch(int n, bool ask)
 {
     char url[160];
     snprintf(url, sizeof(url), "%s%s", CONFIG_RW1_SERVER_URL, TX_PATH);
@@ -271,7 +433,7 @@ static void post_batch(int n, bool ask)
     char *body = build_body(n, ask, source);
     if (body == NULL) {
         ESP_LOGE(TAG, "out of memory building telemetry body");
-        return;
+        return false;
     }
 
     resp_acc_t acc = {.len = 0, .truncated = false};
@@ -285,7 +447,7 @@ static void post_batch(int n, bool ask)
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
     if (client == NULL) {
         free(body);
-        return;
+        return false;
     }
 
     esp_http_client_set_method(client, HTTP_METHOD_POST);
@@ -305,11 +467,13 @@ static void post_batch(int n, bool ask)
         if (ask) {
             ESP_LOGI(TAG, "AI reply: %s", acc.buf);
         }
-    } else {
-        apply_response(NULL, 0);
-        ESP_LOGW(TAG, "POST failed ret=%s status=%d body=%d",
-                 esp_err_to_name(ret), status, acc.len);
+        return true;
     }
+
+    apply_response(NULL, 0);
+    ESP_LOGW(TAG, "POST failed ret=%s status=%d body=%d",
+             esp_err_to_name(ret), status, acc.len);
+    return false;
 }
 
 static void transport_task(void *arg)
@@ -333,16 +497,23 @@ static void transport_task(void *arg)
     while (true) {
         accel_input_sample_t sample = {0};
         if (accel_input_poll(&sample)) {
+            /* Upload screen-frame axes so the server's tilt labels match what
+             * the LCD shows (see accel_input_map_to_screen). */
+            float sx, sy;
+            accel_input_map_to_screen(sample.x_g, sample.y_g, &sx, &sy);
+            sx = sanitize_g(sx);
+            sy = sanitize_g(sy);
+            const float sz = sanitize_g(sample.z_g);
             if (n < TX_BATCH_MAX) {
-                /* Upload screen-frame axes so the server's tilt labels match
-                 * what the LCD shows (see accel_input_map_to_screen). */
-                accel_input_map_to_screen(sample.x_g, sample.y_g,
-                                          &s_batch[n][0], &s_batch[n][1]);
-                s_batch[n][0] = sanitize_g(s_batch[n][0]);
-                s_batch[n][1] = sanitize_g(s_batch[n][1]);
-                s_batch[n][2] = sanitize_g(sample.z_g);
+                s_batch[n][0] = sx;
+                s_batch[n][1] = sy;
+                s_batch[n][2] = sz;
                 n++;
             }
+            /* 正在执行远程指令就用同一个采样节拍累积，不额外阻塞 */
+            const float xyz[3] = {sx, sy, sz};
+            feed_capture(xyz);
+
             status_lock();
             s_st.x_g = sample.x_g;
             s_st.y_g = sample.y_g;
@@ -350,16 +521,25 @@ static void transport_task(void *arg)
             strlcpy(s_st.source, sample.source_name ? sample.source_name : "?", sizeof(s_st.source));
             status_unlock();
         }
+        check_capture_timeout();
 
         const TickType_t now = xTaskGetTickCount();
         if (n > 0 && ((now - last_post) >= post_ticks || n >= TX_BATCH_MAX)) {
             bool ask = s_ask_pending;
-            post_batch(n, ask);
+            bool ok = post_batch(n, ask);
+
+            /* 结果只在成功送达后才清；失败就下一帧重发（与 ask 的策略一致） */
+            if (s_cmd.ready && ok) {
+                s_cmd.ready = false;
+            }
 
             status_lock();
-            bool ok = s_st.server_ok;
             s_st.batch_last = (uint16_t)n;
             s_st.orient = (uint8_t)accel_input_get_orientation();
+            s_st.cmd_state = s_cmd.state;
+            if (s_cmd.rid[0] != '\0') {
+                strlcpy(s_st.cmd_id, s_cmd.rid, sizeof(s_st.cmd_id));
+            }
             char act[TRANSPORT_ACTIVITY_LEN];
             strlcpy(act, s_st.activity, sizeof(act));
             status_unlock();
