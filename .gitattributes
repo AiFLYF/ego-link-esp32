@@ -1,25 +1,29 @@
-# Windows batch scripts need CRLF; everything else normalises to LF.
-*.bat text eol=crlf
-*.py  text eol=lf
-*.c   text eol=lf
-*.h   text eol=lf
-*.md  text eol=lf
-*.yml text eol=lf
-*.txt text eol=lf
-*.csv text eol=lf
-*.lock text eol=lf
-sdkconfig.* text eol=lf
+# 默认把所有文件当二进制；下面的文本类型白名单必须写在它之后，
+# 才能覆盖默认值（gitattributes 后写的规则覆盖先写的同名属性，
+# binary 宏等价于 -text -diff -merge）。
 * binary
 
+# Windows batch scripts need CRLF; everything else normalises to LF.
+*.bat  text diff eol=crlf
+*.py   text diff eol=lf
+*.c    text diff eol=lf
+*.h    text diff eol=lf
+*.md   text diff eol=lf
+*.yml  text diff eol=lf
+*.txt  text diff eol=lf
+*.csv  text diff eol=lf
+*.lock text diff eol=lf
+sdkconfig.* text diff eol=lf
+Kconfig*    text diff eol=lf
+
 # ---- web assets（GitHub Pages 站点根目录 docs/）--------------------------
-# 注意：必须放在 `* binary` 之后才会生效（gitattributes 后写覆盖先写）
 *.html text diff eol=lf
 *.css  text diff eol=lf
 *.js   text diff eol=lf
 *.json text diff eol=lf
 *.svg  text diff eol=lf
 .gitattributes text diff eol=lf
-.gitignore text diff eol=lf
+.gitignore     text diff eol=lf
 
 # vendored 第三方产物不参与文本 diff（three.js + 自托管字体）
 docs/vendor/** binary
