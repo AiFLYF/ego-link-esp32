@@ -64,6 +64,30 @@ def post_json(url, payload, timeout=8):
         return json.loads(r.read().decode("utf-8"))
 
 
+def post_raw(url, raw, timeout=8):
+    req = urllib.request.Request(url, data=raw.encode("utf-8"),
+                                 headers={"Content-Type": "application/json"})
+    with OPENER.open(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+def firmware_body(samples, source="SC7A20", ask=False, question=None):
+    """逐字节复刻 device/main/transport.c build_body() 的输出。
+
+    固件是**手写** JSON（刻意不用 cJSON，因为 cJSON 用 %1.15g 打印 double，
+    float 0.012f 会输出 "0.0120000001634057"，50 样本批次要 2.7KB）。所以
+    C 那边的格式串和服务端解析器之间是一份隐式契约——这里把它钉死：
+    任何一边改了格式，这个用例都会红。
+    """
+    pts = ",".join("[%.3f,%.3f,%.3f]" % s for s in samples)
+    body = ('{"batch":[%s],"x":%.3f,"y":%.3f,"z":%.3f,"source":"%s","ask":%s'
+            % (pts, samples[-1][0], samples[-1][1], samples[-1][2],
+               source, "true" if ask else "false"))
+    if ask:
+        body += ',"q":"%s"' % question
+    return body + "}"
+
+
 # --------------------------------------------------------------------------
 # 假大模型：故意慢，用来证明板端不会被它拖住
 # --------------------------------------------------------------------------
@@ -280,6 +304,35 @@ def main():
         snap = latest(port)
         hz = snap.get("sample_hz", 0)
         check("采样率推算合理（50~150Hz）", 50 <= hz <= 150, "实际: %s Hz" % hz)
+
+        # ---- 11. 固件字节格式契约 -----------------------------------------
+        # 上面各节用的是 json.dumps 生成的载荷，这一节用**逐字节复刻**固件
+        # build_body() 的字符串，确保 C 与服务端的格式契约没有悄悄漂移。
+        print("\n[11] 固件手写 JSON 的格式契约（transport.c build_body）")
+        raw = firmware_body([(0.0, 0.0, 1.0)] * 50)
+        out4 = post_raw("http://127.0.0.1:%d/api/telemetry" % port, raw)
+        check("50 样本固件帧被接受", out4.get("ok") is True,
+              "帧长 %d 字节" % len(raw))
+        check("50 样本固件帧分类正确", out4.get("activity") == "静置·水平",
+              "实际: %s" % out4.get("activity"))
+
+        raw_ask = firmware_body([(0.7, 0.0, 0.71)] * 50, ask=True,
+                                question="我现在的运动状态怎么样？")
+        out5 = post_raw("http://127.0.0.1:%d/api/telemetry" % port, raw_ask)
+        check("带 ask+q 的固件帧被接受", out5.get("ok") is True)
+        check("ask 帧方向判定正确", out5.get("activity") == "静置·向右倾斜",
+              "实际: %s" % out5.get("activity"))
+
+        raw_neg = firmware_body([(-0.012, 0.998, 0.031)] * 50)
+        out6 = post_raw("http://127.0.0.1:%d/api/telemetry" % port, raw_neg)
+        check("负值/三位小数解析正确",
+              out6.get("ok") is True and "右" in out6.get("activity", ""),
+              "实际: %s" % out6.get("activity"))
+
+        raw_src = firmware_body([(0.0, 0.0, 1.0)] * 50, source="QMA7981")
+        out7 = post_raw("http://127.0.0.1:%d/api/telemetry" % port, raw_src)
+        check("source 字段被正确读取", latest(port).get("source") == "QMA7981",
+              "实际: %s" % latest(port).get("source"))
 
     finally:
         for p in (srv,):
