@@ -1,8 +1,8 @@
 # Ego Link 教学版实现 · AI交互课项目仓库
 
 > 《AI交互原型与用户体验设计》（18 周，贯穿样例"Ego Link 随身智能终端"）的课程项目实现仓库，按周推进。
-> 当前进度 **第1周**（已实机跑通）：把开发板的一项真实传感数据（ESP32-S3-EYE 板载 SC7A20 加速度计）
-> 以 100Hz 采集、按批送到自己的服务器（没有 VPS，用电脑代替）、落盘存储并验证 —— 即下图全链路。
+> 当前进度 **第2周**（已实机跑通）：在周一"采集 → 上报 → 存储 → 展示"闭环之上，
+> 加上**网页远程下发「采集一次」指令、按 request_id 反馈执行结果**的反向通道 —— 即下图全链路。
 >
 > 🏠 项目主页（three.js 数据闭环可视化）：<https://aiflyf.github.io/ego-link-esp32/>
 
@@ -10,8 +10,8 @@
 
 | 周 | 任务 | 状态 |
 |---|---|---|
-| 1 | 传感数据采集 + 服务器接收/存储 + Web 展示 | ✅ 本仓库当前内容 |
-| 2 | Web 远程"采集一次"指令（request_id）与执行结果反馈 | 可基于 `transport.c` 直接扩展 |
+| 1 | 传感数据采集 + 服务器接收/存储 + Web 展示 | ✅ |
+| 2 | Web 远程"采集一次"指令（request_id）与执行结果反馈 | ✅ 本仓库当前内容 |
 | 3 | 按键触发 + 本地/远端物理反馈闭环 | BOOT 提问按钮已是雏形 |
 | 4–6 | 自然语言查询/请求、按键说话语音链路、澄清与停止 | |
 | 7–9 | 按需取图、视觉推理反馈、视觉事件主动询问 | |
@@ -107,8 +107,10 @@ python server\server.py
 
 | 方法/路径 | 说明 |
 |---|---|
-| `POST /api/telemetry` | 请求 `{batch:[[x,y,z],…], x, y, z, source, ask, q}` → 响应 `{ok, activity, reply, pending}` |
-| `GET /api/latest` | 快照（状态 + 8s 曲线降采样 + 事件流），JSON |
+| `POST /api/telemetry` | 请求 `{batch:[[x,y,z],…], x, y, z, source, ask, q[, result]}` → 响应 `{ok, activity, reply, pending[, cmd]}` |
+| `POST /api/command` | 下发远程指令 `{"name":"capture_once"}` → 响应 `{ok, id, device_online}` |
+| `GET /api/commands` | 最近 20 条指令及其状态、执行结果 |
+| `GET /api/latest` | 快照（状态 + 8s 曲线降采样 + 事件流 + 指令列表），JSON |
 | `GET /api/stream` | SSE 实时推送（仪表盘用） |
 | `GET /api/logs` | 落盘目录与文件大小 |
 | `GET /` | 网页仪表盘 |
@@ -119,6 +121,41 @@ python server\server.py
   所以服务端说的"上/下/左/右"和板子屏幕上显示的永远一致。
 - `pending: true` 表示服务端正在后台调大模型，此时的 `reply` 是占位文案
   （"正在思考…"），下一帧或之后几帧会带回真正的答案。
+- `cmd` / `result` 是第 2 周的远程指令字段，见下。
+
+### 远程指令通道（第 2 周）
+
+板子是**纯客户端**：它只会周期性地 POST，没有监听端口、收不到服务端主动推送。
+所以指令用「搭车」的方式走：
+
+```
+网页点「采集一次」
+   │  POST /api/command {"name":"capture_once"}
+   ▼
+服务器  ── queued ──►  把指令挂进**下一帧**遥测的响应里
+   │                        {"cmd":{"id":"c-…","name":"capture_once"}}
+   ▼                                   │  第 N 帧
+板子   ── 用正常的 10ms 采样节拍累积 20 个样本（200ms），算平均与标准差
+   │                                   │
+   │  POST /api/telemetry              ▼
+   │  {"…","result":{"id":"c-…","ok":true,"ms":200,"n":20,"x":…,"y":…,"z":…,"std":…}}
+   │                                   │  第 N+1 帧
+   ▼
+服务器  ── done ──►  按 request_id 匹配，写进指令历史 + 事件流 + SSE
+```
+
+一次往返 = **2 个遥测周期**（默认 1 秒）。网页上能看到
+`queued → sent → done` 的完整过程，`/api/commands` 里能查到每次采集的
+平均值、样本数、耗时和标准差。
+
+- 指令名走白名单（`CMD_NAMES`），不认识的名字直接 400。
+- 服务器**一次只发一条**，板子也一次只执行一条，语义简单不会乱序。
+- 下发后 `CMD_TIMEOUT_S`（默认 10 秒，`--cmd-timeout` 可调）没回音就判 `timeout`，
+  网页不会一直转圈。
+- 板端也有一层本地保护：2 秒内凑不齐样本就回 `ok:false` + 原因。
+- 结果**上传成功后才清除**，失败会在下一帧重发（与 `ask` 的重试策略一致）。
+- 采集复用正常的采样节拍，**不额外阻塞**；屏幕上数据行会显示 `采集中 / 采集OK / 采集NG`。
+
 
 ### 数据落盘（第 1 周的"存储"）
 
@@ -150,14 +187,29 @@ python tools\fake_board.py --scenario walk --seconds 20    # 另一个终端灌�
 `--scenario` 可选 `idle / tilt / walk / shake / fall / mixed`；`--ask-at 5` 模拟按 BOOT 提问；
 `--expect-steps 8` 会在结束时断言服务端真的数出了步数（非 0 退出码 = 失败）。
 
+假开发板**也会执行远程指令**，时序与固件一致（第 N 帧收到、第 N+1 帧回传），
+所以第 2 周的整条往返不需要硬件就能验证：
+
+```powershell
+python tools\fake_board.py --scenario tilt --seconds 20   # 一个终端
+# 另一个终端：下发一条指令并等结果
+curl -X POST http://127.0.0.1:8000/api/command -H "Content-Type: application/json" -d "{\"name\":\"capture_once\"}"
+curl http://127.0.0.1:8000/api/commands
+```
+
+或者直接在浏览器仪表盘上点「采集一次」按钮。
+
+`--no-cmd` 会让假开发板**故意不执行**指令，用来验证服务端的超时判定。
+
 改完服务端逻辑跑一遍回归测试：
 
 ```powershell
 python tools\verify_server.py
 ```
 
-它会自己拉起一个临时服务器、灌入各场景、检查分类/计步/跌落/落盘/超时解耦/畸形载荷，
-共 27 项断言，全程不需要硬件，也不需要真实大模型（用一个故意慢 6 秒的假大模型验证不阻塞）。
+它会自己拉起一个临时服务器、灌入各场景、检查分类/计步/跌落/落盘/超时解耦/畸形载荷/
+**指令往返与超时**，共 47 项断言，全程不需要硬件，也不需要真实大模型
+（用一个故意慢 6 秒的假大模型验证不阻塞）。
 
 ### 可选：接入真实大模型
 
