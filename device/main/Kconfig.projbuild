@@ -29,6 +29,20 @@ menu "RW1 AI Interaction (board to PC server)"
         int "Telemetry period (ms)"
         default 500
         help
-            How often the board POSTs an IMU sample to the server.
+            How often the board POSTs one batch of buffered IMU samples to
+            the server. Keep this well above RW1_SAMPLE_PERIOD_MS.
+
+    config RW1_SAMPLE_PERIOD_MS
+        int "IMU sampling period (ms)"
+        default 10
+        help
+            10 ms = 100 Hz. Samples are buffered locally and sent as a single
+            batch every RW1_TELEMETRY_PERIOD_MS, so the HTTP rate stays low
+            while the server still gets a real waveform.
+
+            Do not raise this above ~20 ms: step counting (walking is
+            1.5-2.5 Hz) and free-fall detection (< 0.5 s of weightlessness)
+            are physically impossible below 50 Hz. The original 500 ms
+            (2 Hz) sampling made both features silently fake.
 
 endmenu

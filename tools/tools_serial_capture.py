@@ -5,7 +5,7 @@ Opens the given COM port, pulses a reset-to-run on the ESP32 (RTS=EN), then
 prints every line received for N seconds and exits. Unlike `idf.py monitor`
 this terminates, so it can be used non-interactively to sample telemetry.
 
-Usage: python tools_serial_capture.py COM10 30
+Usage: python tools/tools_serial_capture.py COM10 30
 """
 import sys
 import time

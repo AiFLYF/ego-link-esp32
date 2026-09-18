@@ -1,7 +1,8 @@
 # Ego Link 教学版实现 · AI交互课项目仓库
 
 > 《AI交互原型与用户体验设计》（18 周，贯穿样例"Ego Link 随身智能终端"）的课程项目实现仓库，按周推进。
-> 当前进度 **第1周**（已实机跑通）：把开发板的一项真实传感数据（ESP32-S3-EYE 板载 SC7A20 加速度计）采集出来，送到自己的服务器（没有 VPS，用电脑代替）并验证 —— 即下图全链路。
+> 当前进度 **第1周**（已实机跑通）：把开发板的一项真实传感数据（ESP32-S3-EYE 板载 SC7A20 加速度计）
+> 以 100Hz 采集、按批送到自己的服务器（没有 VPS，用电脑代替）、落盘存储并验证 —— 即下图全链路。
 >
 > 🏠 项目主页（three.js 数据闭环可视化）：<https://aiflyf.github.io/ego-link-esp32/>
 
@@ -21,45 +22,59 @@
 ## 整体流程（数据闭环）
 
 ```
-┌─────────────────┐  WiFi   ┌──────────────────────────────────────────┐
-│  ESP32-S3-EYE   │ ──────► │        你的电脑 = 服务器 (server.py)        │
-│  ┌───────────┐  │  HTTP   │  ① 接收 IMU 遥测  POST /api/telemetry     │
-│  │ IMU 采样   │──┼───────► │  ② AI 分析姿态/晃动/计步（规则引擎，        │
-│  ├───────────┤  │  JSON   │     可配大模型 key 自动升级成真 LLM）      │
-│  │ LVGL 屏幕  │◄─┼──────── │  ③ 结果回传开发板显示                      │
-│  ├───────────┤  │  响应   │  ④ 网页仪表盘实时推送 GET /  (SSE)        │
-│  │ BOOT 按键  │  │         │                                          │
-│  └───────────┘  │         └──────────────────────────────────────────┘
-│  单击=向AI提问   │                 浏览器打开 http://<电脑IP>:8000/
-└─────────────────┘
+┌──────────────────┐  WiFi   ┌────────────────────────────────────────────┐
+│  ESP32-S3-EYE    │ ──────► │        你的电脑 = 服务器 (server.py)          │
+│  ┌────────────┐  │  HTTP   │  ① 接收 IMU 遥测  POST /api/telemetry       │
+│  │ IMU 100Hz  │──┼───────► │     每 500ms 一批（默认 50 个样本）           │
+│  │ 本地缓冲   │  │  批量   │  ② AI 分析姿态/晃动/计步/跌落（规则引擎，      │
+│  ├────────────┤  │  JSON   │     配了大模型 key 时提问改由真 LLM 回答）     │
+│  │ LVGL 屏幕  │◄─┼──────── │  ③ 结果回传开发板显示                        │
+│  ├────────────┤  │  响应   │  ④ 网页仪表盘实时推送 GET /  (SSE)           │
+│  │ BOOT 按键  │  │         │  ⑤ 遥测与事件落盘 server/data/*.jsonl        │
+│  └────────────┘  │         └────────────────────────────────────────────┘
+│  单击 = 向AI提问  │               浏览器打开 http://<电脑IP>:8000/
+│  长按 = 切方向校准│
+└──────────────────┘
 ```
 
-1. **板子**每 500ms 读一次加速度计（g 值），POST 到电脑的服务器；
-2. **服务器**用滑动窗口做运动分类（静置/倾斜方向/晃动/步行计步/疑似跌落），即"AI 分析"；
+1. **板子**以 100Hz 采样加速度计，在本地缓冲成一批，每 500ms POST 一次到电脑的服务器；
+2. **服务器**把整批样本并入滑动窗口，做运动分类（静置/倾斜方向/晃动/步行计步/疑似跌落）；
 3. 服务器把 `当前活动 + AI回复` 放进 HTTP 响应里回传，**板子屏幕实时显示**；
-4. **按 BOOT 键** → 下一帧遥测带上 `ask` 标志 → 服务器生成一段中文 AI 摘要（或调用大模型）→ 板子屏幕显示回复；
-5. 电脑浏览器打开仪表盘，实时看板子的姿态球、|a| 曲线、事件流和 AI 对话。
+4. **单击 BOOT 键** → 下一帧遥测带上 `ask` 标志 → 服务器**立刻**回一句"正在思考…"，
+   大模型在后台线程生成答案，下一帧起板子就能读到真正的回复（板端不会被大模型拖住）；
+5. **长按 BOOT 键** → 循环切换倾斜方向校准（0–7），存进 NVS，不用重编译；
+6. 电脑浏览器打开仪表盘，实时看板子的姿态球、|a| 曲线、事件流和 AI 对话。
+
+> **为什么是"100Hz 采样 + 批量上报"？** 走路频率约 1.5–2.5Hz、自由落体不到 0.5 秒。
+> 如果按每 500ms 采一个点（2Hz）直接上报，计步和跌落检测在物理上就不可能做对，
+> 只能算出假的数字。现在 HTTP 频率仍是 2Hz，但服务端拿到的是真实波形。
 
 ## 目录
 
 | 路径 | 内容 |
 |---|---|
 | `server/server.py` | 电脑服务器（仅 Python 标准库，无需 pip 安装） |
+| `server/data/` | **运行时生成**的 JSONL 日志（git-ignored，见下文"数据落盘"） |
 | `device/` | 开发板 ESP-IDF 工程（ESP-IDF v5.4.x，目标 esp32s3） |
-| `device/main/` | `main.c` 启动、`accel_input.c` IMU驱动（SC7A20/LIS3DH/MPU6050/QMA7981 自动识别）、`wifi_link.c`、`transport.c` HTTP遥测、`ui.c` LVGL界面 |
-| `device/main/Kconfig.projbuild` | WiFi 账号、服务器 URL、上报周期（占位默认值，用 menuconfig 配自己的） |
+| `device/main/` | `main.c` 启动、`accel_input.c` IMU驱动（SC7A20/LIS3DH/MPU6050/QMA7981 自动识别）、`wifi_link.c`、`transport.c` 采样+HTTP遥测、`ui.c` LVGL界面 |
+| `device/main/Kconfig.projbuild` | WiFi 账号、服务器 URL、采样周期、上报周期（占位默认值，用 menuconfig 配自己的） |
 | `tools/gen_font.py` | **必跑**：中文字体子集生成器（生成 git-ignored 的 `device/main/rw1_font.c`） |
+| `tools/fake_board.py` | 假开发板：不接硬件就能灌数据、调仪表盘 |
+| `tools/verify_server.py` | 服务端回归测试（27 项断言，含"大模型不阻塞板端"验证） |
+| `tools/idf_build.py` | 在 Git Bash 里调用 `idf.py` 的包装器（见常见问题） |
+| `tools/tools_serial_capture.py` | 非交互串口抓取（复位→打印N秒→退出，需 pyserial） |
 | `build_device.bat` / `flash_device.bat` | 干净环境编译 / 烧录+串口抓取（参数化 COM 口与秒数） |
-| `tools_serial_capture.py` | 非交互串口抓取（复位→打印N秒→退出，需 pyserial） |
 | LICENSE / NOTICE | MIT；第三方组件与字体授权说明 |
 
-以下内容由构建/组件管理器生成、**不入库**：`device/build/`、`device/managed_components/`、`device/sdkconfig`、`device/main/rw1_font.*`。
+以下内容由构建/组件管理器生成、**不入库**：`device/build/`、`device/managed_components/`、
+`device/sdkconfig`、`device/main/rw1_font.*`、`server/data/`。
 
 ## 首次上手（4 步）
 
 ```powershell
 # ① 生成中文字体（任意带 fontTools 的 Python；从本机字体裁剪，见 NOTICE 授权说明）
 python tools/gen_font.py
+python tools/gen_font.py --list-fonts   # 看看本机有哪些可用中文字体
 
 # ② 配置自己的 WiFi 与电脑 IP（Kconfig → "RW1 AI Interaction"，值存于本地 sdkconfig）
 cd device && idf.py -D SDKCONFIG_DEFAULTS=sdkconfig.bsp.esp32_s3_eye menuconfig
@@ -81,14 +96,68 @@ python server\server.py
 - **离线/国内网络**：首次编译在线拉取组件可先走代理：`set https_proxy=http://127.0.0.1:10808`（按自己代理端口）；完全离线则把已解析的 `managed_components/` 拷入 `device/`（`dependencies.lock` 已提供，保证版本一致）。
 - 断网后板子**无限重试**（前8次每2s，之后每15s），网络恢复即自动重连，无需重新烧录。
 
+### 采样与上报节奏（menuconfig）
+
+| 配置项 | 默认 | 说明 |
+|---|---|---|
+| `RW1_SAMPLE_PERIOD_MS` | 10 | 本地 IMU 采样周期，10ms = 100Hz。**不要超过 20ms**，否则计步/跌落做不了 |
+| `RW1_TELEMETRY_PERIOD_MS` | 500 | 每 500ms 把缓冲的样本打包成一次 HTTP POST |
+
 ### API 协议
 
 | 方法/路径 | 说明 |
 |---|---|
-| `POST /api/telemetry` | 请求 `{x,y,z,source,ask,q}` → 响应 `{ok,activity,reply}` |
-| `GET /api/latest` | 快照（状态 + 8s 样本 + 事件流），JSON |
+| `POST /api/telemetry` | 请求 `{batch:[[x,y,z],…], x, y, z, source, ask, q}` → 响应 `{ok, activity, reply, pending}` |
+| `GET /api/latest` | 快照（状态 + 8s 曲线降采样 + 事件流），JSON |
 | `GET /api/stream` | SSE 实时推送（仪表盘用） |
+| `GET /api/logs` | 落盘目录与文件大小 |
 | `GET /` | 网页仪表盘 |
+
+- `batch` 是本次周期内的全部样本；`x/y/z` 是最后一帧，供旧版服务端或快速查看。
+  只发 `x/y/z`（不带 `batch`）也能用，服务端按单帧处理。
+- **`x/y` 是屏幕坐标系（+x 右、+y 下）**：板端在发送前应用了自己的 NVS 方向校准，
+  所以服务端说的"上/下/左/右"和板子屏幕上显示的永远一致。
+- `pending: true` 表示服务端正在后台调大模型，此时的 `reply` 是占位文案
+  （"正在思考…"），下一帧或之后几帧会带回真正的答案。
+
+### 数据落盘（第 1 周的"存储"）
+
+服务器默认把数据写到 `server/data/`，按天分文件、JSONL 追加：
+
+| 文件 | 内容 |
+|---|---|
+| `telemetry-YYYY-MM-DD.jsonl` | 原始波形，默认降采样到 10Hz，一行一批：`{"k":"t","ts":…,"src":…,"hz":…,"s":[[x,y,z],…]}` |
+| `events-YYYY-MM-DD.jsonl` | 事件流：连接/断开、活动变化、晃动、跌落、AI 提问与回复 |
+
+写盘在独立后台线程里做，磁盘慢或写满都不会拖慢遥测响应。相关参数：
+
+```powershell
+python server\server.py --data-dir D:\rw1data     # 换目录
+python server\server.py --log-hz 50               # 波形按 50Hz 存（更占空间）
+python server\server.py --retain-days 30          # 启动时清理 30 天前的文件（0=不清理）
+python server\server.py --no-log-telemetry        # 只存事件，不存波形
+```
+
+粗略占用：默认 10Hz 波形约 15–20 MB/天，配合 `--retain-days` 可控制总量。
+
+### 不用开发板也能跑
+
+```powershell
+python server\server.py                                   # 一个终端起服务器
+python tools\fake_board.py --scenario walk --seconds 20    # 另一个终端灌数据
+```
+
+`--scenario` 可选 `idle / tilt / walk / shake / fall / mixed`；`--ask-at 5` 模拟按 BOOT 提问；
+`--expect-steps 8` 会在结束时断言服务端真的数出了步数（非 0 退出码 = 失败）。
+
+改完服务端逻辑跑一遍回归测试：
+
+```powershell
+python tools\verify_server.py
+```
+
+它会自己拉起一个临时服务器、灌入各场景、检查分类/计步/跌落/落盘/超时解耦/畸形载荷，
+共 27 项断言，全程不需要硬件，也不需要真实大模型（用一个故意慢 6 秒的假大模型验证不阻塞）。
 
 ### 可选：接入真实大模型
 
@@ -101,6 +170,8 @@ set RW1_LLM_MODEL=qwen-turbo
 python server\server.py
 ```
 
+大模型调用跑在后台线程里，HTTP 响应立刻返回，所以模型再慢也不会让板端超时。
+
 ## 常见问题
 
 | 现象 | 处理 |
@@ -108,9 +179,19 @@ python server\server.py
 | 屏幕显示"服务器:无连接" | 服务器没启动 / 防火墙拦截 / `RW1_SERVER_URL` IP 不对 |
 | 连不上 WiFi（反复 retry） | 路由器侧问题（密码改了/AP重启/信道）；板子会自动无限重试，恢复后自动重连 |
 | 编译报 `rw1_font.c missing` | 先跑 `python tools/gen_font.py`（见首次上手①） |
+| 屏幕中文显示成方块 | 跑 `gen_font.py`，它会报告"板端文案缺字"；换了显示文案后要重跑再编译 |
 | 首次编译卡在拉取组件 | 离线场景拷入 `managed_components/`；在线场景检查能否访问 components.espressif.com |
-| 中文显示为方块/乱码 | LVGL 自带"演示CJK字体"缺字严重，不要启用；用本仓库的 gen_font 子集 + tiny_ttf 方案。改了显示文案后重跑 gen_font 再编译 |
+| 改了 `idf_component.yml` 后编译报 `[safe-delete]` 或重新下载组件 | 删掉 `device/managed_components/` 让它按 `dependencies.lock` 重建即可 |
+| **在 Git Bash 里跑 `idf.py` 只打印一句 "MSys/Mingw is no longer supported" 就退出** | ESP-IDF 5.4 的 `idf.py` 只要环境里存在 `MSYSTEM` 变量（Git for Windows 会强制注入，`unset` 也删不掉）就**直接跳过 `main()`**。用 `build_device.bat`，或 `python tools/idf_build.py -D SDKCONFIG_DEFAULTS=sdkconfig.bsp.esp32_s3_eye build` |
+| 倾斜方向左右/上下反了 | **长按 BOOT 键**循环切换校准值（屏幕上 `o0`–`o7`），存在 NVS 里，不用重编译 |
+| 板子日志每隔 10 秒出现一行 `link OK` | 正常心跳（每 20 次上报一次） |
 | 改 WiFi/服务器地址 | `idf.py menuconfig` → `RW1 AI Interaction`（值只存在本地 sdkconfig，不会被提交） |
+
+## 安全提示
+
+服务器默认监听 `0.0.0.0:8000`、无鉴权、CORS 放开，遥测接口任何同网设备都能写。
+这在课堂/家庭局域网里没问题，但**不要把它暴露到公网**。需要时用
+`--host 127.0.0.1` 限制为本机访问，或自行加一层反向代理与鉴权。
 
 ## License
 

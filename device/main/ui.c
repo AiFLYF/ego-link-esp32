@@ -1,7 +1,12 @@
 /*
- * SPDX-License-Identifier: CC0-1.0
+ * SPDX-License-Identifier: MIT
+ *
  * See ui.h. An LVGL timer (runs in the display task context, safe for LVGL)
  * refreshes the labels from transport_get_status() every 500 ms.
+ *
+ * Every label has an explicit size and LV_LABEL_LONG_DOT, so a long AI reply is
+ * clipped with "…" instead of growing past the 240x240 screen and printing over
+ * the labels above it (which is what a wrapped, unbounded label did before).
  */
 #include "ui.h"
 
@@ -22,14 +27,17 @@
 
 static const char *TAG = "ui";
 
+#define SCREEN_W 240
+
 static lv_obj_t *s_lbl_status;
 static lv_obj_t *s_lbl_act;
 static lv_obj_t *s_lbl_data;
 static lv_obj_t *s_lbl_reply;
 static char s_last_reply[TRANSPORT_REPLY_LEN];
+static bool s_last_pending;
 
 /* LVGL's built-in CJK demo fonts cover only a handful of random glyphs, so we
- * embed a proper SimHei subset (rw1/tools/gen_font.py) and rasterise it with
+ * embed a proper SimHei subset (tools/gen_font.py) and rasterise it with
  * tiny_ttf. Must be created under the LVGL lock (ui_init holds it). */
 static const lv_font_t *CJK_FONT(void)
 {
@@ -47,10 +55,17 @@ static const lv_font_t *CJK_FONT(void)
 #endif
 }
 
-static void style_label(lv_obj_t *lbl, uint32_t color)
+/* Fixed-size, clipped, wrapping label. */
+static lv_obj_t *make_label(lv_obj_t *parent, uint32_t color, int y, int w, int h)
 {
+    lv_obj_t *lbl = lv_label_create(parent);
     lv_obj_set_style_text_font(lbl, CJK_FONT(), 0);
     lv_obj_set_style_text_color(lbl, lv_color_hex(color), 0);
+    lv_obj_set_style_text_align(lbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_size(lbl, w, h);
+    lv_label_set_long_mode(lbl, LV_LABEL_LONG_DOT);
+    lv_obj_align(lbl, LV_ALIGN_TOP_MID, 0, y);
+    return lbl;
 }
 
 static void ui_timer_cb(lv_timer_t *timer)
@@ -60,24 +75,29 @@ static void ui_timer_cb(lv_timer_t *timer)
     transport_get_status(&st);
 
     char buf[128];
-    snprintf(buf, sizeof(buf), "%s · 服务器:%s · 发送%u",
+    snprintf(buf, sizeof(buf), "%s · 服务器:%s · %dHz",
              wifi_link_state_str(), st.server_ok ? "OK" : "无连接",
-             (unsigned)(st.posts_ok + st.posts_fail));
+             (int)(1000 / CONFIG_RW1_SAMPLE_PERIOD_MS));
     lv_label_set_text(s_lbl_status, buf);
     lv_obj_set_style_text_color(s_lbl_status,
                                 lv_color_hex(st.server_ok ? 0x7ee787 : 0xf85149), 0);
 
     lv_label_set_text(s_lbl_act, st.activity[0] ? st.activity : "等待服务器…");
 
-    snprintf(buf, sizeof(buf), "IMU %s  X%+.2f Y%+.2f Z%+.2f",
-             st.source, st.x_g, st.y_g, st.z_g);
+    snprintf(buf, sizeof(buf), "%s  o%d  %d/批\nX%+.2f Y%+.2f Z%+.2f",
+             st.source, st.orient, st.batch_last, st.x_g, st.y_g, st.z_g);
     lv_label_set_text(s_lbl_data, buf);
 
-    /* Only rewrite the (wrapped) reply label when the text actually changed. */
-    if (strcmp(st.reply, s_last_reply) != 0) {
+    /* Only rewrite the reply label when the text actually changed. */
+    if (strcmp(st.reply, s_last_reply) != 0 || st.ai_pending != s_last_pending) {
         strlcpy(s_last_reply, st.reply, sizeof(s_last_reply));
+        s_last_pending = st.ai_pending;
         lv_label_set_text(s_lbl_reply,
                           st.reply[0] ? st.reply : "按 BOOT 键向电脑服务器的AI提问");
+        /* Dim it while the server is still generating, so "正在思考…" reads as
+         * a state rather than as the answer. */
+        lv_obj_set_style_text_color(s_lbl_reply,
+                                    lv_color_hex(st.ai_pending ? 0x8b949e : 0xe3b341), 0);
     }
 }
 
@@ -90,32 +110,20 @@ esp_err_t ui_init(void)
 
     lv_obj_t *title = lv_label_create(scr);
     lv_label_set_text(title, "AI交互课 · 第1周");
-    style_label(title, 0x8b949e);
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 6);
+    lv_obj_set_style_text_font(title, CJK_FONT(), 0);
+    lv_obj_set_style_text_color(title, lv_color_hex(0x8b949e), 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 4);
 
-    s_lbl_status = lv_label_create(scr);
-    style_label(s_lbl_status, 0x7ee787);
-    lv_obj_align(s_lbl_status, LV_ALIGN_TOP_MID, 0, 28);
+    s_lbl_status = make_label(scr, 0x7ee787, 26, SCREEN_W - 12, 20);
+    lv_label_set_text(s_lbl_status, "启动中…");
 
-    s_lbl_act = lv_label_create(scr);
-    style_label(s_lbl_act, 0x7ee787);
-    lv_obj_set_style_text_color(s_lbl_act, lv_color_hex(0x7ee787), 0);
+    s_lbl_act = make_label(scr, 0x7ee787, 50, SCREEN_W - 12, 42);
     lv_label_set_text(s_lbl_act, "启动中…");
-    lv_obj_set_width(s_lbl_act, 228);
-    lv_label_set_long_mode(s_lbl_act, LV_LABEL_LONG_WRAP);
-    lv_obj_set_style_text_align(s_lbl_act, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_align(s_lbl_act, LV_ALIGN_CENTER, 0, -38);
 
-    s_lbl_data = lv_label_create(scr);
-    style_label(s_lbl_data, 0x79c0ff);
-    lv_obj_align(s_lbl_data, LV_ALIGN_CENTER, 0, 8);
+    s_lbl_data = make_label(scr, 0x79c0ff, 96, SCREEN_W - 12, 42);
 
-    s_lbl_reply = lv_label_create(scr);
-    style_label(s_lbl_reply, 0xe3b341);
-    lv_obj_set_width(s_lbl_reply, 224);
-    lv_label_set_long_mode(s_lbl_reply, LV_LABEL_LONG_WRAP);
+    s_lbl_reply = make_label(scr, 0xe3b341, 142, SCREEN_W - 12, 90);
     lv_label_set_text(s_lbl_reply, "按 BOOT 键向电脑服务器的AI提问");
-    lv_obj_align(s_lbl_reply, LV_ALIGN_BOTTOM_MID, 0, -22);
 
     lv_timer_create(ui_timer_cb, 500, NULL);
 

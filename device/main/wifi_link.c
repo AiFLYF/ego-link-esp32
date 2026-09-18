@@ -1,5 +1,5 @@
 /*
- * SPDX-License-Identifier: CC0-1.0
+ * SPDX-License-Identifier: MIT
  *
  * WiFi STA + Aliyun SNTP (same pattern as biaopan main/time_sync.c, but the
  * link state is exposed as a simple up/down flag for the transport task).
