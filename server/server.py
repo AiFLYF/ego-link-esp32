@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-AI 交互课 · 第 1 周任务 —— PC 服务器（无需 VPS，自己的电脑即服务器）
+AI 交互课 · 第 2 周任务 —— PC 服务器（无需 VPS，自己的电脑即服务器）
 
 职责：
   1. 接收 ESP32-S3-EYE 上报的 IMU 遥测数据（HTTP POST /api/telemetry）
@@ -9,6 +9,8 @@ AI 交互课 · 第 1 周任务 —— PC 服务器（无需 VPS，自己的电�
   3. 向开发板返回交互结果（当前姿态/活动 + AI 回复文本），开发板在屏幕上显示
   4. 提供网页仪表盘（SSE 实时推送），在浏览器里看到板子的实时姿态、事件流与 AI 对话
   5. 把遥测与事件落到 server/data/*.jsonl（重启不丢，可回放/分析）
+  6. **远程指令通道**：网页下发「采集一次」→ 搭下一帧遥测的响应下发 → 板子执行后
+     按 request_id 回传结果 → 网页显示 queued/sent/done 全过程（第 2 周）
 
 仅依赖 Python 标准库，直接运行：
     python server.py                        # 默认监听 0.0.0.0:8000，数据写 server/data/
@@ -62,6 +64,11 @@ SHAKE_MIN_GAP_S = 0.6     # 晃动事件的最小间隔（秒），避免一次�
 FREEFALL_G = 0.35         # 失重判定：合加速度阈值（g）
 FREEFALL_MIN_S = 0.05     # 失重判定：至少持续这么久才算疑似跌落（秒）
 
+# ---- 远程命令（第 2 周：Web 下发「采集一次」，按 request_id 反馈结果）----
+CMD_TIMEOUT_S = 10.0      # 命令下发后多久没收到结果就判超时
+CMD_MAX_HISTORY = 20      # 保留最近多少条命令供网页显示
+CMD_NAMES = ("capture_once",)   # 支持的指令白名单（不认的名字直接 400）
+
 ACTIVITY_IDLE = "等待数据…"
 
 # --------------------------------------------------------------------------
@@ -71,6 +78,9 @@ LOCK = threading.Lock()
 SAMPLES = deque(maxlen=MAX_WINDOW)        # [(ts, x, y, z)]，x/y 为屏幕坐标
 SHAKE_TIMES = deque(maxlen=256)           # 晃动事件时间戳（窗口内计数用）
 EVENTS = deque(maxlen=200)                # 事件流（网页显示）
+COMMANDS = {}                             # request_id -> 命令记录
+COMMAND_QUEUE = deque()                   # 待下发的 request_id（FIFO）
+CMD_SEQ = 0                               # 生成可读 request_id 的递增序号
 STATE = {
     "device_online": False,
     "last_post": 0.0,
@@ -107,6 +117,104 @@ def clip_utf8(text, limit):
         except UnicodeDecodeError:
             cut = cut[:-1]
     return "…"
+
+
+# --------------------------------------------------------------------------
+# 远程命令：Web 下发 → 板端执行 → 按 request_id 回传结果
+#
+# 板子是纯客户端（没有长连接、不能主动收推送），所以用**搭车**的方式：
+# 命令挂在下一帧遥测的响应里下发，板子执行完在**再下一帧**的请求体里带回结果。
+# 一次往返 = 2 个遥测周期（默认 1 秒），网页上能看到 queued → sent → done 全过程。
+# --------------------------------------------------------------------------
+def new_command(name, params=None):
+    """建一条待下发的命令，返回 request_id。"""
+    global CMD_SEQ
+    with LOCK:
+        CMD_SEQ += 1
+        cid = "c-%d-%d" % (int(time.time()), CMD_SEQ)
+        COMMANDS[cid] = {
+            "id": cid,
+            "name": name,
+            "params": params or {},
+            "state": "queued",      # queued / sent / done / failed / timeout
+            "created": time.time(),
+            "sent": None,
+            "done": None,
+            "result": None,
+        }
+        COMMAND_QUEUE.append(cid)
+        # 只保留最近 CMD_MAX_HISTORY 条，避免长跑时无限增长
+        while len(COMMANDS) > CMD_MAX_HISTORY:
+            oldest = min(COMMANDS, key=lambda k: COMMANDS[k]["created"])
+            COMMANDS.pop(oldest, None)
+            try:
+                COMMAND_QUEUE.remove(oldest)
+            except ValueError:
+                pass
+    return cid
+
+
+def take_command_for_board():
+    """取一条待下发的命令并标记为 sent。**调用方必须已持有 LOCK。**
+
+    返回给板端的 {"id","name","params"}，或 None。一次只发一条，
+    板子也一次只执行一条，语义简单、不会乱序。
+    """
+    while COMMAND_QUEUE:
+        cid = COMMAND_QUEUE.popleft()
+        rec = COMMANDS.get(cid)
+        if rec is None or rec["state"] != "queued":
+            continue
+        rec["state"] = "sent"
+        rec["sent"] = time.time()
+        return {"id": cid, "name": rec["name"], "params": rec["params"]}
+    return None
+
+
+def apply_command_result(res):
+    """处理板端回传的 result，返回一句给人看的事件文本（无关/不匹配则 None）。
+
+    注意本函数内部会取 LOCK，不能在持有 LOCK 时调用。
+    """
+    if not isinstance(res, dict):
+        return None
+    cid = str(res.get("id", ""))[:32]
+    keep = ("id", "ok", "ms", "n", "x", "y", "z", "std", "err")
+    with LOCK:
+        rec = COMMANDS.get(cid)
+        if rec is None:
+            return None                      # 可能是被淘汰的老命令，静默忽略
+        rec["state"] = "done" if res.get("ok") else "failed"
+        rec["done"] = time.time()
+        rec["result"] = {k: res[k] for k in keep if k in res}
+        latency = (rec["done"] - rec["sent"]) if rec["sent"] else 0.0
+        name = rec["name"]
+        r = rec["result"]
+        if rec["state"] == "done":
+            text = ("命令 %s 完成（往返 %.0f ms）：x=%+.3f y=%+.3f z=%+.3f，%d 样本，标准差 %.4f g"
+                    % (name, latency * 1000, r.get("x", 0.0), r.get("y", 0.0), r.get("z", 0.0),
+                       r.get("n", 0), r.get("std", 0.0)))
+        else:
+            text = "命令 %s 执行失败：%s" % (name, r.get("err", "未说明"))
+    return text
+
+
+def expire_commands():
+    """把下发后长时间没回音的命令判为超时，返回超时的命令名列表。"""
+    now = time.time()
+    expired = []
+    with LOCK:
+        for rec in COMMANDS.values():
+            if rec["state"] == "sent" and rec["sent"] and (now - rec["sent"]) > CMD_TIMEOUT_S:
+                rec["state"] = "timeout"
+                rec["done"] = now
+                expired.append(rec["name"])
+    return expired
+
+
+def commands_snapshot():
+    """按时间倒序返回最近若干条命令的副本（**调用方必须已持有 LOCK**）。"""
+    return [dict(r) for r in sorted(COMMANDS.values(), key=lambda r: r["created"], reverse=True)]
 
 
 # --------------------------------------------------------------------------
@@ -532,7 +640,13 @@ class Handler(BaseHTTPRequestHandler):
                 snap["samples"] = [[round(t, 2), x, y, z]
                                    for (t, x, y, z) in decimate(SAMPLES, 240)]
                 snap["events"] = list(EVENTS)
+                snap["commands"] = commands_snapshot()
             self._send(200, json.dumps(snap, ensure_ascii=False))
+        elif path == "/api/commands":
+            with LOCK:
+                cmds = commands_snapshot()
+            self._send(200, json.dumps({"ok": True, "commands": cmds,
+                                        "names": list(CMD_NAMES)}, ensure_ascii=False))
         elif path == "/api/logs":
             self._send(200, json.dumps(LOGGER.stats() if LOGGER else {}, ensure_ascii=False))
         elif path == "/api/stream":
@@ -544,8 +658,25 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.split("?")[0]
         if path == "/api/telemetry":
             self._telemetry()
+        elif path == "/api/command":
+            self._command()
         else:
             self._send(404, json.dumps({"ok": False, "error": "not found"}))
+
+    # ---- command (网页 → 服务器 → 板 → 服务器 → 网页) -----------------------
+    def _command(self):
+        msg = self._read_json()
+        name = str(msg.get("name", "capture_once"))[:32]
+        if name not in CMD_NAMES:
+            self._send(400, json.dumps(
+                {"ok": False, "error": "unknown command: %s" % name}, ensure_ascii=False))
+            return
+        with LOCK:
+            online = STATE["device_online"]
+        cid = new_command(name, msg.get("params"))
+        push_event("cmd", "下发命令 %s（%s）" % (name, cid))
+        self._send(200, json.dumps(
+            {"ok": True, "id": cid, "device_online": online}, ensure_ascii=False))
 
     # ---- telemetry (板 → 服务器 → 板) --------------------------------------
     def _telemetry(self):
@@ -580,9 +711,16 @@ class Handler(BaseHTTPRequestHandler):
             for kind, text in events:
                 push_event(kind, text)
             src = STATE["source"]
+            # 有排队中的命令就搭这一帧的响应发下去（一次一条）
+            cmd = take_command_for_board()
 
         if LOGGER is not None:
             LOGGER.telemetry(now, src, pts, dt)
+
+        # 板端回传的上一条命令结果（必须在 LOCK 之外处理，apply_command_result 内部取锁）
+        cmd_text = apply_command_result(msg.get("result"))
+        if cmd_text:
+            push_event("cmd", cmd_text)
 
         reply = ""
         if msg.get("ask"):                  # 板子 BOOT 键 → 请求一次 AI 交互
@@ -599,6 +737,8 @@ class Handler(BaseHTTPRequestHandler):
             "reply": clip_utf8(final_reply, BOARD_REPLY_MAX),
             "pending": pending,
         }
+        if cmd is not None:
+            out["cmd"] = cmd
         self._send(200, json.dumps(out, ensure_ascii=False))
 
     @staticmethod
@@ -632,6 +772,7 @@ class Handler(BaseHTTPRequestHandler):
                 with LOCK:
                     snap = dict(STATE)
                     snap["events"] = list(EVENTS)
+                    snap["commands"] = commands_snapshot()
                     snap["sample"] = list(SAMPLES[-1]) if SAMPLES else None
                 snap["now"] = time.time()
                 self.wfile.write(b"data: " + json.dumps(snap, ensure_ascii=False).encode("utf-8") + b"\n\n")
@@ -676,6 +817,17 @@ canvas{width:100%;height:200px;display:block}
 .gbar i{display:block;height:8px;background:#30363d;border-radius:4px;margin-top:4px;position:relative}
 .gbar i b{position:absolute;top:0;height:100%;border-radius:4px;background:#1f6feb}
 footer{margin-top:12px;color:#8b949e;font-size:11px}
+button{background:#1f6feb;color:#fff;border:0;border-radius:6px;padding:6px 14px;font-size:13px;cursor:pointer;font-family:inherit}
+button:hover:not(:disabled){background:#388bfd}
+button:disabled{background:#30363d;color:#8b949e;cursor:default}
+.cmd{display:flex;gap:8px;align-items:baseline;padding:4px 0;border-bottom:1px dashed #21262d}
+.cmd:last-child{border-bottom:0}
+.st{padding:1px 8px;border-radius:99px;font-size:11px;white-space:nowrap}
+.st-queued{background:#30363d;color:#8b949e}
+.st-sent{background:#d2992233;color:#e3b341}
+.st-done{background:#2ea04333;color:#7ee787}
+.st-failed,.st-timeout{background:#f8514933;color:#f85149}
+.mono{font-family:Consolas,monospace;color:#8b949e}
 @media(max-width:720px){.grid{grid-template-columns:1fr}}
 </style>
 </head>
@@ -702,6 +854,19 @@ footer{margin-top:12px;color:#8b949e;font-size:11px}
   <div class="card">
     <canvas id="cv"></canvas>
     <div class="lbl" style="margin-top:6px">上=倾斜示意图（球随重力滚动，屏幕坐标系）；下方为最近8秒 |a| 曲线</div>
+  </div>
+</div>
+<div class="card" style="max-width:1000px;margin-top:14px">
+  <div class="row" style="margin-top:0">
+    <span class="lbl">远程指令</span>
+    <button id="capbtn">采集一次</button>
+    <span id="cmdhint" class="lbl"></span>
+  </div>
+  <div id="cmds" style="margin-top:8px"></div>
+  <div class="lbl" style="margin-top:8px">
+    点按钮 → 服务器把指令搭在<strong>下一帧遥测的响应</strong>里下发 → 板子采 20 个样本（200ms）算平均与标准差
+    → <strong>再下一帧</strong>带着同一个 request_id 回传结果。状态走 queued → sent → done，
+    是一次真实的硬件往返，不是本地伪造。
   </div>
 </div>
 <div class="card" style="max-width:1000px;margin-top:14px">
@@ -738,9 +903,44 @@ function draw(s){
  ctx.fillStyle='#8b949e';ctx.font=12*devicePixelRatio+'px sans-serif';
  ctx.fillText('|a| g',6*devicePixelRatio,H-8);}
 let evts='';
+const STNAME={queued:'排队中',sent:'已下发',done:'已完成',failed:'失败',timeout:'超时'};
+function renderCmds(cmds){
+ const el=document.getElementById('cmds');
+ if(!cmds||!cmds.length){el.innerHTML='<span class="lbl">还没有下发过指令。</span>';return}
+ const h=cmds.slice(0,8).map(c=>{
+  const r=c.result||{};
+  let extra='';
+  if(c.state==='done'){
+   extra=` <span class="mono">x=${(r.x??0).toFixed(3)} y=${(r.y??0).toFixed(3)} z=${(r.z??0).toFixed(3)}`
+        +` · ${r.n??0}样本 · ${Math.round(r.ms??0)}ms · σ=${(r.std??0).toFixed(4)}g</span>`;
+  }else if(c.state==='failed'){extra=` <span class="mono">${r.err||''}</span>`}
+  const lat=(c.sent&&c.done)?` <span class="mono">往返 ${Math.round((c.done-c.sent)*1000)}ms</span>`:'';
+  return `<div class="cmd"><span class="st st-${c.state}">${STNAME[c.state]||c.state}</span>`
+       + `<span>${c.name}</span><span class="mono">${c.id}</span>${lat}${extra}</div>`}).join('');
+ el.innerHTML=h;
+ // 有未完成的指令时把按钮禁掉，避免连点堆一队列
+ const busy=cmds.some(c=>c.state==='queued'||c.state==='sent');
+ const b=document.getElementById('capbtn');
+ b.disabled=busy||!window.__devOnline;
+ b.textContent=busy?'等待板子回传…':'采集一次';
+}
+document.getElementById('capbtn').onclick=()=>{
+ const b=document.getElementById('capbtn');
+ b.disabled=true;b.textContent='下发中…';
+ document.getElementById('cmdhint').textContent='';
+ fetch('/api/command',{method:'POST',headers:{'Content-Type':'application/json'},
+   body:JSON.stringify({name:'capture_once'})})
+  .then(r=>r.json()).then(d=>{
+    if(!d.ok){document.getElementById('cmdhint').textContent='下发失败：'+(d.error||'未知');return}
+    document.getElementById('cmdhint').textContent='已下发 '+d.id+(d.device_online?'':'（注意：板子当前不在线）');
+    pull();
+  })
+  .catch(e=>{document.getElementById('cmdhint').textContent='下发失败：'+e});
+};
 function es(){
  const src=new EventSource('/api/stream');
  src.onmessage=e=>{const s=JSON.parse(e.data);last=s;
+  window.__devOnline=!!s.device_online;
   document.getElementById('dev').className='badge '+(s.device_online?'on':'off');
   document.getElementById('dev').textContent=s.device_online?'在线':'离线';
   document.getElementById('src').textContent=s.source||'';
@@ -751,6 +951,7 @@ function es(){
   document.getElementById('shakes').textContent=s.shake_count;
   if(s.latest){bar('bx',s.latest[1],'vx');bar('by',s.latest[2],'vy');bar('bz',s.latest[3],'vz')}
   if(s.ai_reply)document.getElementById('reply').textContent='AI：'+s.ai_reply;
+  renderCmds(s.commands);
   const f=document.getElementById('feed');
   if(s.events.length){const h=s.events.slice(0,30).map(ev=>
     `<div><span class="t">${new Date(ev.ts*1000).toLocaleTimeString()}</span>${ev.kind} · ${ev.text}</div>`).join('');
@@ -761,7 +962,8 @@ function es(){
 fetch('/api/logs').then(r=>r.json()).then(l=>{
   if(l&&l.dir)document.getElementById('logdir').textContent='落盘: '+l.dir});
 // SSE 里不带 samples 全量，定时拉一次用于曲线
-function pull(){fetch('/api/latest').then(r=>r.json()).then(s=>{if(last)s.ai_reply=last.ai_reply;last=s;draw(s)})}
+function pull(){fetch('/api/latest').then(r=>r.json()).then(s=>{
+  if(last)s.ai_reply=last.ai_reply;last=s;draw(s);renderCmds(s.commands)})}
 pull();setInterval(pull,2000);
 es();
 </script>
@@ -774,7 +976,9 @@ es();
 # 主入口
 # --------------------------------------------------------------------------
 def main():
-    ap = argparse.ArgumentParser(description="AI交互课第1周 · PC服务器")
+    global LOGGER, CMD_TIMEOUT_S
+
+    ap = argparse.ArgumentParser(description="AI交互课第2周 · PC服务器")
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--data-dir", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "data"),
@@ -785,15 +989,17 @@ def main():
                     help="原始波形落盘的降采样频率（Hz），默认 10")
     ap.add_argument("--no-log-telemetry", action="store_true",
                     help="只落盘事件，不落盘原始波形")
+    ap.add_argument("--cmd-timeout", type=float, default=CMD_TIMEOUT_S,
+                    help="远程指令下发后多久没回传结果就判超时（秒），默认 %.0f" % CMD_TIMEOUT_S)
     args = ap.parse_args()
 
-    global LOGGER
+    CMD_TIMEOUT_S = max(1.0, args.cmd_timeout)
     LOGGER = JsonlLogger(args.data_dir, retain_days=args.retain_days,
                          log_telemetry=not args.no_log_telemetry, log_hz=args.log_hz)
 
     srv = ThreadingHTTPServer((args.host, args.port), Handler)
 
-    # 后台心跳：设备超时判定离线
+    # 后台心跳：设备超时判定离线 + 命令超时看护
     def watchdog():
         while True:
             time.sleep(1.0)
@@ -802,15 +1008,20 @@ def main():
                 if STATE["device_online"] and not online:
                     push_event("info", "开发板连接超时，已标记离线")
                 STATE["device_online"] = online
+            for name in expire_commands():
+                push_event("cmd", "命令 %s 超时（%.0f 秒内没有回传结果）"
+                           % (name, CMD_TIMEOUT_S))
     threading.Thread(target=watchdog, daemon=True).start()
 
     llm = "大模型已配置 (%s)" % os.environ.get("RW1_LLM_MODEL", "?") \
         if os.environ.get("RW1_LLM_API_KEY") else "本地规则AI（可配 RW1_LLM_API_KEY 升级）"
     print("=" * 66)
-    print(" AI交互课 第1周 · PC 服务器已启动")
+    print(" AI交互课 第2周 · PC 服务器已启动")
     print("   仪表盘:  http://localhost:%d/" % args.port)
     print("   遥测:    POST http://<本机IP>:%d/api/telemetry" % args.port)
+    print("   指令:    POST http://<本机IP>:%d/api/command   {\"name\":\"capture_once\"}" % args.port)
     print("   AI模式:  %s" % llm)
+    print("   指令超时: %.0f 秒" % CMD_TIMEOUT_S)
     print("   落盘:    %s%s" % (args.data_dir,
           "（仅事件）" if args.no_log_telemetry else "（波形 %.0fHz + 事件，保留 %d 天）"
           % (args.log_hz, args.retain_days)))
