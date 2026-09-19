@@ -378,21 +378,17 @@ def main():
         check("下发响应带设备在线状态", r.get("device_online") is True,
               "实际: %s" % r.get("device_online"))
 
-        states, rec = [], None
-        deadline = time.time() + 14
-        while time.time() < deadline:
-            cmds = get_json("http://127.0.0.1:%d/api/commands" % port).get("commands", [])
-            rec = next((c for c in cmds if c["id"] == cid), None)
-            if rec and (not states or states[-1] != rec["state"]):
-                states.append(rec["state"])
-            if rec and rec["state"] in ("done", "failed", "timeout"):
-                break
-            time.sleep(0.3)
+        rec = _wait_cmd(port, cid, 14)
         board.wait(timeout=25)
 
+        # 用服务端记录的状态迁移历史断言，**不再靠轮询捕捉中间态**：
+        # sent 只在下发帧和回传帧之间存活约一个遥测周期（0.5 s），
+        # 用 0.3 s 轮询去抓它本质是竞态断言，会因为采样时机随机失败（P0-1）。
+        states = [s for s, _ in (rec or {}).get("history", [])]
         check("指令最终走到 done", rec is not None and rec["state"] == "done",
-              "实际: %s（经历 %s）" % (rec and rec["state"], "→".join(states)))
-        check("中间经过了 sent 状态", "sent" in states, "实际: %s" % states)
+              "实际: %s（历史 %s）" % (rec and rec["state"], "→".join(states)))
+        check("历史里完整记录了 queued→sent→done",
+              states[:3] == ["queued", "sent", "done"], "实际: %s" % states)
         if rec and rec.get("result"):
             res = rec["result"]
             check("回传里带着同一个 request_id", res.get("id") == cid)
@@ -468,6 +464,20 @@ def main():
               p5.get("n") == 12 and p5.get("on_ms") == 20 and p5.get("off_ms") == 5000,
               "实际: %s" % p5)
 
+        # pattern 参数：认的值保留，不认的静默丢掉（不报错、不下发脏数据）
+        r6 = post_json("http://127.0.0.1:%d/api/command" % port,
+                       {"name": "led_blink", "params": {"pattern": "alert"}})
+        rec6 = _wait_cmd(port, r6.get("id"), 14)
+        check("合法 pattern=alert 被保留",
+              (rec6 or {}).get("params", {}).get("pattern") == "alert",
+              "实际: %s" % (rec6 or {}).get("params"))
+        r7 = post_json("http://127.0.0.1:%d/api/command" % port,
+                       {"name": "led_blink", "params": {"pattern": "rm -rf /"}})
+        rec7 = _wait_cmd(port, r7.get("id"), 14)
+        check("非法 pattern 被静默丢掉",
+              "pattern" not in (rec7 or {}).get("params", {}),
+              "实际: %s" % (rec7 or {}).get("params"))
+
         board2.wait(timeout=30)
 
         # ---- 16. 跌落 → 远端物理告警闭环（第 3 周）--------------------------
@@ -487,11 +497,11 @@ def main():
         check("判定跌落后自动排队了 led_blink", len(auto) > 0,
               "实际: 新增 %d 条" % len(auto))
         if auto:
-            check("自动告警用的是 3 次快闪",
-                  auto[0].get("params", {}).get("n") == 3,
+            check("自动告警带 alert 语义图案",
+                  auto[0].get("params", {}).get("pattern") == "alert",
                   "实际: %s" % auto[0].get("params"))
         check("自动告警进了事件流",
-              any("跌落" in (e.get("text") or "") and "led_blink" in (e.get("text") or "")
+              any("跌落" in (e.get("text") or "") and "LED 告警" in (e.get("text") or "")
                   for e in latest(port).get("events", [])))
 
         # ---- 17. 命令历史有上限（放最后，因为它会堆一队列指令）--------------
