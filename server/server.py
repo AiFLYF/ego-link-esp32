@@ -71,6 +71,7 @@ CMD_MAX_HISTORY = 20      # 保留最近多少条命令供网页显示
 CMD_NAMES = ("capture_once", "led_blink", "led_set")   # 白名单（不认的名字直接 400）
 
 LED_MAX_BLINKS = 12       # 一次 led_blink 最多闪几下（板端也会再夹一道）
+LED_PATTERNS = ("alert", "ack", "error")   # led_blink 的语义图案（板端映射到预置图案）
 FALL_AUTO_ALERT = True    # 判定跌落时自动下发 LED 告警（远端物理反馈）
 
 ACTIVITY_IDLE = "等待数据…"
@@ -146,17 +147,34 @@ def sanitize_params(name, params):
     """
     p = params if isinstance(params, dict) else {}
     if name == "led_blink":
-        return {
+        out = {
             "n": clamp_int(p.get("n"), 1, LED_MAX_BLINKS, 3),
             "on_ms": clamp_int(p.get("on_ms"), 20, 5000, 80),
             "off_ms": clamp_int(p.get("off_ms"), 20, 5000, 80),
         }
+        # 可选的语义图案：板端会映射到带含义的预置闪烁（告警/确认/错误），
+        # 比只丢一个"闪 N 次"更能表达意图。不认的值直接丢掉，不报错。
+        pat = str(p.get("pattern", "")).strip().lower()
+        if pat in LED_PATTERNS:
+            out["pattern"] = pat
+        return out
     if name == "led_set":
         v = p.get("on", True)
         if isinstance(v, str):
             v = v.strip().lower() in ("1", "true", "yes", "on")
         return {"on": bool(v)}
     return {}
+
+
+def _mark(rec, state, ts=None):
+    """改命令状态并追加迁移历史。**调用方必须已持有 LOCK。**
+
+    为什么要有 history：`sent` 只在下发帧和回传帧之间存活约一个遥测周期
+    （默认 0.5 s），外部用轮询去捕捉这个中间态本质是竞态断言——测试会因为
+    采样时机而随机失败。有了历史，断言改成查表即可，网页也能画出时间线。
+    """
+    rec["state"] = state
+    rec["history"].append([state, ts if ts is not None else time.time()])
 
 
 def new_command(name, params=None):
@@ -170,6 +188,7 @@ def new_command(name, params=None):
             "name": name,
             "params": sanitize_params(name, params),
             "state": "queued",      # queued / sent / done / failed / timeout
+            "history": [["queued", time.time()]],
             "created": time.time(),
             "sent": None,
             "done": None,
@@ -198,8 +217,8 @@ def take_command_for_board():
         rec = COMMANDS.get(cid)
         if rec is None or rec["state"] != "queued":
             continue
-        rec["state"] = "sent"
         rec["sent"] = time.time()
+        _mark(rec, "sent", rec["sent"])
         return {"id": cid, "name": rec["name"], "params": rec["params"]}
     return None
 
@@ -217,8 +236,8 @@ def apply_command_result(res):
         rec = COMMANDS.get(cid)
         if rec is None:
             return None                      # 可能是被淘汰的老命令，静默忽略
-        rec["state"] = "done" if res.get("ok") else "failed"
         rec["done"] = time.time()
+        _mark(rec, "done" if res.get("ok") else "failed", rec["done"])
         rec["result"] = {k: res[k] for k in keep if k in res}
         latency = (rec["done"] - rec["sent"]) if rec["sent"] else 0.0
         name = rec["name"]
@@ -236,14 +255,23 @@ def apply_command_result(res):
 
 
 def expire_commands():
-    """把下发后长时间没回音的命令判为超时，返回超时的命令名列表。"""
+    """把长时间没有进展的命令判为超时，返回超时的命令名列表。
+
+    **`queued` 也要算**：设备离线时下发的命令会一直停在 queued，而 COMMANDS
+    上限只有 CMD_MAX_HISTORY 条——长时间离线会把历史全占满，新命令被挤掉；
+    设备几小时后重新上线还会被补发一批几小时前的操作（比如"闪灯"）。
+    所以 queued 以 created 为基准计时，sent 以 sent 为基准。
+    """
     now = time.time()
     expired = []
     with LOCK:
         for rec in COMMANDS.values():
-            if rec["state"] == "sent" and rec["sent"] and (now - rec["sent"]) > CMD_TIMEOUT_S:
-                rec["state"] = "timeout"
+            if rec["state"] not in ("queued", "sent"):
+                continue
+            base = rec["sent"] or rec["created"]
+            if (now - base) > CMD_TIMEOUT_S:
                 rec["done"] = now
+                _mark(rec, "timeout", now)
                 expired.append(rec["name"])
     return expired
 
@@ -771,8 +799,8 @@ class Handler(BaseHTTPRequestHandler):
         # 远端物理反馈闭环：判定跌落就自动下发 LED 告警。
         # 必须在 LOCK 之外 —— new_command 内部要取锁，在锁里调用会死锁。
         if fell and FALL_AUTO_ALERT:
-            aid = new_command("led_blink", {"n": 3, "on_ms": 80, "off_ms": 80})
-            push_event("alert", "判定跌落，自动下发 led_blink 3 次做物理告警（%s）" % aid)
+            aid = new_command("led_blink", {"pattern": "alert"})
+            push_event("alert", "判定跌落，自动下发 LED 告警（%s）" % aid)
 
         reply = ""
         if msg.get("ask"):                  # 板子 BOOT 键 → 请求一次 AI 交互
