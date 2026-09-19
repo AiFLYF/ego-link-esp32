@@ -100,10 +100,14 @@ void app_main(void)
     ESP_ERROR_CHECK_WITHOUT_ABORT(led_feedback_init());
 
     ESP_ERROR_CHECK(ui_init());
+
+    /* transport_start() 必须排在 setup_ask_button() 之前：前者会创建状态互斥锁，
+     * 而按键回调（transport_request_ask）要用那把锁。反过来的话，
+     * 开机瞬间的按键会取到 NULL 锁。 */
+    transport_start();
     setup_ask_button();
 
     wifi_link_start();
-    transport_start();
 
     ESP_LOGI(TAG, "rw1 board app: IMU %dHz -> batch -> %s%s",
              (int)(1000 / CONFIG_RW1_SAMPLE_PERIOD_MS),

@@ -90,6 +90,7 @@ static int s_ask_attempts;
 static char s_ask_text[64] = "我现在的运动状态怎么样？";
 static uint32_t s_post_count;
 static int s_btn_pending;      /* 自上次成功上报以来 BOOT 被按了几次（第 3 周） */
+static uint32_t s_bad_samples; /* 累计丢弃的不可用样本数（P1-4，只统计不上报） */
 static char s_last_reply[TRANSPORT_REPLY_LEN];   /* 上一次看到过的服务器回复 */
 
 /* [(x,y,z)] in screen frame, filled by the sampling loop. */
@@ -135,6 +136,35 @@ typedef enum {
     CMD_LED_BLINK,      /* led_blink    —— 闪 n 次（远端物理反馈） */
     CMD_LED_SET,        /* led_set      —— 常亮/熄灭 */
 } cmd_kind_t;
+
+/* led_blink 的可选 pattern 参数：让服务端能表达"这是告警/确认/错误"的语义，
+ * 而不是只丢一个"闪 N 次"过来。板端映射到对应的预置图案——
+ * 现场一眼能分清是远端告警还是普通闪灯。 */
+enum {
+    CMD_PATTERN_NONE = 0,
+    CMD_PATTERN_ALERT,
+    CMD_PATTERN_ACK,
+    CMD_PATTERN_ERROR,
+};
+
+static int json_pattern(const cJSON *obj)
+{
+    const cJSON *v = cJSON_IsObject(obj)
+                     ? cJSON_GetObjectItemCaseSensitive(obj, "pattern") : NULL;
+    if (!cJSON_IsString(v) || v->valuestring == NULL) {
+        return CMD_PATTERN_NONE;
+    }
+    if (strcmp(v->valuestring, "alert") == 0) {
+        return CMD_PATTERN_ALERT;
+    }
+    if (strcmp(v->valuestring, "ack") == 0) {
+        return CMD_PATTERN_ACK;
+    }
+    if (strcmp(v->valuestring, "error") == 0) {
+        return CMD_PATTERN_ERROR;
+    }
+    return CMD_PATTERN_NONE;
+}
 
 static int json_int(const cJSON *obj, const char *key, int dflt)
 {
@@ -214,7 +244,7 @@ static void start_capture(const char *id)
 
 /* 执行一条刚收到的指令。LED 类指令立刻完成，采集类交给采样循环慢慢累积。 */
 static void run_command(cmd_kind_t kind, const char *id,
-                        int n, int on_ms, int off_ms, bool on)
+                        int n, int on_ms, int off_ms, bool on, int pattern)
 {
     if (kind == CMD_NONE) {
         return;
@@ -224,10 +254,12 @@ static void run_command(cmd_kind_t kind, const char *id,
         return;
     }
 
-    led_feedback_play(LED_FB_CMD);            /* 收到指令的物理反馈 */
-
     switch (kind) {
     case CMD_CAPTURE:
+        /* 只有采集类才播"收到指令"的中闪：它要跑 200ms，这段时间有反馈才有意义。
+         * LED 类指令**不能**先播 —— 紧接着的 led_feedback_blink/steady 会
+         * 立刻打断它，用户根本看不见（P1-2）。LED 指令自己的闪烁就是反馈。 */
+        led_feedback_play(LED_FB_CMD);
         start_capture(id);
         break;
 
@@ -238,11 +270,22 @@ static void run_command(cmd_kind_t kind, const char *id,
         s_cmd.state = TRANSPORT_CMD_RUNNING;
         s_cmd.started = xTaskGetTickCount();
         s_cmd.n = 0;
-        led_feedback_blink(n, (uint16_t)on_ms, (uint16_t)off_ms);
+        if (pattern == CMD_PATTERN_ALERT) {
+            /* 服务端说"这是告警"，就别让它只是"闪三下"——用带语义的图案，
+             * 现场一眼能分清是远端告警还是普通闪灯。 */
+            led_feedback_play(LED_FB_ALERT);
+        } else if (pattern == CMD_PATTERN_ACK) {
+            led_feedback_play(LED_FB_ACK);
+        } else if (pattern == CMD_PATTERN_ERROR) {
+            led_feedback_play(LED_FB_ERROR);
+        } else {
+            led_feedback_blink(n, (uint16_t)on_ms, (uint16_t)off_ms);
+        }
         status_lock();
         s_st.cmd_count++;
         status_unlock();
-        ESP_LOGI(TAG, "cmd %s: led_blink n=%d on=%dms off=%dms", s_cmd.id, n, on_ms, off_ms);
+        ESP_LOGI(TAG, "cmd %s: led_blink n=%d on=%dms off=%dms pattern=%d",
+                 s_cmd.id, n, on_ms, off_ms, pattern);
         finish_command(true, false, NULL);
         break;
 
@@ -320,13 +363,24 @@ static bool json_escape_append(char *buf, size_t cap, int *off, const char *src)
     return true;
 }
 
-/* Sensor values go straight into "%.3f" formatting, so an implausible reading
- * (a mis-detected chip format, a garbled I2C read) must not be able to blow up
- * the JSON or poison the server's statistics. NaN fails both comparisons and is
- * therefore also caught here. */
-static float sanitize_g(float v)
+/* A sample is only usable when all three axes are plausible (a mis-detected chip
+ * format or a garbled I2C read can produce anything, including NaN).
+ *
+ * 注意：**不能把异常值填 0**。零加速度恰好就是失重的特征（|a| = 0 < FREEFALL_G），
+ * 所以一次读错就会被服务端判成「疑似跌落」，而第 3 周起那还会**自动下发 LED 告警**
+ * ——一次 I²C 错误变成板子无故闪灯报警。正确做法是判定为不可用、整帧丢弃。
+ * NaN 也走这里：它与任何数比较都为假，会自然落到 return false。 */
+static bool sanitize3(float x, float y, float z, float out[3])
 {
-    return (v >= -8.0f && v <= 8.0f) ? v : 0.0f;
+    if (!(x >= -8.0f && x <= 8.0f) ||
+        !(y >= -8.0f && y <= 8.0f) ||
+        !(z >= -8.0f && z <= 8.0f)) {
+        return false;
+    }
+    out[0] = x;
+    out[1] = y;
+    out[2] = z;
+    return true;
 }
 
 /* Build the telemetry JSON by hand rather than with cJSON: cJSON prints doubles
@@ -440,7 +494,7 @@ static void apply_response(const char *body, size_t len)
     char reply[TRANSPORT_REPLY_LEN] = "";
     char cmd_id[TRANSPORT_CMD_ID_LEN] = "";
     cmd_kind_t kind = CMD_NONE;
-    int p_n = 0, p_on = 0, p_off = 0;
+    int p_n = 0, p_on = 0, p_off = 0, p_pattern = 0;
     bool p_onf = false;
     bool ok = false;
     bool pending = false;
@@ -475,6 +529,7 @@ static void apply_response(const char *body, size_t len)
                         p_n   = json_int(jparams, "n", 3);
                         p_on  = json_int(jparams, "on_ms", 80);
                         p_off = json_int(jparams, "off_ms", 80);
+                        p_pattern = json_pattern(jparams);
                     } else if (strcmp(jname->valuestring, "led_set") == 0) {
                         kind = CMD_LED_SET;
                         p_onf = json_bool(jparams, "on", true);
@@ -506,7 +561,7 @@ static void apply_response(const char *body, size_t len)
 
     /* 在锁外执行指令：run_command 只碰 s_cmd 和 LED，不能拖住状态锁 */
     if (cmd_id[0] != '\0') {
-        run_command(kind, cmd_id, p_n, p_on, p_off, p_onf);
+        run_command(kind, cmd_id, p_n, p_on, p_off, p_onf, p_pattern);
     }
 }
 
@@ -553,13 +608,19 @@ static bool post_batch(int n, bool ask)
         return false;
     }
 
-    resp_acc_t acc = {.len = 0, .truncated = false};
-    acc.buf[0] = '\0';
+    /* P1-1：4 KB 的响应缓冲**不能放栈上** —— transport 任务栈只有 8 KB，
+     * 再加上 esp_http_client_perform() 自己的栈帧就没有余量了。栈溢出在
+     * ESP-IDF 下是 canary 报错 + 重启，而且只在响应体较大时偶发、极难复现。
+     * post_batch 只有 transport 任务会调用（不会重入），所以静态化是安全的。 */
+    static resp_acc_t s_acc;
+    s_acc.len = 0;
+    s_acc.truncated = false;
+    s_acc.buf[0] = '\0';
     esp_http_client_config_t cfg = {
         .url = url,
         .timeout_ms = TX_HTTP_TIMEOUT_MS,
         .event_handler = http_event_handler,
-        .user_data = &acc,
+        .user_data = &s_acc,
     };
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
     if (client == NULL) {
@@ -576,20 +637,20 @@ static bool post_batch(int n, bool ask)
     esp_http_client_cleanup(client);
     free(body);
 
-    if (ret == ESP_OK && status == 200 && acc.len > 0) {
-        if (acc.truncated) {
-            ESP_LOGW(TAG, "response truncated at %d bytes (raise TX_RESP_BUF)", acc.len);
+    if (ret == ESP_OK && status == 200 && s_acc.len > 0) {
+        if (s_acc.truncated) {
+            ESP_LOGW(TAG, "response truncated at %d bytes (raise TX_RESP_BUF)", s_acc.len);
         }
-        apply_response(acc.buf, (size_t)acc.len);
+        apply_response(s_acc.buf, (size_t)s_acc.len);
         if (ask) {
-            ESP_LOGI(TAG, "AI reply: %s", acc.buf);
+            ESP_LOGI(TAG, "AI reply: %s", s_acc.buf);
         }
         return true;
     }
 
     apply_response(NULL, 0);
     ESP_LOGW(TAG, "POST failed ret=%s status=%d body=%d",
-             esp_err_to_name(ret), status, acc.len);
+             esp_err_to_name(ret), status, s_acc.len);
     return false;
 }
 
@@ -610,33 +671,31 @@ static void transport_task(void *arg)
     TickType_t last_post = xTaskGetTickCount();
     int n = 0;
     char last_activity[TRANSPORT_ACTIVITY_LEN] = "";
+    const char *last_source = "?";   /* IMU 型号，只在变化时才写进状态 */
 
     while (true) {
         accel_input_sample_t sample = {0};
         if (accel_input_poll(&sample)) {
+            last_source = sample.source_name ? sample.source_name : "?";
             /* Upload screen-frame axes so the server's tilt labels match what
              * the LCD shows (see accel_input_map_to_screen). */
             float sx, sy;
             accel_input_map_to_screen(sample.x_g, sample.y_g, &sx, &sy);
-            sx = sanitize_g(sx);
-            sy = sanitize_g(sy);
-            const float sz = sanitize_g(sample.z_g);
-            if (n < TX_BATCH_MAX) {
-                s_batch[n][0] = sx;
-                s_batch[n][1] = sy;
-                s_batch[n][2] = sz;
-                n++;
+            float xyz[3];
+            if (sanitize3(sx, sy, sample.z_g, xyz)) {
+                if (n < TX_BATCH_MAX) {
+                    s_batch[n][0] = xyz[0];
+                    s_batch[n][1] = xyz[1];
+                    s_batch[n][2] = xyz[2];
+                    n++;
+                }
+                /* 正在执行远程指令就用同一个采样节拍累积，不额外阻塞 */
+                feed_capture(xyz);
+            } else {
+                /* 坏样本整帧丢弃（**不填 0**，见 sanitize3 的注释）。
+                 * 只计数不打日志，避免坏传感器把日志刷爆。 */
+                s_bad_samples++;
             }
-            /* 正在执行远程指令就用同一个采样节拍累积，不额外阻塞 */
-            const float xyz[3] = {sx, sy, sz};
-            feed_capture(xyz);
-
-            status_lock();
-            s_st.x_g = sample.x_g;
-            s_st.y_g = sample.y_g;
-            s_st.z_g = sample.z_g;
-            strlcpy(s_st.source, sample.source_name ? sample.source_name : "?", sizeof(s_st.source));
-            status_unlock();
         }
         check_capture_timeout();
 
@@ -657,6 +716,15 @@ static void transport_task(void *arg)
             status_lock();
             s_st.batch_last = (uint16_t)n;
             s_st.orient = (uint8_t)accel_input_get_orientation();
+            /* P0-2：写**屏幕坐标系**的值（即 s_batch 里已 map 过的），不是原始传感器值。
+             * ui.c 的姿态球直接按 x_g/y_g 放点、不做二次翻转，所以这里必须是屏幕系——
+             * 否则「板子屏幕上看到的倾斜方向」与「网页仪表盘」会相反。
+             * 这正是 accel_input_map_to_screen 存在的唯一理由（见 accel_input.h）。
+             * 顺带把原来的每样本更新收敛成每上报一次（P1-7）。 */
+            s_st.x_g = s_batch[n - 1][0];
+            s_st.y_g = s_batch[n - 1][1];
+            s_st.z_g = s_batch[n - 1][2];
+            strlcpy(s_st.source, last_source, sizeof(s_st.source));
             s_st.cmd_state = s_cmd.state;
             if (s_cmd.rid[0] != '\0') {
                 strlcpy(s_st.cmd_id, s_cmd.rid, sizeof(s_st.cmd_id));
@@ -726,12 +794,21 @@ void transport_start(void)
 
 void transport_request_ask(const char *question)
 {
+    /* 本函数在 iot_button 的任务里跑，而 s_ask_text / s_btn_pending 由 transport
+     * 任务读写 —— 必须走同一把锁。64 字节的 strlcpy 是非原子写，不加锁时
+     * build_body 可能读到半新半旧的问句（服务端收到乱码），
+     * s_btn_pending++ 的读-改-写也可能丢计数。
+     * 注意：s_lock 由 transport_start() 创建，而按钮注册必须排在它之后
+     * （见 main.c 里的调用顺序），否则这里会取到 NULL 锁。 */
+    status_lock();
     if (question != NULL && question[0] != '\0') {
         strlcpy(s_ask_text, question, sizeof(s_ask_text));
     }
     s_ask_attempts = 0;
     s_ask_pending = true;
     s_btn_pending++;          /* 让服务端/网页能看见"物理按键发生了" */
+    status_unlock();
+
     ESP_LOGI(TAG, "ask queued: %s", s_ask_text);
 }
 
