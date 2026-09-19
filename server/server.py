@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-AI 交互课 · 第 2 周任务 —— PC 服务器（无需 VPS，自己的电脑即服务器）
+AI 交互课 · PC 服务器（无需 VPS，自己的电脑即服务器）
 
 职责：
   1. 接收 ESP32-S3-EYE 上报的 IMU 遥测数据（HTTP POST /api/telemetry）
@@ -10,7 +10,7 @@ AI 交互课 · 第 2 周任务 —— PC 服务器（无需 VPS，自己的电�
   4. 提供网页仪表盘（SSE 实时推送），在浏览器里看到板子的实时姿态、事件流与 AI 对话
   5. 把遥测与事件落到 server/data/*.jsonl（重启不丢，可回放/分析）
   6. **远程指令通道**：网页下发「采集一次」→ 搭下一帧遥测的响应下发 → 板子执行后
-     按 request_id 回传结果 → 网页显示 queued/sent/done 全过程（第 2 周）
+     按 request_id 回传结果 → 网页显示 queued/sent/done 全过程
 
 仅依赖 Python 标准库，直接运行：
     python server.py                        # 默认监听 0.0.0.0:8000，数据写 server/data/
@@ -64,7 +64,7 @@ SHAKE_MIN_GAP_S = 0.6     # 晃动事件的最小间隔（秒），避免一次�
 FREEFALL_G = 0.35         # 失重判定：合加速度阈值（g）
 FREEFALL_MIN_S = 0.05     # 失重判定：至少持续这么久才算疑似跌落（秒）
 
-# ---- 远程命令（第 2 周：Web 下发「采集一次」，按 request_id 反馈结果）----
+# ---- 远程命令（Web 下发「采集一次」，按 request_id 反馈结果）----
 CMD_TIMEOUT_S = 10.0      # 命令下发后多久没收到结果就判超时
 CMD_MAX_HISTORY = 20      # 保留最近多少条命令供网页显示
 CMD_NAMES = ("capture_once",)   # 支持的指令白名单（不认的名字直接 400）
@@ -792,180 +792,601 @@ DASHBOARD_HTML = """<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>AI交互课 · 第1周 · 实时仪表盘</title>
+<title>Ego Link · 实时仪表盘</title>
 <style>
-:root{color-scheme:dark}
+/* ==========================================================================
+   设计语言与开发板屏幕（device/main/ui.c）刻意保持一致：
+   同一套语义色、同一套「圆环 + 姿态球 + 三轴对称条」的表达，
+   现场看板子和看网页看到的是同一个东西。
+   ========================================================================== */
+:root{
+  color-scheme:dark;
+  --bg:#0a0e14; --bg-deep:#05070a;
+  --card:#141a23; --card-hi:#1b2230;
+  --line:#252d3a; --track:#1e2530;
+  --text:#e6edf3; --dim:#8b949e; --faint:#5a6472;
+  --green:#3fb950; --teal:#2dd4bf; --blue:#58a6ff;
+  --amber:#e3b341; --red:#f85149; --purple:#a371f7;
+  --r:16px;
+}
 *{box-sizing:border-box;margin:0}
-body{background:#0d1117;color:#e6edf3;font:14px/1.5 "Microsoft YaHei",system-ui,sans-serif;padding:18px}
-h1{font-size:18px;margin-bottom:4px}
-.sub{color:#8b949e;font-size:12px;margin-bottom:14px}
-.grid{display:grid;grid-template-columns:260px 1fr;gap:14px;max-width:1000px}
-.card{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:12px}
-.badge{display:inline-block;padding:2px 10px;border-radius:99px;font-size:12px}
-.on{background:#1f6feb33;color:#79c0ff}.off{background:#f8514933;color:#f85149}
-.warn{background:#d2992233;color:#e3b341}
-canvas{width:100%;height:200px;display:block}
-.row{display:flex;gap:10px;align-items:baseline;margin-top:8px;flex-wrap:wrap}
-.big{font-size:20px;font-weight:700;color:#7ee787}
-.lbl{color:#8b949e;font-size:12px}
-#reply{margin-top:8px;padding:8px;background:#0d1117;border-radius:8px;min-height:40px;color:#e3b341;font-size:13px;white-space:pre-wrap}
-#feed{max-height:300px;overflow-y:auto;font-size:12px}
-#feed div{padding:3px 0;border-bottom:1px dashed #21262d}
-.t{color:#8b949e;margin-right:6px}
-.gbars{display:flex;gap:8px;margin-top:10px}
-.gbar{flex:1;text-align:center}
-.gbar i{display:block;height:8px;background:#30363d;border-radius:4px;margin-top:4px;position:relative}
-.gbar i b{position:absolute;top:0;height:100%;border-radius:4px;background:#1f6feb}
-footer{margin-top:12px;color:#8b949e;font-size:11px}
-button{background:#1f6feb;color:#fff;border:0;border-radius:6px;padding:6px 14px;font-size:13px;cursor:pointer;font-family:inherit}
-button:hover:not(:disabled){background:#388bfd}
-button:disabled{background:#30363d;color:#8b949e;cursor:default}
-.cmd{display:flex;gap:8px;align-items:baseline;padding:4px 0;border-bottom:1px dashed #21262d}
-.cmd:last-child{border-bottom:0}
-.st{padding:1px 8px;border-radius:99px;font-size:11px;white-space:nowrap}
-.st-queued{background:#30363d;color:#8b949e}
-.st-sent{background:#d2992233;color:#e3b341}
-.st-done{background:#2ea04333;color:#7ee787}
-.st-failed,.st-timeout{background:#f8514933;color:#f85149}
-.mono{font-family:Consolas,monospace;color:#8b949e}
-@media(max-width:720px){.grid{grid-template-columns:1fr}}
+body{
+  background:radial-gradient(1200px 600px at 20% -10%,#131b27 0%,var(--bg) 55%,var(--bg-deep) 100%);
+  background-attachment:fixed;
+  color:var(--text);
+  font:14px/1.6 "Microsoft YaHei",system-ui,-apple-system,"Segoe UI",sans-serif;
+  padding:20px 20px 40px;
+  min-height:100vh;
+  -webkit-font-smoothing:antialiased;
+}
+.mono{font-family:Consolas,"SF Mono",ui-monospace,monospace;font-variant-numeric:tabular-nums}
+h1,h2{font-weight:650;letter-spacing:.2px}
+
+/* ---------- 顶栏 ---------- */
+.top{display:flex;align-items:flex-start;justify-content:space-between;gap:20px;flex-wrap:wrap;max-width:1400px;margin:0 auto 18px}
+.brand{display:flex;gap:14px;align-items:flex-start}
+.logo{
+  width:38px;height:38px;border-radius:12px;flex:none;margin-top:2px;
+  background:linear-gradient(140deg,var(--teal),var(--blue) 55%,var(--purple));
+  box-shadow:0 6px 20px -6px var(--teal);
+  position:relative;
+}
+.logo::after{content:"";position:absolute;inset:11px;border-radius:50%;background:var(--bg);opacity:.85}
+h1{font-size:19px;line-height:1.35}
+.sub{color:var(--dim);font-size:12px;max-width:720px}
+.pills{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.pill{
+  display:inline-flex;align-items:center;gap:7px;
+  padding:6px 13px;border-radius:99px;font-size:12px;
+  background:var(--card);border:1px solid var(--line);color:var(--dim);
+  white-space:nowrap;
+}
+.pill i{width:7px;height:7px;border-radius:50%;background:currentColor;flex:none}
+.pill.on{color:var(--green);border-color:#1c3a26;background:#0f1d15}
+.pill.off{color:var(--red);border-color:#3d1f1f;background:#1c1113}
+.pill.off i{animation:breathe 1.6s ease-in-out infinite}
+.pill.warn{color:var(--amber);border-color:#3a2f14;background:#1d1911}
+@keyframes breathe{0%,100%{opacity:1}50%{opacity:.25}}
+
+/* ---------- 卡片网格 ---------- */
+.grid{display:grid;gap:14px;max-width:1400px;margin:0 auto;grid-template-columns:320px minmax(0,1fr) 320px}
+.card{
+  background:linear-gradient(180deg,var(--card-hi),var(--card));
+  border:1px solid var(--line);border-radius:var(--r);
+  padding:16px;min-width:0;
+}
+.card.wide{max-width:1400px;margin:14px auto 0}
+.card-head{display:flex;align-items:baseline;justify-content:space-between;gap:10px;margin-bottom:12px}
+h2{font-size:13px;color:var(--text)}
+.card-head .src{font-size:11px;color:var(--faint)}
+
+/* ---------- 环形仪表 ---------- */
+.gauge{position:relative;width:100%;max-width:210px;margin:4px auto 10px;aspect-ratio:1}
+.gauge svg{width:100%;height:100%;display:block;transform:rotate(135deg)}
+.gauge circle{fill:none;stroke-linecap:round;transform-origin:70px 70px}
+.gauge .track{stroke:var(--track);stroke-width:11;stroke-dasharray:263.9 351.9}
+.gauge .val{stroke:var(--green);stroke-width:11;stroke-dasharray:0 351.9;transition:stroke-dasharray .5s cubic-bezier(.22,1,.36,1),stroke .4s}
+.gauge-mid{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px}
+.act{font-size:30px;font-weight:700;letter-spacing:2px;line-height:1.1;transition:color .4s}
+.abs{font-size:14px;color:var(--dim)}
+.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;border-top:1px solid var(--line);padding-top:12px}
+.stats>div{display:flex;flex-direction:column;gap:2px;text-align:center}
+.stats span{font-size:11px;color:var(--faint)}
+.stats b{font-size:16px;font-weight:650}
+.stats b.sm{font-size:12px;font-weight:500;color:var(--dim)}
+
+/* ---------- 曲线 ---------- */
+#cv{width:100%;height:220px;display:block;border-radius:10px}
+.legend{display:flex;gap:16px;font-size:11px;color:var(--faint);margin-top:8px;flex-wrap:wrap}
+.legend i{display:inline-block;width:10px;height:3px;border-radius:2px;vertical-align:middle;margin-right:5px}
+
+/* ---------- 姿态球 + 三轴条 ---------- */
+.ball{
+  position:relative;width:100%;max-width:190px;aspect-ratio:1;margin:6px auto 14px;
+  border-radius:50%;border:1px solid var(--line);
+  background:radial-gradient(circle at 50% 40%,#0f1620,#0a0e14 70%);
+}
+.ball .ring2{position:absolute;left:50%;top:50%;width:34%;height:34%;transform:translate(-50%,-50%);border-radius:50%;border:1px dashed var(--track)}
+.ball .cross::before,.ball .cross::after{content:"";position:absolute;background:var(--line)}
+.ball .cross::before{left:50%;top:14%;bottom:14%;width:1px}
+.ball .cross::after{top:50%;left:14%;right:14%;height:1px}
+.ball .dot{
+  position:absolute;left:50%;top:50%;width:20px;height:20px;margin:-10px 0 0 -10px;border-radius:50%;
+  background:var(--green);box-shadow:0 0 18px -2px var(--green);
+  transition:transform .3s cubic-bezier(.22,1,.36,1),background .4s,box-shadow .4s;
+}
+.bars{display:flex;flex-direction:column;gap:9px}
+.bar{display:grid;grid-template-columns:14px 1fr 52px;gap:9px;align-items:center;font-size:12px}
+.bar em{font-style:normal;font-weight:700}
+.bar .t{position:relative;height:7px;border-radius:4px;background:var(--track);overflow:hidden}
+.bar .t i{position:absolute;top:0;height:100%;border-radius:4px;left:50%;width:0;transition:left .3s,width .3s,background .3s}
+.bar .v{text-align:right;color:var(--dim);font-size:12px}
+
+/* ---------- AI 回复 ---------- */
+.reply{margin-top:14px;padding:12px 14px;border-radius:12px;background:#0d1219;border:1px solid var(--line);position:relative}
+.reply .tag{
+  display:inline-block;font-size:10px;font-weight:700;letter-spacing:.5px;
+  color:var(--blue);background:#1f6feb33;border-radius:99px;padding:2px 9px;margin-bottom:7px;
+}
+.reply .txt{font-size:13px;color:var(--amber);white-space:pre-wrap;word-break:break-word}
+.reply.pending .txt{color:var(--dim)}
+.reply.pending::after{
+  content:"";position:absolute;right:14px;top:14px;width:13px;height:13px;border-radius:50%;
+  border:2px solid var(--track);border-top-color:var(--amber);animation:spin .9s linear infinite;
+}
+@keyframes spin{to{transform:rotate(360deg)}}
+
+/* ---------- 按钮 ---------- */
+.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+button{
+  font:inherit;font-size:13px;cursor:pointer;border-radius:9px;padding:8px 16px;
+  border:1px solid var(--line);background:var(--card-hi);color:var(--text);
+  transition:background .18s,border-color .18s,transform .06s;
+}
+button:hover:not(:disabled){background:#222c3c;border-color:#37445a}
+button:active:not(:disabled){transform:translateY(1px)}
+button.primary{background:#1f6feb;border-color:#2f81f7;color:#fff}
+button.primary:hover:not(:disabled){background:#2f81f7}
+button:disabled{opacity:.45;cursor:not-allowed}
+.hint{font-size:12px;color:var(--dim)}
+
+/* ---------- 指令 / 事件列表 ---------- */
+.list{display:flex;flex-direction:column}
+.item{display:flex;gap:10px;align-items:baseline;padding:8px 2px;border-bottom:1px dashed #1b2230;font-size:12px;flex-wrap:wrap}
+.item:last-child{border-bottom:0}
+.st{padding:2px 9px;border-radius:99px;font-size:11px;white-space:nowrap;flex:none}
+.st-queued{background:#21262d;color:var(--dim)}
+.st-sent{background:#d2992233;color:var(--amber)}
+.st-done{background:#2ea04333;color:var(--green)}
+.st-failed,.st-timeout{background:#f8514933;color:var(--red)}
+.item .name{color:var(--text);font-weight:600}
+.item .meta{color:var(--faint);font-size:11px}
+#feed{max-height:340px;overflow-y:auto}
+#feed .item{gap:12px}
+#feed .t{color:var(--faint);font-size:11px;flex:none;font-family:Consolas,monospace}
+#feed .k{flex:none;width:8px;height:8px;border-radius:50%;margin-top:6px}
+.k-info{background:var(--dim)}.k-motion{background:var(--blue)}
+.k-shake{background:var(--amber)}.k-fall,.k-alert{background:var(--red)}
+.k-ask{background:var(--purple)}.k-cmd{background:var(--teal)}
+footer{max-width:1400px;margin:18px auto 0;color:var(--faint);font-size:11px;line-height:1.8}
+.empty{color:var(--faint);font-size:12px;padding:6px 0}
+
+@media(max-width:1100px){
+  .grid{grid-template-columns:1fr 1fr}
+  .grid .hero{grid-column:1 / -1}
+}
+@media(max-width:760px){
+  body{padding:14px 12px 30px}
+  .grid{grid-template-columns:1fr}
+  .gauge{max-width:180px}
+  #cv{height:170px}
+}
 </style>
 </head>
 <body>
-<h1>AI交互课 · 第1周 · 开发板 ⇄ 电脑服务器</h1>
-<div class="sub">ESP32-S3-EYE（板载IMU，100Hz采样/500ms批量上报）→ HTTP → 本机Python服务器 → 规则/大模型AI分析 → 回传开发板显示 + 本页实时推送 + JSONL落盘</div>
-<div class="grid">
-  <div class="card">
-    <div class="row"><span class="lbl">设备状态</span><span id="dev" class="badge off">离线</span>
-      <span id="src" class="lbl"></span></div>
-    <div class="row"><span class="lbl">当前活动</span></div>
-    <div class="big" id="act">…</div>
-    <div class="row"><span class="lbl">AI来源</span><span id="mode" class="lbl"></span>
-      <span class="lbl">采样率</span><span id="hz" class="lbl">-</span></div>
-    <div class="row"><span class="lbl">步数/8s</span><span id="steps">0</span>
-      <span class="lbl">晃动/8s</span><span id="shakes">0</span></div>
-    <div class="gbars">
-      <div class="gbar"><span class="lbl">X</span><i><b id="bx"></b></i><span id="vx"></span></div>
-      <div class="gbar"><span class="lbl">Y</span><i><b id="by"></b></i><span id="vy"></span></div>
-      <div class="gbar"><span class="lbl">Z</span><i><b id="bz"></b></i><span id="vz"></span></div>
+
+<header class="top">
+  <div class="brand">
+    <div class="logo"></div>
+    <div>
+      <h1>Ego Link · 实时仪表盘</h1>
+      <p class="sub">ESP32-S3-EYE 板载 IMU 100Hz 采样 → 每 500ms 批量上报 → 本机 Python 服务器分类/大模型分析 → 回传板端显示 + 本页实时推送 + JSONL 落盘</p>
     </div>
-    <div id="reply">按板子 BOOT 键即可向服务器AI提问。</div>
   </div>
-  <div class="card">
+  <div class="pills">
+    <span id="dev" class="pill off"><i></i>离线</span>
+    <span id="hzp" class="pill">— Hz</span>
+    <span id="postsp" class="pill">↑0 帧</span>
+  </div>
+</header>
+
+<main class="grid">
+  <section class="card hero">
+    <div class="card-head"><h2>当前活动</h2><span class="src" id="src">—</span></div>
+    <div class="gauge">
+      <svg viewBox="0 0 140 140" aria-hidden="true">
+        <circle class="track" cx="70" cy="70" r="56"></circle>
+        <circle class="val" id="ring" cx="70" cy="70" r="56"></circle>
+      </svg>
+      <div class="gauge-mid">
+        <div class="act" id="act">…</div>
+        <div class="abs mono" id="abs">0.00 g</div>
+      </div>
+    </div>
+    <div class="stats">
+      <div><span>步数 / 8s</span><b id="steps">0</b></div>
+      <div><span>晃动 / 8s</span><b id="shakes">0</b></div>
+      <div><span>AI 来源</span><b id="mode" class="sm">规则AI</b></div>
+    </div>
+    <div class="reply" id="replybox">
+      <span class="tag">AI</span>
+      <div class="txt" id="reply">按板子 BOOT 键即可向服务器 AI 提问。</div>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="card-head"><h2>合加速度 |a|</h2><span class="src">最近 8 秒 · 服务端降采样</span></div>
     <canvas id="cv"></canvas>
-    <div class="lbl" style="margin-top:6px">上=倾斜示意图（球随重力滚动，屏幕坐标系）；下方为最近8秒 |a| 曲线</div>
+    <div class="legend">
+      <span><i style="background:var(--blue)"></i>|a| 曲线</span>
+      <span><i style="background:var(--faint)"></i>1g 参考线</span>
+      <span><i style="background:var(--red)"></i>失重阈值 0.35g（疑似跌落）</span>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="card-head"><h2>姿态（屏幕坐标系）</h2><span class="src" id="tilt">倾角 —</span></div>
+    <div class="ball">
+      <div class="cross"></div>
+      <div class="ring2"></div>
+      <div class="dot" id="ball"></div>
+    </div>
+    <div class="bars">
+      <div class="bar"><em style="color:var(--red)">X</em><div class="t"><i id="bx"></i></div><span class="v mono" id="vx">0.00</span></div>
+      <div class="bar"><em style="color:var(--green)">Y</em><div class="t"><i id="by"></i></div><span class="v mono" id="vy">0.00</span></div>
+      <div class="bar"><em style="color:var(--blue)">Z</em><div class="t"><i id="bz"></i></div><span class="v mono" id="vz">0.00</span></div>
+    </div>
+  </section>
+</main>
+
+<section class="card wide">
+  <div class="card-head">
+    <h2>远程指令</h2>
+    <span class="src">指令搭在「下一帧遥测的响应」里下发，板子在再下一帧回传结果 —— 一次真实的硬件往返</span>
   </div>
-</div>
-<div class="card" style="max-width:1000px;margin-top:14px">
-  <div class="row" style="margin-top:0">
-    <span class="lbl">远程指令</span>
-    <button id="capbtn">采集一次</button>
-    <span id="cmdhint" class="lbl"></span>
+  <div class="row">
+    <span id="cmdbts"></span>
+    <span id="cmdhint" class="hint"></span>
   </div>
-  <div id="cmds" style="margin-top:8px"></div>
-  <div class="lbl" style="margin-top:8px">
-    点按钮 → 服务器把指令搭在<strong>下一帧遥测的响应</strong>里下发 → 板子采 20 个样本（200ms）算平均与标准差
-    → <strong>再下一帧</strong>带着同一个 request_id 回传结果。状态走 queued → sent → done，
-    是一次真实的硬件往返，不是本地伪造。
-  </div>
-</div>
-<div class="card" style="max-width:1000px;margin-top:14px">
-  <span class="lbl">事件流</span>
+  <div class="list" id="cmds" style="margin-top:10px"></div>
+</section>
+
+<section class="card wide">
+  <div class="card-head"><h2>事件流</h2><span class="src" id="evcount"></span></div>
   <div id="feed"></div>
-</div>
-<footer>服务器: <span id="host"></span> · <span id="logdir"></span> · 页面仅用标准库SSE推送，无需外网</footer>
+</section>
+
+<footer>
+  服务器 <span class="mono" id="host"></span> · <span id="logdir"></span> ·
+  页面只用标准库 SSE 推送，不依赖外网；指令白名单 <span class="mono" id="names"></span>
+</footer>
+
 <script>
-document.getElementById('host').textContent=location.host;
-const cv=document.getElementById('cv'),ctx=cv.getContext('2d');
-let last=null;
-function fit(){cv.width=cv.clientWidth*devicePixelRatio;cv.height=cv.clientHeight*devicePixelRatio}
-addEventListener('resize',fit);fit();
-function bar(id,v,vl){const e=document.getElementById(id);e.style.width=(Math.min(Math.abs(v),2)/4+0.5)*100+'%';
- e.style.left=v<0?(50-Math.min(Math.abs(v),2)/4*50)+'%':'50%';
- document.getElementById(vl).textContent=v.toFixed(2)+'g'}
-function draw(s){
- ctx.clearRect(0,0,cv.width,cv.height);
- const W=cv.width,H=cv.height,top=H*0.52;
- // 倾斜球
- const cx=W/2,cy=top/2,r=Math.min(cx,cy)-10;
- ctx.strokeStyle='#30363d';ctx.beginPath();ctx.arc(cx,cy,r,0,7);ctx.stroke();
- if(s&&s.sample){const[,x,y]=s.sample;
-  ctx.fillStyle='#7ee787';ctx.beginPath();
-  ctx.arc(cx+Math.max(-1,Math.min(1,x))*r*0.8,cy+Math.max(-1,Math.min(1,y))*r*0.8,10*devicePixelRatio,0,7);ctx.fill();}
- // |a| 曲线
- const sp=s&&s.samples||[];
- ctx.strokeStyle='#1f6feb';ctx.beginPath();
- const n=sp.length;
- for(let i=0;i<n;i++){const[,x,y,z]=sp[i];const m=Math.sqrt(x*x+y*y+z*z);
-  const px=W*0.05+i/Math.max(n-1,1)*W*0.9,py=H-(m/3)*(H-top)-6;
-  i?ctx.lineTo(px,py):ctx.moveTo(px,py);}
- ctx.stroke();
- ctx.fillStyle='#8b949e';ctx.font=12*devicePixelRatio+'px sans-serif';
- ctx.fillText('|a| g',6*devicePixelRatio,H-8);}
-let evts='';
-const STNAME={queued:'排队中',sent:'已下发',done:'已完成',failed:'失败',timeout:'超时'};
-function renderCmds(cmds){
- const el=document.getElementById('cmds');
- if(!cmds||!cmds.length){el.innerHTML='<span class="lbl">还没有下发过指令。</span>';return}
- const h=cmds.slice(0,8).map(c=>{
-  const r=c.result||{};
-  let extra='';
-  if(c.state==='done'){
-   extra=` <span class="mono">x=${(r.x??0).toFixed(3)} y=${(r.y??0).toFixed(3)} z=${(r.z??0).toFixed(3)}`
-        +` · ${r.n??0}样本 · ${Math.round(r.ms??0)}ms · σ=${(r.std??0).toFixed(4)}g</span>`;
-  }else if(c.state==='failed'){extra=` <span class="mono">${r.err||''}</span>`}
-  const lat=(c.sent&&c.done)?` <span class="mono">往返 ${Math.round((c.done-c.sent)*1000)}ms</span>`:'';
-  return `<div class="cmd"><span class="st st-${c.state}">${STNAME[c.state]||c.state}</span>`
-       + `<span>${c.name}</span><span class="mono">${c.id}</span>${lat}${extra}</div>`}).join('');
- el.innerHTML=h;
- // 有未完成的指令时把按钮禁掉，避免连点堆一队列
- const busy=cmds.some(c=>c.state==='queued'||c.state==='sent');
- const b=document.getElementById('capbtn');
- b.disabled=busy||!window.__devOnline;
- b.textContent=busy?'等待板子回传…':'采集一次';
+(function(){
+"use strict";
+
+var $ = function(id){ return document.getElementById(id); };
+
+/* ---------------- 语义色（与 device/main/ui.c 同一套） ---------------- */
+var C = { green:"#3fb950", blue:"#58a6ff", amber:"#e3b341", red:"#f85149",
+          purple:"#a371f7", teal:"#2dd4bf", dim:"#8b949e", faint:"#5a6472" };
+
+/* 服务器文案 → 活动词 + 颜色（与板端 classify() 同一套规则） */
+var ACT = [
+  { k:["跌落","失重"], word:"跌落", color:C.red },
+  { k:["晃动"],        word:"晃动", color:C.amber },
+  { k:["步行"],        word:"步行", color:C.purple },
+  { k:["运动"],        word:"运动", color:C.blue },
+  { k:["静置"],        word:"静置", color:C.green }
+];
+function classify(s){
+  for (var i=0;i<ACT.length;i++){
+    for (var j=0;j<ACT[i].k.length;j++){
+      if (s.indexOf(ACT[i].k[j]) >= 0) return ACT[i];
+    }
+  }
+  return { word: s ? s.slice(0,4) : "等待", color:C.faint };
 }
-document.getElementById('capbtn').onclick=()=>{
- const b=document.getElementById('capbtn');
- b.disabled=true;b.textContent='下发中…';
- document.getElementById('cmdhint').textContent='';
- fetch('/api/command',{method:'POST',headers:{'Content-Type':'application/json'},
-   body:JSON.stringify({name:'capture_once'})})
-  .then(r=>r.json()).then(d=>{
-    if(!d.ok){document.getElementById('cmdhint').textContent='下发失败：'+(d.error||'未知');return}
-    document.getElementById('cmdhint').textContent='已下发 '+d.id+(d.device_online?'':'（注意：板子当前不在线）');
-    pull();
-  })
-  .catch(e=>{document.getElementById('cmdhint').textContent='下发失败：'+e});
+
+/* 指令 → 按钮文案与参数（按钮从 /api/commands 的 names 动态生成，
+   所以服务端新增指令时本页不用改代码） */
+var CMD_UI = {
+  capture_once:{ label:"采集一次", params:{}, primary:true },
+  led_blink:   { label:"闪灯 ×3",  params:{n:3,on_ms:80,off_ms:80} },
+  led_set:     { label:"LED 常亮", params:{on:true}, toggle:true }
 };
-function es(){
- const src=new EventSource('/api/stream');
- src.onmessage=e=>{const s=JSON.parse(e.data);last=s;
-  window.__devOnline=!!s.device_online;
-  document.getElementById('dev').className='badge '+(s.device_online?'on':'off');
-  document.getElementById('dev').textContent=s.device_online?'在线':'离线';
-  document.getElementById('src').textContent=s.source||'';
-  document.getElementById('act').textContent=s.activity||'…';
-  document.getElementById('mode').textContent=s.ai_mode+(s.ai_pending?' · 生成中…':'');
-  document.getElementById('hz').textContent=s.sample_hz?s.sample_hz+' Hz':'-';
-  document.getElementById('steps').textContent=s.step_count;
-  document.getElementById('shakes').textContent=s.shake_count;
-  if(s.latest){bar('bx',s.latest[1],'vx');bar('by',s.latest[2],'vy');bar('bz',s.latest[3],'vz')}
-  if(s.ai_reply)document.getElementById('reply').textContent='AI：'+s.ai_reply;
-  renderCmds(s.commands);
-  const f=document.getElementById('feed');
-  if(s.events.length){const h=s.events.slice(0,30).map(ev=>
-    `<div><span class="t">${new Date(ev.ts*1000).toLocaleTimeString()}</span>${ev.kind} · ${ev.text}</div>`).join('');
-   if(h!==evts){evts=h;f.innerHTML=h}}
-  draw(s)};
- src.onerror=()=>{src.close();setTimeout(es,2000)};
+
+/* ---------------- 环形仪表（270°，与板端同款） ---------------- */
+var RING_R = 56, RING_C = 2*Math.PI*RING_R, RING_ARC = RING_C*0.75, ABS_FULL = 2.0;
+var lastRing = -1, lastAct = "", lastBall = "", lastTilt = "";
+
+function setRing(mag){
+  var pct = Math.max(0, Math.min(1, mag/ABS_FULL));
+  var v = Math.round(pct*100);
+  if (v === lastRing) return;
+  lastRing = v;
+  $("ring").style.strokeDasharray = (pct*RING_ARC).toFixed(1) + " " + RING_C.toFixed(1);
+  $("abs").textContent = mag.toFixed(2) + " g";
 }
-fetch('/api/logs').then(r=>r.json()).then(l=>{
-  if(l&&l.dir)document.getElementById('logdir').textContent='落盘: '+l.dir});
-// SSE 里不带 samples 全量，定时拉一次用于曲线
-function pull(){fetch('/api/latest').then(r=>r.json()).then(s=>{
-  if(last)s.ai_reply=last.ai_reply;last=s;draw(s);renderCmds(s.commands)})}
-pull();setInterval(pull,2000);
-es();
+
+/* ---------------- 曲线 ---------------- */
+var cv = $("cv"), ctx = cv.getContext("2d"), samples = [];
+function fitCanvas(){
+  var dpr = window.devicePixelRatio || 1;
+  cv.width = Math.max(1, Math.round(cv.clientWidth*dpr));
+  cv.height = Math.max(1, Math.round(cv.clientHeight*dpr));
+  drawChart();
+}
+function drawChart(){
+  var W = cv.width, H = cv.height, dpr = window.devicePixelRatio || 1;
+  ctx.clearRect(0,0,W,H);
+  if (W < 2 || H < 2) return;
+
+  var padL = 34*dpr, padR = 10*dpr, padT = 12*dpr, padB = 18*dpr;
+  var plotW = W - padL - padR, plotH = H - padT - padB;
+  var maxG = 2.4;
+
+  function yOf(g){ return padT + plotH - Math.min(g, maxG)/maxG*plotH; }
+
+  /* 网格 + 刻度 */
+  ctx.strokeStyle = "#1b2230"; ctx.lineWidth = 1*dpr;
+  ctx.fillStyle = C.faint; ctx.font = (10*dpr)+"px Consolas,monospace";
+  ctx.textAlign = "right"; ctx.textBaseline = "middle";
+  [0,0.5,1,1.5,2].forEach(function(g){
+    var y = yOf(g);
+    ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(W-padR, y); ctx.stroke();
+    ctx.fillText(g.toFixed(1), padL-6*dpr, y);
+  });
+
+  /* 失重阈值 + 1g 参考线 */
+  function hline(g, color, dash){
+    var y = yOf(g);
+    ctx.save(); ctx.setLineDash(dash.map(function(x){return x*dpr}));
+    ctx.strokeStyle = color; ctx.lineWidth = 1*dpr;
+    ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(W-padR, y); ctx.stroke();
+    ctx.restore();
+  }
+  hline(0.35, "rgba(248,81,73,.55)", [4,4]);
+  hline(1.0,  "rgba(139,148,158,.45)", [2,5]);
+
+  var n = samples.length;
+  if (n < 2){
+    ctx.fillStyle = C.faint; ctx.textAlign = "left";
+    ctx.fillText("等待开发板上报…", padL+6*dpr, padT+14*dpr);
+    return;
+  }
+
+  /* 面积 + 折线 */
+  var pts = samples.map(function(s, i){
+    var g = Math.sqrt(s[1]*s[1] + s[2]*s[2] + s[3]*s[3]);
+    return [padL + i/(n-1)*plotW, yOf(g), g];
+  });
+
+  var grad = ctx.createLinearGradient(0, padT, 0, padT+plotH);
+  grad.addColorStop(0, "rgba(88,166,255,.42)");
+  grad.addColorStop(1, "rgba(88,166,255,.02)");
+  ctx.beginPath(); ctx.moveTo(pts[0][0], padT+plotH);
+  pts.forEach(function(p){ ctx.lineTo(p[0], p[1]); });
+  ctx.lineTo(pts[n-1][0], padT+plotH); ctx.closePath();
+  ctx.fillStyle = grad; ctx.fill();
+
+  ctx.beginPath();
+  pts.forEach(function(p, i){ i ? ctx.lineTo(p[0],p[1]) : ctx.moveTo(p[0],p[1]); });
+  ctx.strokeStyle = C.blue; ctx.lineWidth = 2*dpr;
+  ctx.lineJoin = "round"; ctx.stroke();
+
+  /* 末端点 */
+  var last = pts[n-1];
+  ctx.beginPath(); ctx.arc(last[0], last[1], 4*dpr, 0, 6.2832);
+  ctx.fillStyle = C.blue; ctx.fill();
+  ctx.beginPath(); ctx.arc(last[0], last[1], 8*dpr, 0, 6.2832);
+  ctx.fillStyle = "rgba(88,166,255,.22)"; ctx.fill();
+
+  ctx.fillStyle = C.dim; ctx.textAlign = "left"; ctx.textBaseline = "top";
+  ctx.font = (11*dpr)+"px Consolas,monospace";
+  ctx.fillText(last[2].toFixed(2)+" g", last[0]-30*dpr, padT+2*dpr);
+}
+addEventListener("resize", fitCanvas);
+
+/* ---------------- 姿态球与三轴条 ---------------- */
+var BUBBLE_MAX = 62;                     /* 1g 对应的像素偏移（相对球半径 50%） */
+function setBall(x, y, mag){
+  var bx = Math.max(-1, Math.min(1, x)) * BUBBLE_MAX;
+  var by = Math.max(-1, Math.min(1, y)) * BUBBLE_MAX;
+  var key = bx.toFixed(0)+","+by.toFixed(0);
+  var horiz = Math.sqrt(x*x + y*y);
+  var color = (mag < 0.35) ? C.red : (horiz < 0.15 ? C.green : (horiz < 0.7 ? C.amber : C.red));
+  if (key !== lastBall){
+    lastBall = key;
+    var d = $("ball");
+    d.style.transform = "translate(" + bx.toFixed(1) + "px," + by.toFixed(1) + "px)";
+    d.style.background = color;
+    d.style.boxShadow = "0 0 18px -2px " + color;
+  }
+  var t;
+  if (mag < 0.35){ t = "失重"; }
+  else {
+    var c = Math.min(1, Math.abs(0) );  /* 占位，真实值由 setTilt 计算 */
+    t = null;
+  }
+  if (t && t !== lastTilt){ lastTilt = t; $("tilt").textContent = t; }
+}
+function setTilt(z, mag){
+  if (mag < 0.35){ return; }
+  var c = Math.min(1, Math.abs(z)/mag);
+  var deg = Math.round(Math.acos(c)*180/Math.PI);
+  var t = "倾角 " + deg + "°";
+  if (t !== lastTilt){ lastTilt = t; $("tilt").textContent = t; }
+}
+function setBar(i, v){
+  var el = $(["bx","by","bz"][i]), vl = $(["vx","vy","vz"][i]);
+  var pct = Math.min(Math.abs(v), 2)/2*50;      /* 对称：从中点往两边长 */
+  el.style.width = pct + "%";
+  el.style.left = (v >= 0 ? 50 : 50-pct) + "%";
+  el.style.background = [C.red, C.green, C.blue][i];
+  vl.textContent = (v >= 0 ? "+" : "") + v.toFixed(2);
+}
+
+/* ---------------- 指令面板 ---------------- */
+var busy = false, devOnline = false, ledSteady = false, cmdNames = [], cmdsSeen = [];
+var STNAME = { queued:"排队中", sent:"已下发", done:"已完成", failed:"失败", timeout:"超时" };
+
+function renderButtons(){
+  var host = $("cmdbts");
+  if (host.dataset.built === cmdNames.join(",")) { syncButtons(); return; }
+  host.dataset.built = cmdNames.join(",");
+  host.innerHTML = cmdNames.map(function(n){
+    var ui = CMD_UI[n] || { label:n };
+    return '<button data-cmd="' + n + '"' + (ui.primary ? ' class="primary"' : '') + '>'
+         + ui.label + '</button>';
+  }).join(" ") || '<span class="empty">服务端没有开放任何远程指令</span>';
+  Array.prototype.forEach.call(host.querySelectorAll("button"), function(b){
+    b.onclick = function(){ sendCmd(b.dataset.cmd, b); };
+  });
+  syncButtons();
+}
+function syncButtons(){
+  var host = $("cmdbts");
+  Array.prototype.forEach.call(host.querySelectorAll("button"), function(b){
+    var n = b.dataset.cmd, ui = CMD_UI[n] || {};
+    b.disabled = busy || !devOnline;
+    if (ui.toggle && n === "led_set"){
+      b.textContent = ledSteady ? "LED 熄灭" : "LED 常亮";
+    } else if (n === "capture_once" && busy){
+      b.textContent = "等待板子回传…";
+    } else {
+      b.textContent = ui.label || n;
+    }
+  });
+}
+function sendCmd(name, btn){
+  var ui = CMD_UI[name] || {};
+  var params = ui.toggle && name === "led_set" ? {on: !ledSteady} : (ui.params || {});
+  if (btn) btn.disabled = true;
+  $("cmdhint").textContent = "";
+  fetch("/api/command", {
+    method:"POST", headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({name:name, params:params})
+  }).then(function(r){ return r.json(); }).then(function(d){
+    if (!d.ok){ $("cmdhint").textContent = "下发失败：" + (d.error || "未知错误"); return; }
+    $("cmdhint").textContent = "已下发 " + d.id + (d.device_online ? "" : "（注意：板子当前不在线）");
+    pull();
+  }).catch(function(e){
+    $("cmdhint").textContent = "下发失败：" + e;
+  }).then(function(){ syncButtons(); });
+}
+
+function renderCmds(cmds){
+  cmdsSeen = cmds || [];
+  var el = $("cmds");
+  if (!cmds || !cmds.length){ el.innerHTML = '<div class="empty">还没有下发过指令。</div>'; return; }
+  el.innerHTML = cmds.slice(0,8).map(function(c){
+    var r = c.result || {}, extra = "";
+    if (c.state === "done" && r.x !== undefined){
+      extra = '<span class="meta mono">x=' + (+r.x).toFixed(3) + ' y=' + (+r.y).toFixed(3)
+            + ' z=' + (+r.z).toFixed(3) + ' · ' + (r.n||0) + ' 样本 · '
+            + Math.round(r.ms||0) + ' ms · σ=' + (+(r.std||0)).toFixed(4) + ' g</span>';
+    } else if (c.state === "failed"){
+      extra = '<span class="meta mono">' + (r.err || "") + '</span>';
+    }
+    var lat = (c.sent && c.done)
+      ? '<span class="meta mono">往返 ' + Math.round((c.done-c.sent)*1000) + ' ms</span>' : "";
+    var ps = (c.params && Object.keys(c.params).length)
+      ? '<span class="meta mono">' + JSON.stringify(c.params) + '</span>' : "";
+    return '<div class="item"><span class="st st-' + c.state + '">' + (STNAME[c.state]||c.state) + '</span>'
+         + '<span class="name">' + c.name + '</span>' + ps
+         + '<span class="meta mono">' + c.id + '</span>' + lat + extra + '</div>';
+  }).join("");
+
+  busy = cmds.some(function(c){ return c.state === "queued" || c.state === "sent"; });
+  var lastSet = cmds.filter(function(c){ return c.name === "led_set" && c.state === "done"; })[0];
+  if (lastSet && lastSet.params) ledSteady = !!lastSet.params.on;
+  syncButtons();
+}
+
+/* ---------------- 事件流 ---------------- */
+var evHTML = "";
+function renderEvents(evts){
+  if (!evts || !evts.length) return;
+  var h = evts.slice(0,40).map(function(ev){
+    var k = "k-" + (ev.kind || "info");
+    var time = new Date(ev.ts*1000).toLocaleTimeString("zh-CN", {hour12:false});
+    return '<div class="item"><span class="k ' + k + '"></span><span class="t">' + time + '</span>'
+         + '<span>' + ev.text + '</span></div>';
+  }).join("");
+  if (h !== evHTML){
+    evHTML = h;
+    $("feed").innerHTML = h;
+    $("evcount").textContent = "最近 " + evts.length + " 条";
+  }
+}
+
+/* ---------------- 主刷新 ---------------- */
+var aiReply = "";
+function render(s){
+  devOnline = !!s.device_online;
+  var dev = $("dev");
+  dev.className = "pill " + (devOnline ? "on" : "off");
+  dev.innerHTML = "<i></i>" + (devOnline ? "在线" : "离线");
+
+  $("src").textContent = (s.source && s.source !== "-") ? s.source : "—";
+  $("hzp").textContent = s.sample_hz ? (s.sample_hz + " Hz") : "— Hz";
+  $("postsp").textContent = "↑" + (s.posts_ok !== undefined ? s.posts_ok : 0) + " 帧";
+  $("steps").textContent = s.step_count;
+  $("shakes").textContent = s.shake_count;
+  $("mode").textContent = (s.ai_mode || "规则AI") + (s.ai_pending ? " · 生成中…" : "");
+
+  var a = classify(s.activity || "");
+  if (a.word !== lastAct){
+    lastAct = a.word;
+    var e = $("act");
+    e.textContent = a.word;
+    e.style.color = a.color;
+    $("ring").style.stroke = a.color;
+  }
+
+  if (s.ai_reply && s.ai_reply !== aiReply){
+    aiReply = s.ai_reply;
+    $("reply").textContent = aiReply;
+  }
+  $("replybox").className = "reply" + (s.ai_pending ? " pending" : "");
+
+  if (s.latest){
+    var x = s.latest[1], y = s.latest[2], z = s.latest[3];
+    var mag = Math.sqrt(x*x + y*y + z*z);
+    setRing(mag); setBall(x, y, mag); setTilt(z, mag);
+    setBar(0, x); setBar(1, y); setBar(2, z);
+  }
+  renderCmds(s.commands);
+  renderEvents(s.events);
+}
+
+function pull(){
+  fetch("/api/latest").then(function(r){ return r.json(); }).then(function(s){
+    samples = s.samples || [];
+    drawChart();
+    render(s);
+  }).catch(function(){});
+}
+
+function stream(){
+  var es = new EventSource("/api/stream");
+  es.onmessage = function(e){
+    var s = JSON.parse(e.data);
+    render(s);
+  };
+  es.onerror = function(){ es.close(); setTimeout(stream, 2000); };
+}
+
+/* ---------------- 启动 ---------------- */
+$("host").textContent = location.host;
+fitCanvas();
+fetch("/api/logs").then(function(r){ return r.json(); }).then(function(l){
+  if (l && l.dir) $("logdir").textContent = "落盘 " + l.dir;
+}).catch(function(){});
+fetch("/api/commands").then(function(r){ return r.json(); }).then(function(d){
+  cmdNames = d.names || ["capture_once"];
+  $("names").textContent = cmdNames.join(" / ");
+  renderButtons();
+  renderCmds(d.commands);
+}).catch(function(){
+  cmdNames = ["capture_once"];
+  renderButtons();
+});
+pull();
+setInterval(pull, 2000);
+stream();
+})();
 </script>
 </body>
 </html>
@@ -978,7 +1399,7 @@ es();
 def main():
     global LOGGER, CMD_TIMEOUT_S
 
-    ap = argparse.ArgumentParser(description="AI交互课第2周 · PC服务器")
+    ap = argparse.ArgumentParser(description="AI 交互课 · PC 服务器（遥测接收 + 远程指令 + 网页仪表盘）")
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--data-dir", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "data"),
@@ -1016,7 +1437,7 @@ def main():
     llm = "大模型已配置 (%s)" % os.environ.get("RW1_LLM_MODEL", "?") \
         if os.environ.get("RW1_LLM_API_KEY") else "本地规则AI（可配 RW1_LLM_API_KEY 升级）"
     print("=" * 66)
-    print(" AI交互课 第2周 · PC 服务器已启动")
+    print(" AI 交互课 · PC 服务器已启动")
     print("   仪表盘:  http://localhost:%d/" % args.port)
     print("   遥测:    POST http://<本机IP>:%d/api/telemetry" % args.port)
     print("   指令:    POST http://<本机IP>:%d/api/command   {\"name\":\"capture_once\"}" % args.port)
