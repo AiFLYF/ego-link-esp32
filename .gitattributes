@@ -1,25 +1,71 @@
-# Windows batch scripts need CRLF; everything else normalises to LF.
+# ============================================================================
+# 行尾与 diff 策略
+#
+# ⚠️ gitattributes 是「后写覆盖先写」（last match wins），不是「更具体优先」。
+# 旧版本把 `* binary` 写在 `*.c text eol=lf` 那一块**之后**，而 `binary` 是
+# 宏，展开为 `-diff -merge -text`，于是**所有源码都被打成了二进制**：
+#   $ git diff --stat
+#   device/main/accel_input.c | Bin 18079 -> 20123 bytes
+# 后果：代码 diff 完全不可读、PR 无法评审、三方合并用不上文本驱动。
+#
+# 正确写法：**兜底规则放最前，例外放后面**。
+# ============================================================================
+
+# 兜底：让 git 自动判别文本/二进制，文本一律在工作区保持 LF
+# （与仓库现状一致：32 个文本文件已经是 i/lf w/lf）
+* text=auto eol=lf
+
+# Windows 批处理必须保持 CRLF，否则 cmd.exe 会解析错乱
 *.bat text eol=crlf
-*.py  text eol=lf
-*.c   text eol=lf
-*.h   text eol=lf
-*.md  text eol=lf
-*.yml text eol=lf
-*.txt text eol=lf
-*.csv text eol=lf
-*.lock text eol=lf
-sdkconfig.* text eol=lf
-* binary
+
+# ---- 真正的二进制资产：不规范化、不尝试文本 diff --------------------------
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.ico   binary
+*.webp  binary
+*.bmp   binary
+*.woff  binary
+*.woff2 binary
+*.ttf   binary
+*.otf   binary
+*.eot   binary
+*.bin   binary
+*.elf   binary
+*.obj   binary
+*.a     binary
+*.lib   binary
+*.zip   binary
+*.gz    binary
+*.7z    binary
+*.pdf   binary
+
+# ---- 源码与文档：显式声明为文本 + 启用文本 diff ---------------------------
+*.c     text diff eol=lf
+*.h     text diff eol=lf
+*.cpp   text diff eol=lf
+*.hpp   text diff eol=lf
+*.py    text diff eol=lf
+*.md    text diff eol=lf
+*.txt   text diff eol=lf
+*.yml   text diff eol=lf
+*.yaml  text diff eol=lf
+*.json  text diff eol=lf
+*.csv   text diff eol=lf
+*.lock  text diff eol=lf
+*.toml  text diff eol=lf
+*.cmake text diff eol=lf
+CMakeLists.txt text diff eol=lf
+sdkconfig.* text diff eol=lf
 
 # ---- web assets（GitHub Pages 站点根目录 docs/）--------------------------
-# 注意：必须放在 `* binary` 之后才会生效（gitattributes 后写覆盖先写）
-*.html text diff eol=lf
-*.css  text diff eol=lf
-*.js   text diff eol=lf
-*.json text diff eol=lf
-*.svg  text diff eol=lf
+*.html  text diff eol=lf
+*.css   text diff eol=lf
+*.js    text diff eol=lf
+*.svg   text diff eol=lf
 .gitattributes text diff eol=lf
-.gitignore text diff eol=lf
+.gitignore     text diff eol=lf
 
-# vendored 第三方产物不参与文本 diff（three.js + 自托管字体）
+# 必须放在最后：vendored 第三方产物不参与文本 diff（three.js + 自托管字体）
 docs/vendor/** binary
