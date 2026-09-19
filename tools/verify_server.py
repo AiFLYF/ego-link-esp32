@@ -82,6 +82,19 @@ def _expect_400(url, payload):
         return False
 
 
+def _wait_cmd(port, cid, timeout):
+    """等一条指令走到终态，返回它的记录（超时则返回最后看到的样子）。"""
+    deadline = time.time() + timeout
+    rec = None
+    while time.time() < deadline:
+        cmds = get_json("http://127.0.0.1:%d/api/commands" % port).get("commands", [])
+        rec = next((c for c in cmds if c["id"] == cid), None)
+        if rec and rec["state"] in ("done", "failed", "timeout"):
+            return rec
+        time.sleep(0.3)
+    return rec
+
+
 def firmware_body(samples, source="SC7A20", ask=False, question=None):
     """逐字节复刻 device/main/transport.c build_body() 的输出。
 
@@ -417,8 +430,72 @@ def main():
         check("超时事件进了事件流",
               any("超时" in (e.get("text") or "") for e in latest(port).get("events", [])))
 
-        # ---- 14. 命令历史有上限 --------------------------------------------
-        print("\n[14] 命令历史不无限增长")
+        # ---- 15. 远端物理反馈指令（第 3 周）--------------------------------
+        print("\n[14] 物理反馈指令 led_blink / led_set")
+        board2 = subprocess.Popen(
+            [PY, os.path.join(HERE, "fake_board.py"),
+             "--url", "http://127.0.0.1:%d" % port,
+             "--scenario", "idle", "--seconds", "18", "--quiet"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        time.sleep(2.0)
+
+        r3 = post_json("http://127.0.0.1:%d/api/command" % port,
+                       {"name": "led_blink", "params": {"n": 3, "on_ms": 80, "off_ms": 80}})
+        rec3 = _wait_cmd(port, r3.get("id"), 14)
+        check("led_blink 走到 done", rec3 is not None and rec3["state"] == "done",
+              "实际: %s" % (rec3 and rec3["state"]))
+        check("led_blink 参数被保留", (rec3 or {}).get("params", {}).get("n") == 3,
+              "实际: %s" % (rec3 or {}).get("params"))
+        check("led_blink 不回传测量值（只有 ok/ms）",
+              "x" not in ((rec3 or {}).get("result") or {}),
+              "实际: %s" % ((rec3 or {}).get("result")))
+
+        r4 = post_json("http://127.0.0.1:%d/api/command" % port,
+                       {"name": "led_set", "params": {"on": True}})
+        rec4 = _wait_cmd(port, r4.get("id"), 14)
+        check("led_set 走到 done", rec4 is not None and rec4["state"] == "done",
+              "实际: %s" % (rec4 and rec4["state"]))
+        check("led_set 的 on 参数被保留", (rec4 or {}).get("params", {}).get("on") is True,
+              "实际: %s" % (rec4 or {}).get("params"))
+
+        # 越界参数必须被夹住（外部输入不信任）
+        r5 = post_json("http://127.0.0.1:%d/api/command" % port,
+                       {"name": "led_blink",
+                        "params": {"n": 999, "on_ms": 1, "off_ms": 999999}})
+        rec5 = _wait_cmd(port, r5.get("id"), 14)
+        p5 = (rec5 or {}).get("params", {})
+        check("越界参数被夹到安全范围",
+              p5.get("n") == 12 and p5.get("on_ms") == 20 and p5.get("off_ms") == 5000,
+              "实际: %s" % p5)
+
+        board2.wait(timeout=30)
+
+        # ---- 16. 跌落 → 远端物理告警闭环（第 3 周）--------------------------
+        print("\n[15] 跌落自动触发 LED 物理告警")
+        t_mark = time.time()
+        # 连灌几帧失重数据（|a|≈0.02g）。dt 由"批大小/到达间隔"自校准，
+        # 所以要多帧快速连发，采样窗口里才会真的有连续失重样本。
+        for _ in range(6):
+            post_json("http://127.0.0.1:%d/api/telemetry" % port,
+                      {"batch": [[0.02, -0.01, 0.01]] * 20,
+                       "x": 0.02, "y": -0.01, "z": 0.01, "source": "SC7A20"})
+            time.sleep(0.03)
+        time.sleep(0.5)
+
+        cmds = get_json("http://127.0.0.1:%d/api/commands" % port).get("commands", [])
+        auto = [c for c in cmds if c["name"] == "led_blink" and c["created"] >= t_mark]
+        check("判定跌落后自动排队了 led_blink", len(auto) > 0,
+              "实际: 新增 %d 条" % len(auto))
+        if auto:
+            check("自动告警用的是 3 次快闪",
+                  auto[0].get("params", {}).get("n") == 3,
+                  "实际: %s" % auto[0].get("params"))
+        check("自动告警进了事件流",
+              any("跌落" in (e.get("text") or "") and "led_blink" in (e.get("text") or "")
+                  for e in latest(port).get("events", [])))
+
+        # ---- 17. 命令历史有上限（放最后，因为它会堆一队列指令）--------------
+        print("\n[16] 命令历史不无限增长")
         for _ in range(25):
             post_json("http://127.0.0.1:%d/api/command" % port, {"name": "capture_once"})
         n = len(get_json("http://127.0.0.1:%d/api/commands" % port).get("commands", []))

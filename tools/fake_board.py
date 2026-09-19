@@ -175,22 +175,28 @@ def main():
         # 模拟板端执行远程指令：上一帧收到 cmd，就用**本帧**的样本算结果，本帧带回。
         # 与固件时序一致——cmd 挂在第 N 帧响应上，第 N+1 帧请求里带 result。
         if pending_cmd is not None:
-            n = min(args.capture_n, len(batch))
-            head = batch[:n]
-            mx = sum(p[0] for p in head) / n
-            my = sum(p[1] for p in head) / n
-            mz = sum(p[2] for p in head) / n
-            mags = [math.sqrt(p[0] ** 2 + p[1] ** 2 + p[2] ** 2) for p in head]
-            mm = sum(mags) / n
-            std = math.sqrt(sum((m - mm) ** 2 for m in mags) / n)
-            payload["result"] = {
-                "id": pending_cmd, "ok": True,
-                "ms": round(n / args.sample_hz * 1000, 1), "n": n,
-                "x": round(mx, 4), "y": round(my, 4), "z": round(mz, 4),
-                "std": round(std, 4),
-            }
-            print("  t=%5.1fs  执行指令 %s → 回传 x=%+.3f y=%+.3f z=%+.3f (%d 样本, σ=%.4f)"
-                  % (time.time() - t0, pending_cmd, mx, my, mz, n, std))
+            cid, cname, cparams = pending_cmd
+            res = {"id": cid, "ok": True}
+            if cname == "capture_once":
+                n = min(args.capture_n, len(batch))
+                head = batch[:n]
+                mx = sum(p[0] for p in head) / n
+                my = sum(p[1] for p in head) / n
+                mz = sum(p[2] for p in head) / n
+                mags = [math.sqrt(p[0] ** 2 + p[1] ** 2 + p[2] ** 2) for p in head]
+                mm = sum(mags) / n
+                std = math.sqrt(sum((m - mm) ** 2 for m in mags) / n)
+                res.update({"ms": round(n / args.sample_hz * 1000, 1), "n": n,
+                            "x": round(mx, 4), "y": round(my, 4), "z": round(mz, 4),
+                            "std": round(std, 4)})
+                note = "x=%+.3f y=%+.3f z=%+.3f (%d 样本, σ=%.4f)" % (mx, my, mz, n, std)
+            else:
+                # led_blink / led_set：板端立刻完成，没有测量值
+                res.update({"ms": 1.0, "n": 0})
+                note = json.dumps(cparams, ensure_ascii=False)
+            payload["result"] = res
+            print("  t=%5.1fs  执行指令 %s(%s) → %s"
+                  % (time.time() - t0, cname, cid, note))
             pending_cmd = None
             results_sent += 1
 
@@ -214,7 +220,7 @@ def main():
                 else:
                     print("  t=%5.1fs  收到指令 %s（%s），下一帧执行"
                           % (time.time() - t0, cmd.get("id"), cmd.get("name")))
-                    pending_cmd = cmd["id"]
+                    pending_cmd = (cmd["id"], cmd.get("name", "?"), cmd.get("params") or {})
         except (urllib.error.URLError, OSError, ValueError) as exc:
             fail += 1
             if fail <= 3:
