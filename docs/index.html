@@ -253,6 +253,15 @@ pre .k{color:var(--teal)}pre .s{color:var(--amber)}pre .c{color:var(--faint);fon
 .feat p{font-size:13.5px;color:var(--dim);line-height:1.75}
 .feat code{font-size:12px;background:rgba(255,255,255,.05);border:1px solid var(--line);border-radius:5px;padding:1.5px 6px;color:#bcd2e2}
 
+/* ---- 板端 240x240 界面展示 ---- */
+.shots{display:grid;grid-template-columns:repeat(4,1fr);gap:16px}
+.shot{margin:0;padding:16px 16px 14px;display:flex;flex-direction:column;align-items:center;gap:12px}
+.shot img{width:100%;max-width:240px;aspect-ratio:1/1;display:block;border-radius:13px;
+  border:1px solid var(--line);image-rendering:pixelated;
+  box-shadow:0 20px 44px -24px rgba(0,0,0,.92)}
+.shot figcaption{font:600 11.5px/1.5 var(--font-mono);color:var(--dim);letter-spacing:.05em;text-align:center}
+.shot figcaption b{display:block;font-size:13px;letter-spacing:.02em;margin-bottom:2px}
+
 /* ===================== quickstart ===================== */
 .qs{display:grid;gap:14px}
 .qs-item{display:grid;grid-template-columns:46px 1fr;gap:18px;align-items:start;padding:20px}
@@ -314,11 +323,12 @@ footer .note{max-width:72ch;line-height:1.75;margin-top:18px;font-size:12.5px;co
   .stats{grid-template-columns:repeat(3,1fr)}
   .flow{grid-template-columns:1fr 1fr}.fstep .arrow{display:none}
   .feats{grid-template-columns:1fr 1fr}.payloads{grid-template-columns:1fr}
+  .shots{grid-template-columns:repeat(2,1fr)}
 }
 @media (max-width:680px){
   section{padding:72px 0}
   .stats{grid-template-columns:1fr 1fr}
-  .flow,.feats{grid-template-columns:1fr}
+  .flow,.feats,.shots{grid-template-columns:1fr}
   .hero-copy{padding:128px 22px 66px}
   .loop-viz{height:300px}
   .qs-item{grid-template-columns:38px 1fr;gap:12px;padding:16px}
@@ -347,7 +357,7 @@ footer .note{max-width:72ch;line-height:1.75;margin-top:18px;font-size:12.5px;co
 <nav>
   <span class="brand"><i class="dot"></i>Ego<b>·</b>Link</span>
   <div class="links">
-    <a href="#loop">闭环</a><a href="#features">亮点</a><a href="#quickstart">上手</a><a href="#api">接口</a><a href="#roadmap">18周路线</a>
+    <a href="#loop">闭环</a><a href="#ui">界面</a><a href="#features">亮点</a><a href="#quickstart">上手</a><a href="#api">接口</a><a href="#roadmap">18周路线</a>
   </div>
   <a class="gh" href="https://github.com/AiFLYF/ego-link-esp32">GitHub ↗</a>
 </nav>
@@ -359,7 +369,7 @@ footer .note{max-width:72ch;line-height:1.75;margin-top:18px;font-size:12.5px;co
   <div class="hero-copy">
     <span class="pill rv"><i></i>LIVE · 500 ms / 帧 · 真实传感器读数</span>
     <h1 class="rv" style="--d:90ms">板子动一下，<br>屏幕<em>就有回应</em>。</h1>
-    <p class="lead rv" style="--d:180ms">板载 SC7A20 加速度计每 500ms 上报真实姿态，你自己的电脑就是 AI 服务器：识别倾斜、晃动、步行与疑似跌落，把分析结果发回 240×240 的 LVGL 小屏 —— 不需要 VPS，服务器只用 Python 标准库。</p>
+    <p class="lead rv" style="--d:180ms">板载 SC7A20 加速度计 100Hz 采样、每 500ms 批量上报真实姿态，你自己的电脑就是 AI 服务器：识别倾斜、晃动、步行与疑似跌落，把结果发回 240×240 的<em>图形化小屏</em> —— 不需要 VPS，服务器只用 Python 标准库。</p>
     <div class="cta rv" style="--d:260ms">
       <a class="btn p" href="#loop">看数据怎么跑 →</a>
       <a class="btn s" href="#quickstart">四步跑通</a>
@@ -369,7 +379,7 @@ footer .note{max-width:72ch;line-height:1.75;margin-top:18px;font-size:12.5px;co
       <div class="stat"><b>±<span class="num" data-to="16">0</span> g</b><span>SC7A20 量程</span></div>
       <div class="stat"><b><span class="num" data-to="8">0</span> 方向</b><span>姿态识别</span></div>
       <div class="stat"><b><span class="num" data-to="0">0</span> 依赖</b><span>服务器 pip 包</span></div>
-      <div class="stat"><b><span class="num" data-to="104">0</span> KB</b><span>中文字体子集</span></div>
+      <div class="stat"><b><span class="num" data-to="180">0</span> KB</b><span>中文字体子集</span></div>
     </div>
   </div>
   <div class="scroll-cue" aria-hidden="true">SCROLL<span></span></div>
@@ -378,10 +388,10 @@ footer .note{max-width:72ch;line-height:1.75;margin-top:18px;font-size:12.5px;co
 <!-- ================= STRIP ================= -->
 <div class="strip">
   <div class="mq" id="mq">
-    <span>ESP-IDF v5.4</span><span>ESP32-S3-EYE</span><span>SC7A20 IMU</span><span>LVGL 8</span><span>240×240 ST7789</span>
+    <span>ESP-IDF v5.4</span><span>ESP32-S3-EYE</span><span>SC7A20 IMU</span><span>LVGL 9.6</span><span>240×240 ST7789</span>
     <span>ThreadingHTTPServer</span><span>SSE 推送</span><span>tiny_ttf</span><span>fontTools 子集</span><span>Kconfig / menuconfig</span>
     <span>UTF-8 安全截断</span><span>WiFi 自动重连</span><span>OpenAI 兼容端点</span><span>MIT License</span>
-    <span>ESP-IDF v5.4</span><span>ESP32-S3-EYE</span><span>SC7A20 IMU</span><span>LVGL 8</span><span>240×240 ST7789</span>
+    <span>ESP-IDF v5.4</span><span>ESP32-S3-EYE</span><span>SC7A20 IMU</span><span>LVGL 9.6</span><span>240×240 ST7789</span>
     <span>ThreadingHTTPServer</span><span>SSE 推送</span><span>tiny_ttf</span><span>fontTools 子集</span><span>Kconfig / menuconfig</span>
     <span>UTF-8 安全截断</span><span>WiFi 自动重连</span><span>OpenAI 兼容端点</span><span>MIT License</span>
   </div>
@@ -403,8 +413,8 @@ footer .note{max-width:72ch;line-height:1.75;margin-top:18px;font-size:12.5px;co
       <div class="fstep up card rv" style="--d:60ms"><span class="arrow">→</span><span class="no">① 采集</span><h3>IMU 采样</h3><p>SC7A20 三轴读数（WHO_AM_I=0x11 自动识别），换算为 g 并做死区滤波。</p><i class="spot"></i></div>
       <div class="fstep up card rv" style="--d:120ms"><span class="arrow">→</span><span class="no">② 上行</span><h3>POST /api/telemetry</h3><p>esp_http_client 每 500ms 一帧；断网无限重试，恢复即续传。</p><i class="spot"></i></div>
       <div class="fstep down card rv" style="--d:180ms"><span class="arrow">→</span><span class="no">③ 分析</span><h3>服务器 AI</h3><p>8s 滑动窗口：倾角八方向、峰值计步、方差判晃动 → 活动标签。</p><i class="spot"></i></div>
-      <div class="fstep down card rv" style="--d:240ms"><span class="arrow">→</span><span class="no">④ 回屏</span><h3>响应即下行</h3><p>activity + AI 回复随响应返回，UTF-8 安全截断后渲染上屏。</p><i class="spot"></i></div>
-      <div class="fstep down card rv" style="--d:300ms"><span class="arrow">→</span><span class="no">⑤ 旁观</span><h3>SSE 仪表盘</h3><p>浏览器 GET /：姿态球、|a| 曲线、事件流实时推送，零刷新。</p><i class="spot"></i></div>
+      <div class="fstep down card rv" style="--d:240ms"><span class="arrow">→</span><span class="no">④ 回屏</span><h3>响应即下行</h3><p>activity + AI 回复随响应返回，板端把长句解析成活动环 / 姿态球 / AI 气泡，长回复自动分页上屏。</p><i class="spot"></i></div>
+      <div class="fstep down card rv" style="--d:300ms"><span class="arrow">→</span><span class="no">⑤ 旁观</span><h3>SSE 仪表盘</h3><p>浏览器 GET /：环形仪表、姿态球、三轴对称条、|a| 曲线、事件流实时推送，零刷新，与板端同一套语义色。</p><i class="spot"></i></div>
     </div>
 
     <div class="payloads">
@@ -412,10 +422,11 @@ footer .note{max-width:72ch;line-height:1.75;margin-top:18px;font-size:12.5px;co
         <div class="plabel"><i></i>上行 · board → server（500ms 一帧）</div>
         <div class="code">
           <div class="bar"><i class="d"></i><i class="d"></i><i class="d"></i><span class="t">telemetry.json</span><button class="copy" type="button">复制</button></div>
-<pre>{ <span class="k">"x"</span>: 0.02, <span class="k">"y"</span>: -0.98, <span class="k">"z"</span>: 0.11,
-  <span class="k">"source"</span>: <span class="s">"sc7a20"</span>, <span class="k">"ask"</span>: 0 }
-<span class="c">// 按下 BOOT 键 → ask:1, 附提问文本</span>
-<span class="c">// 服务器回 {activity, reply} 供屏显</span></pre>
+<pre>{ <span class="k">"batch"</span>: [[0.02,-0.98,0.11], <span class="c">/* …共 50 个样本 */</span>],
+  <span class="k">"x"</span>: 0.02, <span class="k">"y"</span>: -0.98, <span class="k">"z"</span>: 0.11,
+  <span class="k">"source"</span>: <span class="s">"SC7A20"</span>, <span class="k">"ask"</span>: false }
+<span class="c">// 100Hz 采样攒成一批，每 500ms POST 一次</span>
+<span class="c">// 按下 BOOT 键 → ask:true，并附提问文本 q</span></pre>
         </div>
       </div>
       <div class="rv" style="--d:100ms">
@@ -423,8 +434,9 @@ footer .note{max-width:72ch;line-height:1.75;margin-top:18px;font-size:12.5px;co
         <div class="code">
           <div class="bar"><i class="d"></i><i class="d"></i><i class="d"></i><span class="t">response.json</span><button class="copy" type="button">复制</button></div>
 <pre>{ <span class="k">"ok"</span>: true,
-  <span class="k">"activity"</span>: <span class="s">"步行 · 峰值 4 次/8s"</span>,
-  <span class="k">"reply"</span>: <span class="s">"检测到节律性冲击，像步行。"</span> }
+  <span class="k">"activity"</span>: <span class="s">"运动/步行 (峰值 1.2g, 约8步)"</span>,
+  <span class="k">"reply"</span>: <span class="s">"正在进行的动作是「运动/步行 (峰值 1.2g, 约8步)」…"</span>,
+  <span class="k">"pending"</span>: false }
 <span class="c">// 未接大模型时 reply 为规则引擎真实摘要</span>
 <span class="c">// 配 RW1_LLM_API_KEY 自动升级成真 LLM</span></pre>
         </div>
@@ -433,14 +445,47 @@ footer .note{max-width:72ch;line-height:1.75;margin-top:18px;font-size:12.5px;co
   </div>
 </section>
 
+<!-- ================= ON-DEVICE UI ================= -->
+<section id="ui">
+  <div class="wrap">
+    <div class="sec-head rv"><span class="eyebrow">02 · On-Device UI</span><h2>240×240 的屏幕上，<span class="g">一眼看懂板子在干什么</span></h2></div>
+    <p class="sec-lede rv" style="--d:80ms">原来的板端界面是四行居中纯文本 —— 服务器返回的整句 <code>运动/步行 (峰值 1.2g, 约8步)</code> 被塞进 240px 宽的 label，直接截成 <code>…</code>，现场看不出重点。现在重做成图形化仪表：活动环 + 姿态球 + 三轴对称条 + AI 气泡，颜色本身就是结论。</p>
+
+    <div class="shots">
+      <figure class="shot card rv" style="--d:40ms">
+        <img src="ui-preview/screen-01-idle.png" alt="板端界面：静置水平，活动环绿色" loading="lazy" width="240" height="240">
+        <figcaption><b>静置 · 水平</b>绿 · 环内 1.00g</figcaption>
+      </figure>
+      <figure class="shot card rv" style="--d:90ms">
+        <img src="ui-preview/screen-03-walk.png" alt="板端界面：运动步行，活动环紫色" loading="lazy" width="240" height="240">
+        <figcaption><b>运动 / 步行</b>紫 · 从原句解析出「约 8 步」</figcaption>
+      </figure>
+      <figure class="shot card rv" style="--d:140ms">
+        <img src="ui-preview/screen-04-shake.png" alt="板端界面：剧烈晃动，活动环琥珀色" loading="lazy" width="240" height="240">
+        <figcaption><b>剧烈晃动</b>琥珀 · 三轴条同时大幅摆动</figcaption>
+      </figure>
+      <figure class="shot card rv" style="--d:190ms">
+        <img src="ui-preview/screen-05-fall.png" alt="板端界面：疑似跌落，红色告警与环外呼吸光" loading="lazy" width="240" height="240">
+        <figcaption><b>疑似跌落</b>红 + 环外呼吸告警</figcaption>
+      </figure>
+    </div>
+
+    <div class="feats" style="margin-top:16px">
+      <div class="feat card rv" style="--d:60ms"><span class="tag">语义色</span><h3>颜色就是结论</h3><p>静置绿 / 步行紫 / 运动蓝 / 晃动琥珀 / 跌落红 —— 五类活动各一个色；姿态球的颜色还跟着倾斜量走（水平绿、倾斜琥珀、大角度红），判定跌落时活动环外多一圈呼吸红光，隔两米也看得见。</p><i class="spot"></i></div>
+      <div class="feat a card rv" style="--d:110ms"><span class="tag">不丢字</span><h3>AI 回复自动分页</h3><p>回复按显示宽度切页（中文记 2 列、优先在空格处断），每 4 秒翻一页，右下角显示 <code>1/N</code>；服务端生成中显示转圈并把正文压暗。长回复不再被 <code>…</code> 吃掉，而是逐页读全。</p><i class="spot"></i></div>
+      <div class="feat v card rv" style="--d:160ms"><span class="tag">可验证</span><h3>没有硬件也能看界面</h3><p><code>tools/ui_preview.py</code> <b>解析 <code>ui.c</code> 里的 <code>UI_*</code> 宏</b>渲染像素级预览图，并做布局自检（控件是否越界、环心文字是否落在环内、回复是否 ≤2 行不超宽）—— 改布局时预览自动跟着变，不会出现「代码改了、预览图还是旧的」。</p><i class="spot"></i></div>
+    </div>
+  </div>
+</section>
+
 <!-- ================= FEATURES ================= -->
 <section id="features">
   <div class="wrap">
-    <div class="sec-head rv"><span class="eyebrow">02 · Highlights</span><h2>六个值得看的<span class="g">工程决定</span></h2></div>
+    <div class="sec-head rv"><span class="eyebrow">03 · Highlights</span><h2>六个值得看的<span class="g">工程决定</span></h2></div>
     <div class="feats">
       <div class="feat card rv" style="--d:40ms"><span class="tag">零依赖服务器</span><h3>Python 标准库全家桶</h3><p><code>ThreadingHTTPServer</code> + SSE，不装一个 pip 包就有接收、存储、查询、推送四件套。拿到任何一台电脑 <code>python server.py</code> 即跑。</p><i class="spot"></i></div>
       <div class="feat a card rv" style="--d:90ms"><span class="tag">可升级的 AI</span><h3>规则先行，大模型即插</h3><p>倾斜/计步/晃动/疑似跌落由滑动窗口规则引擎判定（8s 窗口、阈值可调）；配三个环境变量就换成任意 OpenAI 兼容端点生成回复。</p><i class="spot"></i></div>
-      <div class="feat v card rv" style="--d:140ms"><span class="tag">显示工程</span><h3>104KB 字体子集治好乱码</h3><p>LVGL 自带 CJK 演示字体缺字严重。<code>gen_font.py</code> 扫描源码+服务器文案，用 fontTools 从本机字体裁子集，tiny_ttf 运行时渲染 —— 屏显中文一个方块都没有。</p><i class="spot"></i></div>
+      <div class="feat v card rv" style="--d:140ms"><span class="tag">显示工程</span><h3>180KB 字体子集 + 图形化仪表</h3><p>LVGL 自带 CJK 演示字体缺字严重，<code>gen_font.py</code> 用 fontTools 从本机字体裁出 180KB 子集，tiny_ttf 运行时渲染，屏显中文一个方块都没有；在此之上把原来的四行纯文本重做成活动环 + 姿态球 + 三轴对称条 + AI 气泡。</p><i class="spot"></i></div>
       <div class="feat a card rv" style="--d:190ms"><span class="tag">网络鲁棒</span><h3>断网是常态，恢复是自动</h3><p>WiFi 掉线事件驱动重连：前 8 次每 2s、之后每 15s 无限重试；HTTP 失败静默退避。路由器恢复，板子两秒内自己回来，不用碰烧录线。</p><i class="spot"></i></div>
       <div class="feat card rv" style="--d:240ms"><span class="tag">协议细节</span><h3>响应即通道，不另开连接</h3><p>AI 回复搭载在遥测 POST 的响应体返回（HTTP/1.0 兼容坑已填：ON_DATA 累积器读 body），板端一条连接完成双向通信。</p><i class="spot"></i></div>
       <div class="feat v card rv" style="--d:290ms"><span class="tag">隐私设计</span><h3>凭据永远不进 git</h3><p>Kconfig 默认值是占位符，真实 WiFi/密码/IP 只存本地 <code>sdkconfig</code>（gitignored）；系统字体产物同样排除 —— clone 即安全，配置走 menuconfig。</p><i class="spot"></i></div>
@@ -451,7 +496,7 @@ footer .note{max-width:72ch;line-height:1.75;margin-top:18px;font-size:12.5px;co
 <!-- ================= QUICKSTART ================= -->
 <section id="quickstart">
   <div class="wrap">
-    <div class="sec-head rv"><span class="eyebrow">03 · Quickstart</span><h2>四步<span class="g">跑通全流程</span></h2></div>
+    <div class="sec-head rv"><span class="eyebrow">04 · Quickstart</span><h2>四步<span class="g">跑通全流程</span></h2></div>
     <p class="sec-lede rv" style="--d:80ms">需要：一块 ESP32-S3 系开发板（本工程按 S3-EYE 的 240×240 屏写）、ESP-IDF v5.4.x、任意 Python 3.10+。</p>
     <div class="qs">
       <div class="qs-item card rv" style="--d:60ms"><span class="n">1</span><div><h3>生成中文字体子集（从你本机字体裁，版权安全）</h3>
@@ -479,7 +524,7 @@ flash_device.bat COM10 30</pre></div></div><i class="spot"></i></div>
 <!-- ================= API ================= -->
 <section id="api">
   <div class="wrap">
-    <div class="sec-head rv"><span class="eyebrow">04 · Interface</span><h2>服务器<span class="g">接口一览</span></h2></div>
+    <div class="sec-head rv"><span class="eyebrow">05 · Interface</span><h2>服务器<span class="g">接口一览</span></h2></div>
     <div class="tbl-scroll rv" style="--d:80ms"><table>
       <thead><tr><th>方法 · 路径</th><th>作用</th><th>载荷 / 返回</th></tr></thead>
       <tbody>
@@ -495,11 +540,11 @@ flash_device.bat COM10 30</pre></div></div><i class="spot"></i></div>
 <!-- ================= ROADMAP ================= -->
 <section id="roadmap">
   <div class="wrap">
-    <div class="sec-head rv"><span class="eyebrow">05 · Course Roadmap</span><h2>18 周，<span class="g">一个仓库长出来</span></h2></div>
+    <div class="sec-head rv"><span class="eyebrow">06 · Course Roadmap</span><h2>18 周，<span class="g">一个仓库长出来</span></h2></div>
     <p class="sec-lede rv" style="--d:80ms">课程贯穿样例「Ego Link 随身智能终端」：从传感闭环出发，每周叠加一层交互能力，直到期末原型验收。</p>
     <div class="tl rv" style="--d:140ms" id="tl">
       <div class="rail"></div>
-      <div class="row done"><span class="w">Week 1–3</span><span class="t">最小交互闭环与设备反馈 —— 传感采集 / Web 展示 / 远程指令 / 按键物理反馈<span class="chip">W1 ✔ 已跑通</span></span></div>
+      <div class="row done"><span class="w">Week 1–3</span><span class="t">最小交互闭环与设备反馈 —— 传感采集 / Web 展示 / 远程指令 / 按键物理反馈 / 板端图形化界面<span class="chip">W1–W3 ✔ 已跑通</span></span></div>
       <div class="row"><span class="w">Week 4–6</span><span class="t">自然语言与语音任务交互 —— NL 查询采集、按键说话、澄清与停止</span></div>
       <div class="row"><span class="w">Week 7–9</span><span class="t">视觉感知与事件反馈 —— 按需取图、推理结果表达、主动询问</span></div>
       <div class="row"><span class="w">Week 10–12</span><span class="t">多源状态与主动交互 —— 观测 vs 状态、上下文组织、纠错记忆</span></div>
