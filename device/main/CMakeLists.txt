@@ -12,6 +12,7 @@ idf_component_register(
         "accel_input.c"
         "wifi_link.c"
         "transport.c"
+        "led_feedback.c"
         "ui.c"
         "rw1_font.c"
     INCLUDE_DIRS "."
@@ -24,4 +25,5 @@ idf_component_register(
         esp_timer
         esp_http_client
         json
+        led_indicator
 )

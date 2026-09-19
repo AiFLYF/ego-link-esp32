@@ -55,6 +55,8 @@ BOARD_REPLY_MAX = 512     # 回传板端的回复字节上限（UTF-8 安全截�
 
 STEP_MIN_G = 0.25         # 计步：高出窗口均值的幅度阈值（g）
 STEP_REFRACTORY_S = 0.30  # 计步：两步之间的最小间隔（秒）
+DT_NOMINAL = 0.01         # 标称采样间隔（对应板端 CONFIG_RW1_SAMPLE_PERIOD_MS=10）
+DT_TRUST_MAX = 0.05       # 超过这个推断间隔就认为该帧晚到了、时间轴不可信
 MOTION_STD = 0.06         # "算得上在动"的短窗标准差阈值（g）
 SHAKE_ZCR = 3.5           # 晃动判定：|a| 起伏频率高于该值（Hz）。步行 1.5~2.5Hz，
                           # 晃动 3~8Hz —— 只靠幅度分不开两者（走路也有 0.5g 起伏），
@@ -65,9 +67,14 @@ FREEFALL_G = 0.35         # 失重判定：合加速度阈值（g）
 FREEFALL_MIN_S = 0.05     # 失重判定：至少持续这么久才算疑似跌落（秒）
 
 # ---- 远程命令（第 2 周：Web 下发「采集一次」，按 request_id 反馈结果）----
+# 第 3 周在此基础上加了两个「物理反馈」指令：led_blink / led_set —— 板载 LED 在 GPIO3。
 CMD_TIMEOUT_S = 10.0      # 命令下发后多久没收到结果就判超时
 CMD_MAX_HISTORY = 20      # 保留最近多少条命令供网页显示
-CMD_NAMES = ("capture_once",)   # 支持的指令白名单（不认的名字直接 400）
+CMD_NAMES = ("capture_once", "led_blink", "led_set")   # 白名单（不认的名字直接 400）
+
+LED_MAX_BLINKS = 12       # 一次 led_blink 最多闪几下（板端也会再夹一道）
+LED_PATTERNS = ("alert", "ack", "error")   # led_blink 的语义图案（板端映射到预置图案）
+FALL_AUTO_ALERT = True    # 判定跌落时自动下发 LED 告警（远端物理反馈）
 
 ACTIVITY_IDLE = "等待数据…"
 
@@ -93,6 +100,7 @@ STATE = {
     "ai_pending": False,
     "ai_mode": "规则AI",
     "sample_hz": 0.0,                      # 实测采样率（由批量大小与到达间隔推算）
+    "dt_trusted": 0.0,                     # 最近一次可信的采样间隔（P1-6：晚到帧不参与）
     "boot_time": time.time(),
 }
 
@@ -126,6 +134,52 @@ def clip_utf8(text, limit):
 # 命令挂在下一帧遥测的响应里下发，板子执行完在**再下一帧**的请求体里带回结果。
 # 一次往返 = 2 个遥测周期（默认 1 秒），网页上能看到 queued → sent → done 全过程。
 # --------------------------------------------------------------------------
+def clamp_int(value, lo, hi, dflt):
+    """把外部传来的数字夹进 [lo, hi]；不是数字就用默认值。"""
+    try:
+        v = int(float(value))
+    except (TypeError, ValueError):
+        return dflt
+    return max(lo, min(hi, v))
+
+
+def sanitize_params(name, params):
+    """把网页/调用方传来的参数夹到安全范围。
+
+    服务端先夹一道，板端还会再夹一道 —— 外部输入不信任，谁也别指望对方把好关。
+    """
+    p = params if isinstance(params, dict) else {}
+    if name == "led_blink":
+        out = {
+            "n": clamp_int(p.get("n"), 1, LED_MAX_BLINKS, 3),
+            "on_ms": clamp_int(p.get("on_ms"), 20, 5000, 80),
+            "off_ms": clamp_int(p.get("off_ms"), 20, 5000, 80),
+        }
+        # 可选的语义图案：板端会映射到带含义的预置闪烁（告警/确认/错误），
+        # 比只丢一个"闪 N 次"更能表达意图。不认的值直接丢掉，不报错。
+        pat = str(p.get("pattern", "")).strip().lower()
+        if pat in LED_PATTERNS:
+            out["pattern"] = pat
+        return out
+    if name == "led_set":
+        v = p.get("on", True)
+        if isinstance(v, str):
+            v = v.strip().lower() in ("1", "true", "yes", "on")
+        return {"on": bool(v)}
+    return {}
+
+
+def _mark(rec, state, ts=None):
+    """改命令状态并追加迁移历史。**调用方必须已持有 LOCK。**
+
+    为什么要有 history：`sent` 只在下发帧和回传帧之间存活约一个遥测周期
+    （默认 0.5 s），外部用轮询去捕捉这个中间态本质是竞态断言——测试会因为
+    采样时机而随机失败。有了历史，断言改成查表即可，网页也能画出时间线。
+    """
+    rec["state"] = state
+    rec["history"].append([state, ts if ts is not None else time.time()])
+
+
 def new_command(name, params=None):
     """建一条待下发的命令，返回 request_id。"""
     global CMD_SEQ
@@ -135,8 +189,9 @@ def new_command(name, params=None):
         COMMANDS[cid] = {
             "id": cid,
             "name": name,
-            "params": params or {},
+            "params": sanitize_params(name, params),
             "state": "queued",      # queued / sent / done / failed / timeout
+            "history": [["queued", time.time()]],
             "created": time.time(),
             "sent": None,
             "done": None,
@@ -165,8 +220,8 @@ def take_command_for_board():
         rec = COMMANDS.get(cid)
         if rec is None or rec["state"] != "queued":
             continue
-        rec["state"] = "sent"
         rec["sent"] = time.time()
+        _mark(rec, "sent", rec["sent"])
         return {"id": cid, "name": rec["name"], "params": rec["params"]}
     return None
 
@@ -184,30 +239,42 @@ def apply_command_result(res):
         rec = COMMANDS.get(cid)
         if rec is None:
             return None                      # 可能是被淘汰的老命令，静默忽略
-        rec["state"] = "done" if res.get("ok") else "failed"
         rec["done"] = time.time()
+        _mark(rec, "done" if res.get("ok") else "failed", rec["done"])
         rec["result"] = {k: res[k] for k in keep if k in res}
         latency = (rec["done"] - rec["sent"]) if rec["sent"] else 0.0
         name = rec["name"]
         r = rec["result"]
         if rec["state"] == "done":
-            text = ("命令 %s 完成（往返 %.0f ms）：x=%+.3f y=%+.3f z=%+.3f，%d 样本，标准差 %.4f g"
-                    % (name, latency * 1000, r.get("x", 0.0), r.get("y", 0.0), r.get("z", 0.0),
-                       r.get("n", 0), r.get("std", 0.0)))
+            if "x" in r:      # capture_once 有测量值
+                text = ("命令 %s 完成（往返 %.0f ms）：x=%+.3f y=%+.3f z=%+.3f，%d 样本，标准差 %.4f g"
+                        % (name, latency * 1000, r.get("x", 0.0), r.get("y", 0.0), r.get("z", 0.0),
+                           r.get("n", 0), r.get("std", 0.0)))
+            else:             # led_blink / led_set 只有执行确认
+                text = "命令 %s 完成（往返 %.0f ms）" % (name, latency * 1000)
         else:
             text = "命令 %s 执行失败：%s" % (name, r.get("err", "未说明"))
     return text
 
 
 def expire_commands():
-    """把下发后长时间没回音的命令判为超时，返回超时的命令名列表。"""
+    """把长时间没有进展的命令判为超时，返回超时的命令名列表。
+
+    **`queued` 也要算**：设备离线时下发的命令会一直停在 queued，而 COMMANDS
+    上限只有 CMD_MAX_HISTORY 条——长时间离线会把历史全占满，新命令被挤掉；
+    设备几小时后重新上线还会被补发一批几小时前的操作（比如"闪灯"）。
+    所以 queued 以 created 为基准计时，sent 以 sent 为基准。
+    """
     now = time.time()
     expired = []
     with LOCK:
         for rec in COMMANDS.values():
-            if rec["state"] == "sent" and rec["sent"] and (now - rec["sent"]) > CMD_TIMEOUT_S:
-                rec["state"] = "timeout"
+            if rec["state"] not in ("queued", "sent"):
+                continue
+            base = rec["sent"] or rec["created"]
+            if (now - base) > CMD_TIMEOUT_S:
                 rec["done"] = now
+                _mark(rec, "timeout", now)
                 expired.append(rec["name"])
     return expired
 
@@ -674,7 +741,10 @@ class Handler(BaseHTTPRequestHandler):
         with LOCK:
             online = STATE["device_online"]
         cid = new_command(name, msg.get("params"))
-        push_event("cmd", "下发命令 %s（%s）" % (name, cid))
+        with LOCK:
+            rec = COMMANDS.get(cid)
+            pdesc = (" %s" % json.dumps(rec["params"], ensure_ascii=False)) if rec and rec["params"] else ""
+        push_event("cmd", "下发命令 %s%s（%s）" % (name, pdesc, cid))
         self._send(200, json.dumps(
             {"ok": True, "id": cid, "device_online": online}, ensure_ascii=False))
 
@@ -692,11 +762,21 @@ class Handler(BaseHTTPRequestHandler):
             prev_post = STATE["last_post"]
             was_online = STATE["device_online"]
             # 采样间隔由"本批样本数 / 两批到达的间隔"自校准，不依赖板端上报
+            # dt 由"本批样本数 / 两批到达的间隔"自校准。但**晚到的帧不可信**：
+            # 若某帧因网络抖动晚到 3 秒，50 个样本的推断间隔会被算成 60 ms，
+            # 这批样本就被摊到 3 秒的时间轴上 —— MOTION_WINDOW_S(0.6 s) 的短窗里
+            # 只剩最后 1~2 个样本，晃动/跌落全部漏检，sample_hz 也会跳变。
+            # 所以推断值明显偏大时沿用上一帧的可信值，不让它污染时间轴（P1-6）。
             if prev_post > 0 and len(pts) > 1:
-                dt = (now - prev_post) / float(len(pts))
-                dt = min(0.6, max(0.002, dt))
+                dt_est = (now - prev_post) / float(len(pts))
+                dt_est = min(0.6, max(0.002, dt_est))
+                if dt_est > DT_TRUST_MAX:
+                    dt = STATE["dt_trusted"] or DT_NOMINAL
+                else:
+                    dt = dt_est
+                    STATE["dt_trusted"] = dt_est
             else:
-                dt = 0.01
+                dt = DT_NOMINAL
             STATE["sample_hz"] = round(1.0 / dt, 1)
 
             STATE["device_online"] = True
@@ -710,6 +790,7 @@ class Handler(BaseHTTPRequestHandler):
             STATE["activity"] = activity
             for kind, text in events:
                 push_event(kind, text)
+            fell = any(k == "fall" for k, _ in events)
             src = STATE["source"]
             # 有排队中的命令就搭这一帧的响应发下去（一次一条）
             cmd = take_command_for_board()
@@ -721,6 +802,18 @@ class Handler(BaseHTTPRequestHandler):
         cmd_text = apply_command_result(msg.get("result"))
         if cmd_text:
             push_event("cmd", cmd_text)
+
+        # 按键触发（第 3 周）：板子把 BOOT 按下的次数带上来，
+        # 这样网页/日志能看到"物理动作真的发生了"，而不只是间接看到 ask。
+        btn = msg.get("btn")
+        if isinstance(btn, (int, float)) and btn > 0:
+            push_event("btn", "板端 BOOT 键按下 %d 次" % int(btn))
+
+        # 远端物理反馈闭环：判定跌落就自动下发 LED 告警。
+        # 必须在 LOCK 之外 —— new_command 内部要取锁，在锁里调用会死锁。
+        if fell and FALL_AUTO_ALERT:
+            aid = new_command("led_blink", {"pattern": "alert"})
+            push_event("alert", "判定跌落，自动下发 LED 告警（%s）" % aid)
 
         reply = ""
         if msg.get("ask"):                  # 板子 BOOT 键 → 请求一次 AI 交互
@@ -860,13 +953,17 @@ button:disabled{background:#30363d;color:#8b949e;cursor:default}
   <div class="row" style="margin-top:0">
     <span class="lbl">远程指令</span>
     <button id="capbtn">采集一次</button>
+    <button id="ledbtn">闪灯 ×3</button>
+    <button id="ledsetbtn">LED 常亮</button>
     <span id="cmdhint" class="lbl"></span>
   </div>
   <div id="cmds" style="margin-top:8px"></div>
   <div class="lbl" style="margin-top:8px">
-    点按钮 → 服务器把指令搭在<strong>下一帧遥测的响应</strong>里下发 → 板子采 20 个样本（200ms）算平均与标准差
-    → <strong>再下一帧</strong>带着同一个 request_id 回传结果。状态走 queued → sent → done，
-    是一次真实的硬件往返，不是本地伪造。
+    指令挂在<strong>下一帧遥测的响应</strong>里下发，板子在<strong>再下一帧</strong>带回结果，
+    状态走 queued → sent → done，是一次真实的硬件往返。<br>
+    「采集一次」= 板子采 20 个样本（200ms）算平均与标准差；
+    「闪灯 / LED 常亮」= 驱动板上 GPIO3 那颗 LED，即<strong>远端物理反馈</strong>。<br>
+    另外：服务器判定<strong>跌落</strong>时会自动下发一次「闪灯 ×3」做物理告警，不用手点。
   </div>
 </div>
 <div class="card" style="max-width:1000px;margin-top:14px">
@@ -903,6 +1000,7 @@ function draw(s){
  ctx.fillStyle='#8b949e';ctx.font=12*devicePixelRatio+'px sans-serif';
  ctx.fillText('|a| g',6*devicePixelRatio,H-8);}
 let evts='';
+let ledSteady=false;
 const STNAME={queued:'排队中',sent:'已下发',done:'已完成',failed:'失败',timeout:'超时'};
 function renderCmds(cmds){
  const el=document.getElementById('cmds');
@@ -910,33 +1008,45 @@ function renderCmds(cmds){
  const h=cmds.slice(0,8).map(c=>{
   const r=c.result||{};
   let extra='';
-  if(c.state==='done'){
+  if(c.state==='done'&&'x' in r){
    extra=` <span class="mono">x=${(r.x??0).toFixed(3)} y=${(r.y??0).toFixed(3)} z=${(r.z??0).toFixed(3)}`
         +` · ${r.n??0}样本 · ${Math.round(r.ms??0)}ms · σ=${(r.std??0).toFixed(4)}g</span>`;
   }else if(c.state==='failed'){extra=` <span class="mono">${r.err||''}</span>`}
   const lat=(c.sent&&c.done)?` <span class="mono">往返 ${Math.round((c.done-c.sent)*1000)}ms</span>`:'';
+  const ps=(c.params&&Object.keys(c.params).length)?` <span class="mono">${JSON.stringify(c.params)}</span>`:'';
   return `<div class="cmd"><span class="st st-${c.state}">${STNAME[c.state]||c.state}</span>`
-       + `<span>${c.name}</span><span class="mono">${c.id}</span>${lat}${extra}</div>`}).join('');
+       + `<span>${c.name}</span>${ps}<span class="mono">${c.id}</span>${lat}${extra}</div>`}).join('');
  el.innerHTML=h;
- // 有未完成的指令时把按钮禁掉，避免连点堆一队列
+ // 有未完成的指令时把按钮都禁掉，避免连点堆一队列
  const busy=cmds.some(c=>c.state==='queued'||c.state==='sent');
- const b=document.getElementById('capbtn');
- b.disabled=busy||!window.__devOnline;
- b.textContent=busy?'等待板子回传…':'采集一次';
+ const off=busy||!window.__devOnline;
+ const cb=document.getElementById('capbtn');
+ cb.disabled=off; cb.textContent=busy?'等待板子回传…':'采集一次';
+ const lb=document.getElementById('ledbtn'); if(lb) lb.disabled=off;
+ // 从最近一条成功的 led_set 推出灯的稳态，决定按钮该显示什么动作
+ const lastSet=cmds.find(c=>c.name==='led_set'&&c.state==='done');
+ if(lastSet&&lastSet.params) ledSteady=!!lastSet.params.on;
+ const sb=document.getElementById('ledsetbtn');
+ if(sb){sb.disabled=off; sb.textContent=ledSteady?'LED 熄灭':'LED 常亮';}
 }
-document.getElementById('capbtn').onclick=()=>{
- const b=document.getElementById('capbtn');
- b.disabled=true;b.textContent='下发中…';
+function sendCmd(name,params,btn){
+ const old=btn?btn.textContent:'';
+ if(btn){btn.disabled=true;btn.textContent='下发中…'}
  document.getElementById('cmdhint').textContent='';
  fetch('/api/command',{method:'POST',headers:{'Content-Type':'application/json'},
-   body:JSON.stringify({name:'capture_once'})})
+   body:JSON.stringify({name:name,params:params||{}})})
   .then(r=>r.json()).then(d=>{
+    if(btn)btn.textContent=old;
     if(!d.ok){document.getElementById('cmdhint').textContent='下发失败：'+(d.error||'未知');return}
     document.getElementById('cmdhint').textContent='已下发 '+d.id+(d.device_online?'':'（注意：板子当前不在线）');
     pull();
   })
-  .catch(e=>{document.getElementById('cmdhint').textContent='下发失败：'+e});
-};
+  .catch(e=>{if(btn)btn.textContent=old;
+    document.getElementById('cmdhint').textContent='下发失败：'+e});
+}
+document.getElementById('capbtn').onclick=e=>sendCmd('capture_once',{},e.target);
+document.getElementById('ledbtn').onclick=e=>sendCmd('led_blink',{n:3,on_ms:80,off_ms:80},e.target);
+document.getElementById('ledsetbtn').onclick=e=>sendCmd('led_set',{on:!ledSteady},e.target);
 function es(){
  const src=new EventSource('/api/stream');
  src.onmessage=e=>{const s=JSON.parse(e.data);last=s;
@@ -1001,16 +1111,27 @@ def main():
 
     # 后台心跳：设备超时判定离线 + 命令超时看护
     def watchdog():
+        next_purge = time.time() + 86400
         while True:
             time.sleep(1.0)
             with LOCK:
                 online = (time.time() - STATE["last_post"]) < DEVICE_TIMEOUT
                 if STATE["device_online"] and not online:
                     push_event("info", "开发板连接超时，已标记离线")
+                    # P1-12：顺手复位跌落状态。否则掉线期间若正好处在跌落态，
+                    # 重新上线后第一次**真实**跌落不会触发事件
+                    # （analyze 里的判据是 fall_active and not prev_fall）。
+                    STATE["fall_active"] = False
+                    STATE["activity"] = ACTIVITY_IDLE
                 STATE["device_online"] = online
             for name in expire_commands():
                 push_event("cmd", "命令 %s 超时（%.0f 秒内没有回传结果）"
                            % (name, CMD_TIMEOUT_S))
+            # P1-11：日志清理原来只在 JsonlLogger 构造时跑一次，README 却写
+            # 「保留 7 天」——服务器连续跑一个学期会一直涨。改成每天清一次。
+            if LOGGER is not None and time.time() > next_purge:
+                LOGGER.purge_old()
+                next_purge = time.time() + 86400
     threading.Thread(target=watchdog, daemon=True).start()
 
     llm = "大模型已配置 (%s)" % os.environ.get("RW1_LLM_MODEL", "?") \
