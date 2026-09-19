@@ -1,18 +1,21 @@
 /*
  * SPDX-License-Identifier: MIT
  *
- * AI交互课 第1周 · 开发板端应用
+ * AI交互课 第3周 · 开发板端应用 —— 按键触发 + 本地/远端物理反馈闭环
  *
  * Flow:  on-board IMU --(HTTP POST /api/telemetry, batched)--> PC server (server.py)
  *        PC server classifies the motion ("AI") and answers --> shown here.
- *        BOOT single click  => next telemetry frame carries ask=true; the server
- *                              replies immediately with "正在思考…" and delivers
- *                              the real answer on a later frame.
+ *        BOOT single click  => LED 立刻闪一下（**本地**物理反馈，不等网络），
+ *                              下一帧遥测带上 ask=true；服务器立刻回"正在思考…"，
+ *                              大模型的答案由后续帧带回，到达时再闪两下（**远端**反馈）。
  *        BOOT long press    => cycle the tilt calibration (which way is "up"),
  *                              persisted in NVS, no rebuild needed.
+ *        远端指令           => 服务器可下发 led_blink / led_set 驱动这颗灯，
+ *                              例如判定跌落时自动快闪 3 次做物理告警。
  *
  *   - bsp_display_start():   LCD + LVGL
  *   - accel_input_init():    SC7A20/LIS3DH/MPU6050/QMA7981 auto-detect
+ *   - led_feedback_init():   板载 LED（GPIO3）图案反馈
  *   - ui_init():             status/activity/AI-reply screen
  *   - wifi_link_start():     WiFi STA (+ Aliyun SNTP for log timestamps)
  *   - transport_start():     IMU sampling + batched telemetry to the PC server
@@ -25,6 +28,7 @@
 #include "nvs_flash.h"
 
 #include "accel_input.h"
+#include "led_feedback.h"
 #include "transport.h"
 #include "ui.h"
 #include "wifi_link.h"
@@ -37,6 +41,8 @@ static void on_ask_click(void *btn, void *arg)
 {
     (void)btn;
     (void)arg;
+    /* 先给本地反馈：按键被识别这件事不该等网络往返 */
+    led_feedback_play(LED_FB_ACK);
     transport_request_ask("我现在的运动状态怎么样？");
 }
 
@@ -48,6 +54,8 @@ static void on_orient_long_press(void *btn, void *arg)
     (void)btn;
     (void)arg;
     accel_input_cycle_orientation();
+    /* 两下短闪 = 长按生效，和单击的"一下"区分得开 */
+    led_feedback_play(LED_FB_REPLY);
     ESP_LOGI(TAG, "tilt calibration -> orientation %d (long-press BOOT to cycle)",
              accel_input_get_orientation());
 }
@@ -88,6 +96,8 @@ void app_main(void)
     bsp_display_backlight_on();
 
     ESP_ERROR_CHECK_WITHOUT_ABORT(accel_input_init());
+    /* LED 反馈是锦上添花，没有灯也不该拦住主流程 */
+    ESP_ERROR_CHECK_WITHOUT_ABORT(led_feedback_init());
 
     ESP_ERROR_CHECK(ui_init());
     setup_ask_button();

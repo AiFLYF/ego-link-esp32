@@ -26,6 +26,7 @@
 #include "freertos/task.h"
 
 #include "accel_input.h"
+#include "led_feedback.h"
 #include "wifi_link.h"
 
 static const char *TAG = "transport";
@@ -73,6 +74,7 @@ typedef struct {
     /* result waiting to be uploaded on the next frame */
     bool       ready;
     bool       ok;
+    bool       has_measurement; /* capture_once 才有 x/y/z/std；LED 指令只回 ok/ms */
     char       rid[TRANSPORT_CMD_ID_LEN];
     float      ms;
     int        rn;
@@ -87,6 +89,8 @@ static volatile bool s_ask_pending;
 static int s_ask_attempts;
 static char s_ask_text[64] = "我现在的运动状态怎么样？";
 static uint32_t s_post_count;
+static int s_btn_pending;      /* 自上次成功上报以来 BOOT 被按了几次（第 3 周） */
+static char s_last_reply[TRANSPORT_REPLY_LEN];   /* 上一次看到过的服务器回复 */
 
 /* [(x,y,z)] in screen frame, filled by the sampling loop. */
 static float s_batch[TX_BATCH_MAX][3];
@@ -121,7 +125,70 @@ static void status_unlock(void)
     xSemaphoreGive(s_lock);
 }
 
-/* ---------------- remote commands (week 2) -------------------------------- */
+/* ---------------- remote commands (week 2 起) ----------------------------- */
+
+/* 支持哪些指令。板端也做一层白名单：服务端万一发来没实现的名字，
+ * 静默忽略即可，绝不因为一条陌生指令把采样循环搞乱。 */
+typedef enum {
+    CMD_NONE = 0,
+    CMD_CAPTURE,        /* capture_once —— 累积样本做一次测量 */
+    CMD_LED_BLINK,      /* led_blink    —— 闪 n 次（远端物理反馈） */
+    CMD_LED_SET,        /* led_set      —— 常亮/熄灭 */
+} cmd_kind_t;
+
+static int json_int(const cJSON *obj, const char *key, int dflt)
+{
+    const cJSON *v = cJSON_IsObject(obj) ? cJSON_GetObjectItemCaseSensitive(obj, key) : NULL;
+    return cJSON_IsNumber(v) ? (int)v->valuedouble : dflt;
+}
+
+static bool json_bool(const cJSON *obj, const char *key, bool dflt)
+{
+    const cJSON *v = cJSON_IsObject(obj) ? cJSON_GetObjectItemCaseSensitive(obj, key) : NULL;
+    if (cJSON_IsBool(v)) {
+        return cJSON_IsTrue(v);
+    }
+    if (cJSON_IsNumber(v)) {
+        return v->valuedouble != 0;
+    }
+    return dflt;
+}
+
+/* 结束当前指令并准备好结果。with_measurement=false 时只回 ok/ms
+ * （led_blink / led_set 这类没有测量值）。 */
+static void finish_command(bool ok, bool with_measurement, const char *err)
+{
+    s_cmd.ready = true;
+    s_cmd.ok = ok;
+    strlcpy(s_cmd.rid, s_cmd.id, sizeof(s_cmd.rid));
+    s_cmd.rn = s_cmd.n;
+    s_cmd.ms = (float)pdTICKS_TO_MS(xTaskGetTickCount() - s_cmd.started);
+    s_cmd.has_measurement = (with_measurement && ok && s_cmd.n > 0);
+
+    if (s_cmd.has_measurement) {
+        const float inv = 1.0f / (float)s_cmd.n;
+        s_cmd.xyz[0] = s_cmd.sum[0] * inv;
+        s_cmd.xyz[1] = s_cmd.sum[1] * inv;
+        s_cmd.xyz[2] = s_cmd.sum[2] * inv;
+        const float mean_mag = s_cmd.mag_sum * inv;
+        const float var = s_cmd.mag_sq_sum * inv - mean_mag * mean_mag;   /* E[|a|²]-E[|a|]² */
+        s_cmd.std = (var > 0.0f) ? sqrtf(var) : 0.0f;
+        s_cmd.err[0] = '\0';
+    } else {
+        s_cmd.xyz[0] = s_cmd.xyz[1] = s_cmd.xyz[2] = 0.0f;
+        s_cmd.std = 0.0f;
+        strlcpy(s_cmd.err, ok ? "" : (err ? err : "command failed"), sizeof(s_cmd.err));
+    }
+
+    s_cmd.running = false;
+    s_cmd.state = ok ? TRANSPORT_CMD_DONE : TRANSPORT_CMD_FAILED;
+    if (!ok) {
+        led_feedback_play(LED_FB_ERROR);      /* 失败给一个能看见的物理信号 */
+    }
+    ESP_LOGI(TAG, "cmd %s: %s (%d samples, %.0f ms, std %.4f g)%s",
+             s_cmd.rid, ok ? "done" : "failed", s_cmd.rn, s_cmd.ms, s_cmd.std,
+             ok ? "" : s_cmd.err);
+}
 
 static void start_capture(const char *id)
 {
@@ -145,35 +212,57 @@ static void start_capture(const char *id)
     ESP_LOGI(TAG, "cmd %s: capture_once started (%d samples)", s_cmd.id, CAPTURE_N);
 }
 
-/* Turn the accumulated samples into a result ready for the next upload. */
-static void finish_capture(bool ok, const char *err)
+/* 执行一条刚收到的指令。LED 类指令立刻完成，采集类交给采样循环慢慢累积。 */
+static void run_command(cmd_kind_t kind, const char *id,
+                        int n, int on_ms, int off_ms, bool on)
 {
-    s_cmd.ready = true;
-    s_cmd.ok = ok;
-    strlcpy(s_cmd.rid, s_cmd.id, sizeof(s_cmd.rid));
-    s_cmd.rn = s_cmd.n;
-    s_cmd.ms = (float)pdTICKS_TO_MS(xTaskGetTickCount() - s_cmd.started);
-
-    if (ok && s_cmd.n > 0) {
-        const float inv = 1.0f / (float)s_cmd.n;
-        s_cmd.xyz[0] = s_cmd.sum[0] * inv;
-        s_cmd.xyz[1] = s_cmd.sum[1] * inv;
-        s_cmd.xyz[2] = s_cmd.sum[2] * inv;
-        const float mean_mag = s_cmd.mag_sum * inv;
-        const float var = s_cmd.mag_sq_sum * inv - mean_mag * mean_mag;   /* E[|a|²]-E[|a|]² */
-        s_cmd.std = (var > 0.0f) ? sqrtf(var) : 0.0f;
-        strlcpy(s_cmd.err, "", sizeof(s_cmd.err));
-    } else {
-        s_cmd.xyz[0] = s_cmd.xyz[1] = s_cmd.xyz[2] = 0.0f;
-        s_cmd.std = 0.0f;
-        strlcpy(s_cmd.err, err ? err : "capture failed", sizeof(s_cmd.err));
+    if (kind == CMD_NONE) {
+        return;
+    }
+    if (s_cmd.running) {
+        ESP_LOGW(TAG, "cmd %s ignored: %s still running", id, s_cmd.id);
+        return;
     }
 
-    s_cmd.running = false;
-    s_cmd.state = ok ? TRANSPORT_CMD_DONE : TRANSPORT_CMD_FAILED;
-    ESP_LOGI(TAG, "cmd %s: %s (%d samples, %.0f ms, std %.4f g)%s",
-             s_cmd.rid, ok ? "done" : "failed", s_cmd.rn, s_cmd.ms, s_cmd.std,
-             ok ? "" : s_cmd.err);
+    led_feedback_play(LED_FB_CMD);            /* 收到指令的物理反馈 */
+
+    switch (kind) {
+    case CMD_CAPTURE:
+        start_capture(id);
+        break;
+
+    case CMD_LED_BLINK:
+        /* 先把"当前指令"占上，好让结果带上正确的 request_id 和耗时 */
+        utf8_strlcpy(s_cmd.id, id, sizeof(s_cmd.id));
+        s_cmd.running = true;
+        s_cmd.state = TRANSPORT_CMD_RUNNING;
+        s_cmd.started = xTaskGetTickCount();
+        s_cmd.n = 0;
+        led_feedback_blink(n, (uint16_t)on_ms, (uint16_t)off_ms);
+        status_lock();
+        s_st.cmd_count++;
+        status_unlock();
+        ESP_LOGI(TAG, "cmd %s: led_blink n=%d on=%dms off=%dms", s_cmd.id, n, on_ms, off_ms);
+        finish_command(true, false, NULL);
+        break;
+
+    case CMD_LED_SET:
+        utf8_strlcpy(s_cmd.id, id, sizeof(s_cmd.id));
+        s_cmd.running = true;
+        s_cmd.state = TRANSPORT_CMD_RUNNING;
+        s_cmd.started = xTaskGetTickCount();
+        s_cmd.n = 0;
+        led_feedback_steady(on);
+        status_lock();
+        s_st.cmd_count++;
+        status_unlock();
+        ESP_LOGI(TAG, "cmd %s: led_set on=%d", s_cmd.id, on ? 1 : 0);
+        finish_command(true, false, NULL);
+        break;
+
+    default:
+        break;
+    }
 }
 
 /* Feed one freshly sampled point into the running capture. */
@@ -190,7 +279,7 @@ static void feed_capture(const float xyz[3])
     s_cmd.mag_sq_sum += mag * mag;
 
     if (++s_cmd.n >= CAPTURE_N) {
-        finish_capture(true, NULL);
+        finish_command(true, true, NULL);
     }
 }
 
@@ -199,7 +288,7 @@ static void check_capture_timeout(void)
 {
     if (s_cmd.running &&
         pdTICKS_TO_MS(xTaskGetTickCount() - s_cmd.started) > CAPTURE_TIMEOUT_MS) {
-        finish_capture(false, "not enough samples");
+        finish_command(false, true, "not enough samples");
     }
 }
 
@@ -250,7 +339,7 @@ static char *build_body(int n, bool ask, const char *source)
         return NULL;
     }
     size_t cap = 256 + (size_t)n * 28 + strlen(s_ask_text) * 2 + 64
-                 + (s_cmd.ready ? 320 : 0);
+                 + (s_cmd.ready ? 320 : 0) + 32;
     char *buf = malloc(cap);
     if (buf == NULL) {
         return NULL;
@@ -309,11 +398,11 @@ static char *build_body(int n, bool ask, const char *source)
         off += snprintf(buf + off, cap - (size_t)off,
                         "\",\"ok\":%s,\"ms\":%.1f,\"n\":%d",
                         s_cmd.ok ? "true" : "false", s_cmd.ms, s_cmd.rn);
-        if (s_cmd.ok) {
+        if (s_cmd.has_measurement) {
             off += snprintf(buf + off, cap - (size_t)off,
                             ",\"x\":%.4f,\"y\":%.4f,\"z\":%.4f,\"std\":%.4f",
                             s_cmd.xyz[0], s_cmd.xyz[1], s_cmd.xyz[2], s_cmd.std);
-        } else {
+        } else if (!s_cmd.ok) {
             off += snprintf(buf + off, cap - (size_t)off, ",\"err\":\"");
             if (!json_escape_append(buf, cap, &off, s_cmd.err)) {
                 free(buf);
@@ -322,6 +411,16 @@ static char *build_body(int n, bool ask, const char *source)
             off += snprintf(buf + off, cap - (size_t)off, "\"");
         }
         off += snprintf(buf + off, cap - (size_t)off, "}");
+    }
+
+    /* 按键触发（第 3 周）：自上次上报以来 BOOT 被按了几次。
+     * 让服务端/网页能看见"物理动作真的发生了"，而不只是间接看到 ask。 */
+    if (s_btn_pending > 0) {
+        if ((size_t)off + 24 > cap) {
+            free(buf);
+            return NULL;
+        }
+        off += snprintf(buf + off, cap - (size_t)off, ",\"btn\":%d", s_btn_pending);
     }
 
     /* Close with an explicit write (not snprintf) so a full buffer can never
@@ -340,6 +439,9 @@ static void apply_response(const char *body, size_t len)
     char activity[TRANSPORT_ACTIVITY_LEN] = "";
     char reply[TRANSPORT_REPLY_LEN] = "";
     char cmd_id[TRANSPORT_CMD_ID_LEN] = "";
+    cmd_kind_t kind = CMD_NONE;
+    int p_n = 0, p_on = 0, p_off = 0;
+    bool p_onf = false;
     bool ok = false;
     bool pending = false;
 
@@ -363,10 +465,25 @@ static void apply_response(const char *body, size_t len)
             if (cJSON_IsObject(jcmd)) {
                 const cJSON *jid = cJSON_GetObjectItemCaseSensitive(jcmd, "id");
                 const cJSON *jname = cJSON_GetObjectItemCaseSensitive(jcmd, "name");
+                const cJSON *jparams = cJSON_GetObjectItemCaseSensitive(jcmd, "params");
                 if (cJSON_IsString(jid) && jid->valuestring != NULL &&
-                    cJSON_IsString(jname) && jname->valuestring != NULL &&
-                    strcmp(jname->valuestring, "capture_once") == 0) {
-                    utf8_strlcpy(cmd_id, jid->valuestring, sizeof(cmd_id));
+                    cJSON_IsString(jname) && jname->valuestring != NULL) {
+                    if (strcmp(jname->valuestring, "capture_once") == 0) {
+                        kind = CMD_CAPTURE;
+                    } else if (strcmp(jname->valuestring, "led_blink") == 0) {
+                        kind = CMD_LED_BLINK;
+                        p_n   = json_int(jparams, "n", 3);
+                        p_on  = json_int(jparams, "on_ms", 80);
+                        p_off = json_int(jparams, "off_ms", 80);
+                    } else if (strcmp(jname->valuestring, "led_set") == 0) {
+                        kind = CMD_LED_SET;
+                        p_onf = json_bool(jparams, "on", true);
+                    }
+                    if (kind != CMD_NONE) {
+                        utf8_strlcpy(cmd_id, jid->valuestring, sizeof(cmd_id));
+                    } else {
+                        ESP_LOGW(TAG, "unknown cmd '%s' ignored", jname->valuestring);
+                    }
                 }
             }
             cJSON_Delete(root);
@@ -387,9 +504,9 @@ static void apply_response(const char *body, size_t len)
     }
     status_unlock();
 
-    /* 在锁外启动采集：start_capture 只碰 s_cmd，且不能拖住状态锁 */
+    /* 在锁外执行指令：run_command 只碰 s_cmd 和 LED，不能拖住状态锁 */
     if (cmd_id[0] != '\0') {
-        start_capture(cmd_id);
+        run_command(kind, cmd_id, p_n, p_on, p_off, p_onf);
     }
 }
 
@@ -528,9 +645,13 @@ static void transport_task(void *arg)
             bool ask = s_ask_pending;
             bool ok = post_batch(n, ask);
 
-            /* 结果只在成功送达后才清；失败就下一帧重发（与 ask 的策略一致） */
-            if (s_cmd.ready && ok) {
-                s_cmd.ready = false;
+            /* 结果与按键计数只在成功送达后才清；失败就下一帧重发
+             * （与 ask 的重试策略一致，不丢东西） */
+            if (ok) {
+                if (s_cmd.ready) {
+                    s_cmd.ready = false;
+                }
+                s_btn_pending = 0;
             }
 
             status_lock();
@@ -542,7 +663,17 @@ static void transport_task(void *arg)
             }
             char act[TRANSPORT_ACTIVITY_LEN];
             strlcpy(act, s_st.activity, sizeof(act));
+            const bool reply_changed =
+                (s_st.reply[0] != '\0' && strcmp(s_st.reply, s_last_reply) != 0);
+            if (reply_changed) {
+                strlcpy(s_last_reply, s_st.reply, sizeof(s_last_reply));
+            }
             status_unlock();
+
+            /* 服务器/AI 的回复变了就闪两下 —— 这是"远端反馈真的回来了"的物理信号 */
+            if (reply_changed) {
+                led_feedback_play(LED_FB_REPLY);
+            }
 
             /* A button press must never be silently swallowed: keep the flag and
              * retry on the next frame, but stop after a few tries. */
@@ -600,6 +731,7 @@ void transport_request_ask(const char *question)
     }
     s_ask_attempts = 0;
     s_ask_pending = true;
+    s_btn_pending++;          /* 让服务端/网页能看见"物理按键发生了" */
     ESP_LOGI(TAG, "ask queued: %s", s_ask_text);
 }
 
