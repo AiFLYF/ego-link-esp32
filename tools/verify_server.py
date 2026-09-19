@@ -342,6 +342,13 @@ def main():
         check("50 样本固件帧分类正确", out4.get("activity") == "静置·水平",
               "实际: %s" % out4.get("activity"))
 
+        # 先把 8 秒窗口灌满「向右倾斜」，再发 ask 帧。
+        # 注意：不灌的话窗口里还留着上一节的 (0,0,1) 样本，均值被稀释，
+        # 方向会被判成「水平」。修 P1-6（晚到帧不再污染时间轴）之前，
+        # 被夸大的 dt 会把旧样本挤出窗口，这条断言是**靠那个 bug 才通过**的。
+        for _ in range(4):
+            post_raw("http://127.0.0.1:%d/api/telemetry" % port,
+                     firmware_body([(0.7, 0.0, 0.71)] * 50))
         raw_ask = firmware_body([(0.7, 0.0, 0.71)] * 50, ask=True,
                                 question="我现在的运动状态怎么样？")
         out5 = post_raw("http://127.0.0.1:%d/api/telemetry" % port, raw_ask)
