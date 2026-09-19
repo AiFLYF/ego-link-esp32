@@ -45,4 +45,22 @@ menu "RW1 AI Interaction (board to PC server)"
             are physically impossible below 50 Hz. The original 500 ms
             (2 Hz) sampling made both features silently fake.
 
+    config RW1_IMU_DEBUG_LOG
+        bool "Periodic IMU diagnostic log (1 Hz)"
+        default y
+        help
+            Once per second the transport task logs one line with the raw
+            sensor sample, the screen-frame values, |a| and the active
+            orientation. Used to validate the sensor->screen axis mapping
+            on a real board: hold the board in a known pose and compare
+            against the expected numbers.
+
+            Expected values (screen frame: +x right, +y down, +z out of
+            the screen): flat on table, screen up -> (0, 0, +1);
+            standing on the top edge -> y = -1; bottom edge -> y = +1;
+            right edge -> x = +1; left edge -> x = -1. |a| should read
+            ~1.00 g whenever the board is at rest.
+
+            Turn it off to reduce log noise once the mapping is confirmed.
+
 endmenu
