@@ -52,6 +52,12 @@ static const led_seg_t *s_segs;      /* 正在播的图案（NULL = 没在播）
 static int s_n;
 static int s_cur;
 
+/* 世代号：每次换图案就 ++。esp_timer_stop() 取消不了"已经在飞行中"的回调——
+ * 那个回调仍会跑一次，并可能 esp_timer_start_once() 把**新**图案多推一格
+ * （快速连发指令时闪烁节奏就乱了）。所以回调在动手前先核对世代号，
+ * 发现自己是上一个世代的就直接退出。 */
+static uint32_t s_gen;
+
 /* 自定义闪烁的临时图案缓冲（远端 led_blink 用） */
 static led_seg_t s_dyn[LED_FB_MAX_BLINKS * 2 + 1];
 
@@ -62,13 +68,14 @@ static void led_apply(bool on)
     }
 }
 
-/* 停掉当前图案。先把指针清空，这样万一回调正好在跑也只会空转一下。 */
+/* 停掉当前图案。先把指针清空并推进世代号，这样万一回调正好在跑也只会空转一下。 */
 static void stop_pattern(void)
 {
     portENTER_CRITICAL(&s_mux);
     s_segs = NULL;
     s_n = 0;
     s_cur = 0;
+    s_gen++;
     portEXIT_CRITICAL(&s_mux);
     if (s_timer != NULL) {
         esp_timer_stop(s_timer);     /* 没在跑时会返回 INVALID_STATE，无所谓 */
@@ -100,8 +107,10 @@ static void led_timer_cb(void *arg)
 
     const led_seg_t *segs;
     int cur, n;
+    uint32_t gen;
 
     portENTER_CRITICAL(&s_mux);
+    gen = s_gen;
     segs = s_segs;
     n = s_n;
     cur = s_cur;
@@ -111,6 +120,15 @@ static void led_timer_cb(void *arg)
     portEXIT_CRITICAL(&s_mux);
 
     if (segs == NULL || cur >= n) {
+        return;
+    }
+
+    /* 世代号变了说明这次回调是"上一个图案"的尾巴（esp_timer_stop 拦不住它），
+     * 直接退出，别去动别人的图案。 */
+    portENTER_CRITICAL(&s_mux);
+    const bool stale = (gen != s_gen);
+    portEXIT_CRITICAL(&s_mux);
+    if (stale) {
         return;
     }
 
