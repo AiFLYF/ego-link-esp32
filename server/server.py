@@ -55,6 +55,8 @@ BOARD_REPLY_MAX = 512     # 回传板端的回复字节上限（UTF-8 安全截�
 
 STEP_MIN_G = 0.25         # 计步：高出窗口均值的幅度阈值（g）
 STEP_REFRACTORY_S = 0.30  # 计步：两步之间的最小间隔（秒）
+DT_NOMINAL = 0.01         # 标称采样间隔（对应板端 CONFIG_RW1_SAMPLE_PERIOD_MS=10）
+DT_TRUST_MAX = 0.05       # 超过这个推断间隔就认为该帧晚到了、时间轴不可信
 MOTION_STD = 0.06         # "算得上在动"的短窗标准差阈值（g）
 SHAKE_ZCR = 3.5           # 晃动判定：|a| 起伏频率高于该值（Hz）。步行 1.5~2.5Hz，
                           # 晃动 3~8Hz —— 只靠幅度分不开两者（走路也有 0.5g 起伏），
@@ -98,6 +100,7 @@ STATE = {
     "ai_pending": False,
     "ai_mode": "规则AI",
     "sample_hz": 0.0,                      # 实测采样率（由批量大小与到达间隔推算）
+    "dt_trusted": 0.0,                     # 最近一次可信的采样间隔（P1-6：晚到帧不参与）
     "boot_time": time.time(),
 }
 
@@ -759,11 +762,21 @@ class Handler(BaseHTTPRequestHandler):
             prev_post = STATE["last_post"]
             was_online = STATE["device_online"]
             # 采样间隔由"本批样本数 / 两批到达的间隔"自校准，不依赖板端上报
+            # dt 由"本批样本数 / 两批到达的间隔"自校准。但**晚到的帧不可信**：
+            # 若某帧因网络抖动晚到 3 秒，50 个样本的推断间隔会被算成 60 ms，
+            # 这批样本就被摊到 3 秒的时间轴上 —— MOTION_WINDOW_S(0.6 s) 的短窗里
+            # 只剩最后 1~2 个样本，晃动/跌落全部漏检，sample_hz 也会跳变。
+            # 所以推断值明显偏大时沿用上一帧的可信值，不让它污染时间轴（P1-6）。
             if prev_post > 0 and len(pts) > 1:
-                dt = (now - prev_post) / float(len(pts))
-                dt = min(0.6, max(0.002, dt))
+                dt_est = (now - prev_post) / float(len(pts))
+                dt_est = min(0.6, max(0.002, dt_est))
+                if dt_est > DT_TRUST_MAX:
+                    dt = STATE["dt_trusted"] or DT_NOMINAL
+                else:
+                    dt = dt_est
+                    STATE["dt_trusted"] = dt_est
             else:
-                dt = 0.01
+                dt = DT_NOMINAL
             STATE["sample_hz"] = round(1.0 / dt, 1)
 
             STATE["device_online"] = True
@@ -1098,16 +1111,27 @@ def main():
 
     # 后台心跳：设备超时判定离线 + 命令超时看护
     def watchdog():
+        next_purge = time.time() + 86400
         while True:
             time.sleep(1.0)
             with LOCK:
                 online = (time.time() - STATE["last_post"]) < DEVICE_TIMEOUT
                 if STATE["device_online"] and not online:
                     push_event("info", "开发板连接超时，已标记离线")
+                    # P1-12：顺手复位跌落状态。否则掉线期间若正好处在跌落态，
+                    # 重新上线后第一次**真实**跌落不会触发事件
+                    # （analyze 里的判据是 fall_active and not prev_fall）。
+                    STATE["fall_active"] = False
+                    STATE["activity"] = ACTIVITY_IDLE
                 STATE["device_online"] = online
             for name in expire_commands():
                 push_event("cmd", "命令 %s 超时（%.0f 秒内没有回传结果）"
                            % (name, CMD_TIMEOUT_S))
+            # P1-11：日志清理原来只在 JsonlLogger 构造时跑一次，README 却写
+            # 「保留 7 天」——服务器连续跑一个学期会一直涨。改成每天清一次。
+            if LOGGER is not None and time.time() > next_purge:
+                LOGGER.purge_old()
+                next_purge = time.time() + 86400
     threading.Thread(target=watchdog, daemon=True).start()
 
     llm = "大模型已配置 (%s)" % os.environ.get("RW1_LLM_MODEL", "?") \
