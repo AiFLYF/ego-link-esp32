@@ -58,15 +58,15 @@
 | `server/server.py` | 电脑服务器（仅 Python 标准库，无需 pip 安装） |
 | `server/data/` | **运行时生成**的 JSONL 日志（git-ignored，见下文"数据落盘"） |
 | `device/` | 开发板 ESP-IDF 工程（ESP-IDF v5.4.x，目标 esp32s3） |
-| `device/main/` | `main.c` 启动、`accel_input.c` IMU驱动（SC7A20/LIS3DH/MPU6050/QMA7981 自动识别）、`wifi_link.c` WiFi STA、`net_config.c` 运行期配置、`provisioning.c` SoftAP 配网、`transport.c` 采样+HTTP遥测、`ui.c` LVGL界面、`led_feedback.c` LED 物理反馈 |
+| `device/main/` | `main.c` 启动、`accel_input.c` IMU驱动（SC7A20/LIS3DH/MPU6050/QMA7981 自动识别）、`wifi_link.c` WiFi STA、`net_config.c` 运行期配置、`provisioning.c` SoftAP 配网、`transport.c` 采样+HTTP遥测、`led_feedback.c` LED图案播放器、`ui.c` LVGL 图形化仪表盘（见下文"板端界面"） |
 | `device/main/net_config.c` | **运行期配置的唯一入口**：NVS 优先，为空时逐项回退 Kconfig（向后兼容） |
 | `device/main/provisioning.c` | SoftAP + `esp_http_server` 配网页；`provisioning_page.h` 是内联的单页 HTML |
 | `device/main/prov_form.c` | 配网表单的解析与校验。**刻意零 IDF 依赖**，可用 host 侧编译器直接测 |
 | `device/main/Kconfig.projbuild` | WiFi 账号、服务器 URL、采样周期、上报周期——现在只是**出厂默认值**，优先用配网页改 |
 | `tools/gen_font.py` | **必跑**：中文字体子集生成器（生成 git-ignored 的 `device/main/rw1_font.c`） |
 | `tools/fake_board.py` | 假开发板：不接硬件就能灌数据、调仪表盘 |
-| `tools/verify_server.py` | 服务端回归测试（断言数见运行输出，含"大模型不阻塞板端"验证） |
-| `tools/idf_build.py` | 在 Git Bash 里调用 `idf.py` 的包装器（见常见问题） |
+| `tools/ui_preview.py` | 板端 240x240 界面预览渲染器：**解析 `ui.c` 里的 `UI_*` 宏**出图，没有硬件也能验证界面 |
+| `tools/verify_server.py` | 服务端回归测试（跑完自报「N/N 通过」，断言数随功能增长；含"大模型不阻塞板端"验证） || `tools/idf_build.py` | 在 Git Bash 里调用 `idf.py` 的包装器（见常见问题） |
 | `tools/tools_serial_capture.py` | 非交互串口抓取（复位→打印N秒→退出，需 pyserial） |
 | `build_device.bat` / `flash_device.bat` | 干净环境编译 / 烧录+串口抓取（参数化 COM 口与秒数） |
 | LICENSE / NOTICE | MIT；第三方组件与字体授权说明 |
@@ -278,6 +278,51 @@ AP 存活 **5 分钟无操作自动关闭**回 STA（避免忘记关热点长期
 立刻断，用户永远看不到那个错误提示。所以页面/扫描阶段保持**纯 AP**（规避信道干扰），
 只在"试连"那一小段切 **APSTA**（手机保持连着才能收到结果）。
 
+### 板端界面（240x240 图形化仪表盘）
+
+早期版本的 `ui.c` 是四个居中的纯文本 label：把服务器返回的整句活动文案
+（如 `运动/步行 (峰值 1.2g, 约8步)`）直接塞进 240px 宽的 label，被 `LV_LABEL_LONG_DOT`
+截成 `…`，现场看不出重点。现在改成图形化仪表：
+
+```
++--------------------------------------------+
+| * 在线   100Hz   ^1234    SC7A20 o0        | 状态胶囊：链路/采样率/上报数/IMU与校准档
++----------------------+---------------------+
+|        /-----\\       |     /-------\\       |
+|        | 静置 |       |     |   *   |       | 左：活动环（量程=|a| 0..2g）
+|        \\-----/       |     \\-------/       | 右：姿态球（重力方向）
+|         水平         |      倾角 12°        |
++----------------------+---------------------+
+| X ===------   Y ==-----   Z =====-----     | 三轴对称条（±2g，0 在中点）
++--------------------------------------------+
+| [AI]                             (o)  1/2  |
+|  服务器回复（超长自动分页，每 4 秒翻一页）    |
++--------------------------------------------+
+```
+
+- **活动环**：活动不再是一句话，而是「活动词 + 语义色 + 环」。颜色跟着活动走：
+  静置绿 / 步行紫 / 运动蓝 / 晃动琥珀 / 跌落红。服务器原句里的细节
+  （水平 / 向左倾斜 / 峰值 / 约 N 步）**被解析出真实数值**后另起一行小字，不再被截断。
+- **姿态球**：直接用 `transport_status_t.x_g/y_g`（屏幕坐标系）放点，与网页仪表盘、
+  与上报给服务端的数据是**同一套方向语义**，不做二次翻转。
+- **三轴对称条**：±2g 对称条，0 在中点，正负一眼分得开。
+- **AI 回复自动分页**：按显示宽度切页（中文记 2 列，优先在空格/句读处断），每 4 秒翻一页，
+  右下角显示 `1/2`。长回复不再被 `…` 吃掉，而是**逐页读全**。
+- **状态即颜色**：跌落时活动环外多一圈呼吸红光；断链时状态点呼吸，在线时保持常亮
+  （不做无意义重绘，避免 240x240 SPI 屏撕裂）；远程指令状态在胶囊右侧显示 `···/OK/NG`。
+- **几何零硬编码**：尺寸与配色全部集中在 `ui.c` 顶部的 `UI_*` 宏里，
+  `tools/ui_preview.py` **解析同一份宏**渲染预览图 —— 改布局时预览自动跟着变，
+  不会出现"代码改了、预览图还是旧的"。
+
+没有硬件也能看界面（Pillow 渲染，与固件同源）：
+
+```powershell
+python tools\ui_preview.py            # 输出 docs/ui-preview/screen-*.png + contact-sheet.png
+python tools\ui_preview.py --scale 3  # 拼接图放大 3 倍
+```
+
+![板端界面预览（含改造前对比）](docs/ui-preview/contact-sheet.png)
+
 ### 数据落盘（第 1 周的"存储"）
 
 服务器默认把数据写到 `server/data/`，按天分文件、JSONL 追加：
@@ -359,6 +404,9 @@ python server\server.py
 | 倾斜方向左右/上下反了 | **长按 BOOT 键**循环切换校准值（屏幕上 `o0`–`o7`），存在 NVS 里，不用重编译 |
 | 板子日志每隔 10 秒出现一行 `link OK` | 正常心跳（每 20 次上报一次） |
 | 改 WiFi/服务器地址 | `idf.py menuconfig` → `RW1 AI Interaction`（值只存在本地 sdkconfig，不会被提交） |
+| **`git switch -c feature/xxx` 建出来的分支是 unborn**（`git branch` 里看不到、`git status` 把全部文件显示成 `A`） | `.git/refs/heads/feature/` 这个**目录不存在**：松散引用写不进去时 git 会**静默成功**（退出码 0 但不落盘），`git switch -c` 只改得动 HEAD → HEAD 指向一个不存在的 ref。用**写文件的方式**建出该目录（bash 里 `mkdir -p .git/refs/heads/feature` 会被沙箱回滚），之后 `git branch` / `git switch -c` 即正常。注意 `packed-refs` 乱序是**另一个**独立故障 |
+| 两个会话在同一工作区里干活，工作区文件大面积消失 / 引用丢失 | 一个工作区同时只能有一个 HEAD，两个 `git switch` 并发会把索引和工作区交替写坏。**并发必须各用独立工作区**：`git worktree add ../rw1-x <branch>` |
+| 编译报 `ninja: error: build.ninja:30: loading 'CMakeFiles/rules.ninja': The system cannot find the path specified` | `device/build/` 被中断的构建或分支切换弄成了半残状态。先 `idf.py reconfigure` 再 build；还不行就删掉 `device/build/` 全量重编 |
 
 ## 安全提示
 
