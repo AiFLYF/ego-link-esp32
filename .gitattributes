@@ -12,7 +12,6 @@
 # ============================================================================
 
 # 兜底：让 git 自动判别文本/二进制，文本一律在工作区保持 LF
-# （与仓库现状一致：32 个文本文件已经是 i/lf w/lf）
 * text=auto eol=lf
 
 # Windows 批处理必须保持 CRLF，否则 cmd.exe 会解析错乱
@@ -56,6 +55,7 @@
 *.lock  text diff eol=lf
 *.toml  text diff eol=lf
 *.cmake text diff eol=lf
+Kconfig*    text diff eol=lf
 CMakeLists.txt text diff eol=lf
 sdkconfig.* text diff eol=lf
 
