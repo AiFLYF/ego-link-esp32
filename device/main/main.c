@@ -29,6 +29,8 @@
 
 #include "accel_input.h"
 #include "led_feedback.h"
+#include "net_config.h"
+#include "provisioning.h"
 #include "transport.h"
 #include "ui.h"
 #include "wifi_link.h"
@@ -36,6 +38,34 @@
 static const char *TAG = "main";
 
 static button_handle_t s_buttons[BSP_BUTTON_NUM];
+
+/* 三条配网入口的第 2 条：双击 BOOT 强制重新配网。
+ * 刻意**不动**现有的单击（提问）和长按（校准）——"双击"在用户直觉里就是
+ * "我要设置点什么"，加一个新手势比改旧手势安全（PROPOSAL §1.3）。 */
+static void on_prov_double_click(void *btn, void *arg)
+{
+    (void)btn;
+    (void)arg;
+    if (provisioning_is_active()) {
+        ESP_LOGW(TAG, "已经在配网模式了");
+        return;
+    }
+    led_feedback_play(LED_FB_ACK);
+    ESP_LOGW(TAG, "双击 BOOT -> 进入配网模式");
+    /* provisioning_start() 内部会切成 WIFI_MODE_AP，STA 连接自然断开 */
+    provisioning_start();
+}
+
+/* 看护：5 分钟没人动配网页就自动关热点回 STA（PROPOSAL §1.4）。
+ * 单独起个小任务而不是塞进别处，是为了让"谁负责关 AP"只有一个答案。 */
+static void prov_watchdog_task(void *arg)
+{
+    (void)arg;
+    while (true) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        provisioning_poll_timeout();
+    }
+}
 
 static void on_ask_click(void *btn, void *arg)
 {
@@ -77,7 +107,8 @@ static void setup_ask_button(void)
     }
     iot_button_register_cb(ask_btn, BUTTON_SINGLE_CLICK, NULL, on_ask_click, NULL);
     iot_button_register_cb(ask_btn, BUTTON_LONG_PRESS_START, NULL, on_orient_long_press, NULL);
-    ESP_LOGI(TAG, "BOOT: click -> ask the PC server AI, long-press -> cycle tilt calibration");
+    iot_button_register_cb(ask_btn, BUTTON_DOUBLE_CLICK, NULL, on_prov_double_click, NULL);
+    ESP_LOGI(TAG, "BOOT: click -> ask, long-press -> cycle tilt, double-click -> 重新配网");
 }
 
 void app_main(void)
@@ -101,15 +132,33 @@ void app_main(void)
 
     ESP_ERROR_CHECK(ui_init());
 
+    /* WiFi 栈先建起来（netif / 事件循环 / wifi init），但先不连 ——
+     * 配网需要"栈在、连接待定"这个中间状态。 */
+    ESP_ERROR_CHECK(wifi_link_init());
+
     /* transport_start() 必须排在 setup_ask_button() 之前：前者会创建状态互斥锁，
      * 而按键回调（transport_request_ask）要用那把锁。反过来的话，
      * 开机瞬间的按键会取到 NULL 锁。 */
     transport_start();
     setup_ask_button();
 
-    wifi_link_start();
+    /* 把表单解析的边界用例跑一遍，串口看 "N/N PASS"（本机没有 host C 编译器，
+     * 所以自检放在目标板上跑，见 provisioning.h 的说明）。 */
+    prov_form_selftest();
 
+    /* 三条配网入口的第 1 条：NVS 里没有凭据就自动开热点。
+     * 有凭据就直接连 —— 老 sdkconfig 一字不改仍然走这条路（向后兼容）。 */
+    if (net_config_present()) {
+        wifi_link_start();
+    } else {
+        ESP_LOGW(TAG, "NVS 里没有 WiFi 配置，进入配网模式（双击 BOOT 可再次进入）");
+        provisioning_start();
+    }
+    xTaskCreatePinnedToCore(prov_watchdog_task, "prov_wd", 2560, NULL, 3, NULL, 0);
+
+    net_config_t cfg;
+    net_config_load(&cfg);
     ESP_LOGI(TAG, "rw1 board app: IMU %dHz -> batch -> %s%s",
              (int)(1000 / CONFIG_RW1_SAMPLE_PERIOD_MS),
-             CONFIG_RW1_SERVER_URL, "/api/telemetry");
+             cfg.url, "/api/telemetry");
 }

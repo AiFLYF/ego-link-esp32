@@ -13,7 +13,8 @@
 |---|---|---|
 | 1 | 传感数据采集 + 服务器接收/存储 + Web 展示 | ✅ |
 | 2 | Web 远程"采集一次"指令（request_id）与执行结果反馈 | ✅ |
-| 3 | 按键触发 + 本地/远端物理反馈闭环 | ✅ 本仓库当前内容 |
+| 3 | 按键触发 + 本地/远端物理反馈闭环 | ✅ |
+| — | **运行期配置：SoftAP 配网 + NVS**（工程改进，非课程周次） | ✅ 本仓库当前内容 |
 | 4–6 | 自然语言查询/请求、按键说话语音链路、澄清与停止 | |
 | 7–9 | 按需取图、视觉推理反馈、视觉事件主动询问 | |
 | 10–12 | 观测 vs 当前状态（数据年龄）、多源上下文、纠错记忆 | |
@@ -57,12 +58,15 @@
 | `server/server.py` | 电脑服务器（仅 Python 标准库，无需 pip 安装） |
 | `server/data/` | **运行时生成**的 JSONL 日志（git-ignored，见下文"数据落盘"） |
 | `device/` | 开发板 ESP-IDF 工程（ESP-IDF v5.4.x，目标 esp32s3） |
-| `device/main/` | `main.c` 启动、`accel_input.c` IMU驱动（SC7A20/LIS3DH/MPU6050/QMA7981 自动识别）、`wifi_link.c`、`transport.c` 采样+HTTP遥测、`ui.c` LVGL界面 |
-| `device/main/Kconfig.projbuild` | WiFi 账号、服务器 URL、采样周期、上报周期（占位默认值，用 menuconfig 配自己的） |
+| `device/main/` | `main.c` 启动、`accel_input.c` IMU驱动（SC7A20/LIS3DH/MPU6050/QMA7981 自动识别）、`wifi_link.c` WiFi STA、`net_config.c` 运行期配置、`provisioning.c` SoftAP 配网、`transport.c` 采样+HTTP遥测、`led_feedback.c` LED图案播放器、`ui.c` LVGL 图形化仪表盘（见下文"板端界面"） |
+| `device/main/net_config.c` | **运行期配置的唯一入口**：NVS 优先，为空时逐项回退 Kconfig（向后兼容） |
+| `device/main/provisioning.c` | SoftAP + `esp_http_server` 配网页；`provisioning_page.h` 是内联的单页 HTML |
+| `device/main/prov_form.c` | 配网表单的解析与校验。**刻意零 IDF 依赖**，可用 host 侧编译器直接测 |
+| `device/main/Kconfig.projbuild` | WiFi 账号、服务器 URL、采样周期、上报周期——现在只是**出厂默认值**，优先用配网页改 |
 | `tools/gen_font.py` | **必跑**：中文字体子集生成器（生成 git-ignored 的 `device/main/rw1_font.c`） |
 | `tools/fake_board.py` | 假开发板：不接硬件就能灌数据、调仪表盘 |
-| `tools/verify_server.py` | 服务端回归测试（27 项断言，含"大模型不阻塞板端"验证） |
-| `tools/idf_build.py` | 在 Git Bash 里调用 `idf.py` 的包装器（见常见问题） |
+| `tools/ui_preview.py` | 板端 240x240 界面预览渲染器：**解析 `ui.c` 里的 `UI_*` 宏**出图，没有硬件也能验证界面 |
+| `tools/verify_server.py` | 服务端回归测试（跑完自报「N/N 通过」，断言数随功能增长；含"大模型不阻塞板端"验证） || `tools/idf_build.py` | 在 Git Bash 里调用 `idf.py` 的包装器（见常见问题） |
 | `tools/tools_serial_capture.py` | 非交互串口抓取（复位→打印N秒→退出，需 pyserial） |
 | `build_device.bat` / `flash_device.bat` | 干净环境编译 / 烧录+串口抓取（参数化 COM 口与秒数） |
 | LICENSE / NOTICE | MIT；第三方组件与字体授权说明 |
@@ -77,25 +81,35 @@
 python tools/gen_font.py
 python tools/gen_font.py --list-fonts   # 看看本机有哪些可用中文字体
 
-# ② 配置自己的 WiFi 与电脑 IP（Kconfig → "RW1 AI Interaction"，值存于本地 sdkconfig）
-cd device && idf.py -D SDKCONFIG_DEFAULTS=sdkconfig.bsp.esp32_s3_eye menuconfig
-
-# ③ 编译 + 烧录（首次编译会从组件仓库拉取 espressif/esp32_s3_eye 等到 managed_components/）
-cd .. && build_device.bat
+# ② 编译 + 烧录（首次编译会从组件仓库拉取 espressif/esp32_s3_eye 等到 managed_components/）
+build_device.bat
 flash_device.bat COM3 30        # 端口按设备管理器改；默认 COM10
 
-# ④ 启动服务器（同一直连网络/热点即可）
+# ③ 启动服务器（同一直连网络/热点即可）
 python server\server.py
+
+# ④ 配网 —— 不用再 menuconfig 了
+#    首次上电板子会自己开热点 EGO-LINK-XXXX
+#    手机连上（密码看板子屏幕）→ 浏览器打开 http://192.168.4.1
+#    选 WiFi、填电脑 IP、点「保存并连接」；板子先试连，成功才保存
 ```
 
 浏览器打开 <http://localhost:8000/> 即见仪表盘。串口日志出现
 `Detected accelerometer: SC7A20` → `Got IP` → `activity: 静置·…` 即闭环成功。
 
-- 服务器 URL 填电脑 `ipconfig` → WLAN 的 IPv4（**不能** 127.0.0.1）；IP 变化后 menuconfig 改 `RW1_SERVER_URL` 重编译。
+- **WiFi 和服务器地址现在是运行期配置**，配一次就存进 NVS，断电重启直接连。
+  要换网络/换电脑 IP：**双击 BOOT** 重新进配网，或长按……都不用，双击就行。
+- 服务器地址填电脑 `ipconfig` → WLAN 的 IPv4（**不能** 127.0.0.1）；
+  配网页上可以点「测试连接」当场验证通不通。
+- `menuconfig` 里的 `RW1_WIFI_*` / `RW1_SERVER_URL` 现在只是**出厂默认值**——
+  NVS 为空时才生效。老 `sdkconfig` 一字不改仍然能跑（向后兼容）。
 - Windows 防火墙弹窗请**允许**；否则以管理员执行：
   `netsh advfirewall firewall add rule name="rw1-server" dir=in action=allow protocol=TCP localport=8000`
 - **离线/国内网络**：首次编译在线拉取组件可先走代理：`set https_proxy=http://127.0.0.1:10808`（按自己代理端口）；完全离线则把已解析的 `managed_components/` 拷入 `device/`（`dependencies.lock` 已提供，保证版本一致）。
 - 断网后板子**无限重试**（前8次每2s，之后每15s），网络恢复即自动重连，无需重新烧录。
+
+> 为什么值得做这件事：原来 WiFi 密码是**编译进固件**的，把固件发给同学等于把
+> 自己的 WiFi 密码一起发出去。现在密码只在你自己的 NVS 里。
 
 ### 采样与上报节奏（menuconfig）
 
@@ -205,6 +219,110 @@ BSP 自带的 4 个效果（on/off/快闪/慢闪）都是**无限循环**，做�
 外部输入不信任，谁也别指望对方把好关。
 
 
+### 运行期配置：SoftAP 配网
+
+**要解决的问题**：WiFi SSID / 密码 / 服务器地址原来只能靠 menuconfig 改，改一次要
+全量重编译 + 烧录；PC 换个 DHCP 地址就得再来一遍。**更要命的是编译出来的固件里
+WiFi 密码是明文**——把固件发给同学/老师，等于把自己的 WiFi 密码一起发出去。
+
+现在改成运行期配置：
+
+```
+首次上电 / NVS 里没有凭据 / 双击 BOOT
+            │
+            ▼
+  板子开热点 EGO-LINK-<MAC后2字节>，密码是屏幕上的 4 位随机数
+            │   手机连上 → 浏览器打开 192.168.4.1
+            ▼
+  填表：① 扫描选 WiFi  ② 服务器地址（可当场「测试连接」）  ③ 设备名  ④ 上报周期
+            │
+            ▼
+  点「保存并连接」→ 板子**先试连**（最长 15 秒）
+            │
+       ┌────┴────┐
+     失败        成功
+       │          │
+  页面红字报原因   写 NVS → 转 STA → 屏幕显示新 IP
+  **不写 NVS、     AP 自动关闭
+   不关 AP，可重试**
+```
+
+**为什么是"先试连再保存"**：用户永远知道失败在哪一步；也不会把一份连不上的凭据
+存进去，导致下次开机直接失联。这正是"配完了没数据、不知道是 WiFi 还是服务器地址错"
+那个排查地狱的解药——所以服务器地址旁边还有个「测试连接」按钮当场验。
+
+**向后兼容**：`net_config_load()` 在 NVS 为空时**逐项**回退 `CONFIG_RW1_*`，
+所以老 `sdkconfig` 一字不改仍然能跑，Kconfig 那两项从"唯一来源"平滑降级为"出厂默认值"。
+
+**三条重新配网的入口**（缺一条就可能"配错了只能重烧"）：
+
+1. NVS 里没有凭据 → 开机自动进 AP（首次上电的自然路径）
+2. **双击 BOOT** → 强制重新配网（刻意不动现有的单击提问 / 长按校准两个手势）
+3. 配网页上的「清除配置并重启」
+
+AP 存活 **5 分钟无操作自动关闭**回 STA（避免忘记关热点长期占道 + 耗电），
+屏幕上提示"配网超时"。
+
+| 路由 | 说明 |
+|---|---|
+| `GET /` | 配网页。**内联在固件里、零外部请求**——配网时手机连的是板子自己的热点，根本没有外网，引 CDN 必然白屏 |
+| `GET /scan` | 扫描周边 AP，返回 `{nets:[{ssid,rssi,open}]}` |
+| `GET /testurl?url=` | 当场测试服务器地址通不通 |
+| `POST /save` | 解析表单 → 校验 → **先试连** → 成功才写 NVS |
+| `POST /clear` | 清 NVS 并重启 |
+
+开机自检会打印一行 `net: ssid=... url=... source=NVS|Kconfig`，一眼看清配置从哪来。
+
+**一个刻意偏离原设计的地方**：原方案建议"配网期间用纯 `WIFI_MODE_AP`，不做 APSTA"，
+但验收要求"密码错误时页面红字报错、**不关 AP**"。如果试连时切成纯 STA，手机连接会
+立刻断，用户永远看不到那个错误提示。所以页面/扫描阶段保持**纯 AP**（规避信道干扰），
+只在"试连"那一小段切 **APSTA**（手机保持连着才能收到结果）。
+
+### 板端界面（240x240 图形化仪表盘）
+
+早期版本的 `ui.c` 是四个居中的纯文本 label：把服务器返回的整句活动文案
+（如 `运动/步行 (峰值 1.2g, 约8步)`）直接塞进 240px 宽的 label，被 `LV_LABEL_LONG_DOT`
+截成 `…`，现场看不出重点。现在改成图形化仪表：
+
+```
++--------------------------------------------+
+| * 在线   100Hz   ^1234    SC7A20 o0        | 状态胶囊：链路/采样率/上报数/IMU与校准档
++----------------------+---------------------+
+|        /-----\\       |     /-------\\       |
+|        | 静置 |       |     |   *   |       | 左：活动环（量程=|a| 0..2g）
+|        \\-----/       |     \\-------/       | 右：姿态球（重力方向）
+|         水平         |      倾角 12°        |
++----------------------+---------------------+
+| X ===------   Y ==-----   Z =====-----     | 三轴对称条（±2g，0 在中点）
++--------------------------------------------+
+| [AI]                             (o)  1/2  |
+|  服务器回复（超长自动分页，每 4 秒翻一页）    |
++--------------------------------------------+
+```
+
+- **活动环**：活动不再是一句话，而是「活动词 + 语义色 + 环」。颜色跟着活动走：
+  静置绿 / 步行紫 / 运动蓝 / 晃动琥珀 / 跌落红。服务器原句里的细节
+  （水平 / 向左倾斜 / 峰值 / 约 N 步）**被解析出真实数值**后另起一行小字，不再被截断。
+- **姿态球**：直接用 `transport_status_t.x_g/y_g`（屏幕坐标系）放点，与网页仪表盘、
+  与上报给服务端的数据是**同一套方向语义**，不做二次翻转。
+- **三轴对称条**：±2g 对称条，0 在中点，正负一眼分得开。
+- **AI 回复自动分页**：按显示宽度切页（中文记 2 列，优先在空格/句读处断），每 4 秒翻一页，
+  右下角显示 `1/2`。长回复不再被 `…` 吃掉，而是**逐页读全**。
+- **状态即颜色**：跌落时活动环外多一圈呼吸红光；断链时状态点呼吸，在线时保持常亮
+  （不做无意义重绘，避免 240x240 SPI 屏撕裂）；远程指令状态在胶囊右侧显示 `···/OK/NG`。
+- **几何零硬编码**：尺寸与配色全部集中在 `ui.c` 顶部的 `UI_*` 宏里，
+  `tools/ui_preview.py` **解析同一份宏**渲染预览图 —— 改布局时预览自动跟着变，
+  不会出现"代码改了、预览图还是旧的"。
+
+没有硬件也能看界面（Pillow 渲染，与固件同源）：
+
+```powershell
+python tools\ui_preview.py            # 输出 docs/ui-preview/screen-*.png + contact-sheet.png
+python tools\ui_preview.py --scale 3  # 拼接图放大 3 倍
+```
+
+![板端界面预览（含改造前对比）](docs/ui-preview/contact-sheet.png)
+
 ### 数据落盘（第 1 周的"存储"）
 
 服务器默认把数据写到 `server/data/`，按天分文件、JSONL 追加：
@@ -286,6 +404,9 @@ python server\server.py
 | 倾斜方向左右/上下反了 | **长按 BOOT 键**循环切换校准值（屏幕上 `o0`–`o7`），存在 NVS 里，不用重编译 |
 | 板子日志每隔 10 秒出现一行 `link OK` | 正常心跳（每 20 次上报一次） |
 | 改 WiFi/服务器地址 | `idf.py menuconfig` → `RW1 AI Interaction`（值只存在本地 sdkconfig，不会被提交） |
+| **`git switch -c feature/xxx` 建出来的分支是 unborn**（`git branch` 里看不到、`git status` 把全部文件显示成 `A`） | `.git/refs/heads/feature/` 这个**目录不存在**：松散引用写不进去时 git 会**静默成功**（退出码 0 但不落盘），`git switch -c` 只改得动 HEAD → HEAD 指向一个不存在的 ref。用**写文件的方式**建出该目录（bash 里 `mkdir -p .git/refs/heads/feature` 会被沙箱回滚），之后 `git branch` / `git switch -c` 即正常。注意 `packed-refs` 乱序是**另一个**独立故障 |
+| 两个会话在同一工作区里干活，工作区文件大面积消失 / 引用丢失 | 一个工作区同时只能有一个 HEAD，两个 `git switch` 并发会把索引和工作区交替写坏。**并发必须各用独立工作区**：`git worktree add ../rw1-x <branch>` |
+| 编译报 `ninja: error: build.ninja:30: loading 'CMakeFiles/rules.ninja': The system cannot find the path specified` | `device/build/` 被中断的构建或分支切换弄成了半残状态。先 `idf.py reconfigure` 再 build；还不行就删掉 `device/build/` 全量重编 |
 
 ## 安全提示
 
