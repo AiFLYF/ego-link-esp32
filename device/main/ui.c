@@ -51,6 +51,7 @@
 #include "esp_log.h"
 #include "lvgl.h"
 
+#include "provisioning.h"
 #include "transport.h"
 #include "wifi_link.h"
 
@@ -241,6 +242,18 @@ static uint32_t s_last_ball_color;
 static int      s_page;                         /* 当前回复页（0 起） */
 static int      s_page_total = 1;
 static int      s_page_tick;
+
+/* ---- 配网覆盖层（PROPOSAL §1.8 验收 #1）----------------------------------
+ * 配网时板子还没连上任何网络，遥测数据没有意义，而屏幕是用户唯一的"说明书"：
+ * 必须把 AP 名、4 位密码、要打开的地址显示清楚。做成整屏覆盖层而不是另建 screen，
+ * 是为了不动既有的布局代码；显示时定时器提前返回，底下的控件不会被重绘。 */
+static lv_obj_t *s_prov_panel;
+static lv_obj_t *s_prov_ssid;
+static lv_obj_t *s_prov_pass;
+static lv_obj_t *s_prov_url;
+static lv_obj_t *s_prov_hint;
+static lv_obj_t *s_prov_result;
+static bool      s_prov_shown;
 
 /* ==========================================================================
  * 字体
@@ -633,6 +646,36 @@ static void move_bubble(int tx, int ty)
 static void ui_timer_cb(lv_timer_t *timer)
 {
     (void)timer;
+
+    /* 配网模式：整屏让给配网提示（验收 #1 要求屏幕显示 AP 名 + 4 位码 + 地址）。
+     * 提前返回，底下的仪表盘控件这一帧就不重绘了。 */
+    if (provisioning_is_active()) {
+        s_prov_shown = true;
+        char pbuf[80];
+        snprintf(pbuf, sizeof(pbuf), "WiFi  %s", provisioning_ap_ssid());
+        lv_label_set_text(s_prov_ssid, pbuf);
+        snprintf(pbuf, sizeof(pbuf), "密码  %s", provisioning_ap_pass());
+        lv_label_set_text(s_prov_pass, pbuf);
+        lv_label_set_text(s_prov_url, PROV_AP_IP);
+
+        const char *res = provisioning_last_result();
+        lv_label_set_text(s_prov_result, res[0] ? res : "");
+        lv_obj_set_style_text_color(s_prov_result,
+                                    lv_color_hex(res[0] ? UI_C_GREEN : UI_C_DIM), 0);
+        lv_obj_set_hidden(s_prov_panel, false);
+        return;
+    }
+    if (s_prov_shown) {
+        /* 刚从配网切回仪表盘：清掉"只在变化时才写"那几处缓存，
+         * 否则若内容恰好与配网前相同，屏幕上会残留配网提示。 */
+        s_prov_shown = false;
+        s_last_reply[0] = '\0';
+        s_last_activity[0] = '\0';
+        s_last_abs = UI_NONE;
+        s_last_badge = -1;
+        s_last_online = false;      /* 强制下一帧重画在线状态 */
+        lv_obj_set_hidden(s_prov_panel, true);
+    }
 
     transport_status_t st;
     transport_get_status(&st);
@@ -1062,6 +1105,40 @@ static void build_reply_card(lv_obj_t *scr)
     lv_label_set_text(s_lbl_reply, "按 BOOT 键向电脑服务器的 AI 提问");
 }
 
+/* 配网覆盖层：整屏盖住仪表盘，把"怎么连"讲清楚。
+ * 视觉语言复用本文件的 UI_C_* 配色与三档字号，不引入新的样式体系。 */
+static void build_prov_panel(lv_obj_t *scr)
+{
+    s_prov_panel = make_box(scr, 0, 0, UI_SCR_W, UI_SCR_H, UI_C_BG, 0, 0);
+    lv_obj_set_style_bg_grad_color(s_prov_panel, lv_color_hex(UI_C_BG_DEEP), 0);
+    lv_obj_set_style_bg_grad_dir(s_prov_panel, LV_GRAD_DIR_VER, 0);
+    lv_obj_set_hidden(s_prov_panel, true);
+
+    lv_obj_t *t = make_label(s_prov_panel, 0, 10, UI_SCR_W, 22,
+                             cjk_font(18), UI_C_AMBER, LV_TEXT_ALIGN_CENTER);
+    lv_label_set_text(t, "配网模式");
+
+    lv_obj_t *sub = make_label(s_prov_panel, 0, 34, UI_SCR_W, 14,
+                               cjk_font(12), UI_C_DIM, LV_TEXT_ALIGN_CENTER);
+    lv_label_set_text(sub, "用手机连接下面这个热点");
+
+    /* AP 名与密码是这一屏的主角，给最大字号 */
+    s_prov_ssid = make_label(s_prov_panel, 6, 58, UI_SCR_W - 12, 20,
+                             cjk_font(14), UI_C_GREEN, LV_TEXT_ALIGN_CENTER);
+    s_prov_pass = make_label(s_prov_panel, 6, 82, UI_SCR_W - 12, 26,
+                             cjk_font(18), UI_C_AMBER, LV_TEXT_ALIGN_CENTER);
+
+    s_prov_url = make_label(s_prov_panel, 6, 118, UI_SCR_W - 12, 26,
+                            cjk_font(18), UI_C_BLUE, LV_TEXT_ALIGN_CENTER);
+
+    s_prov_hint = make_label(s_prov_panel, 8, 150, UI_SCR_W - 16, 44,
+                             cjk_font(12), UI_C_DIM, LV_TEXT_ALIGN_CENTER);
+    lv_label_set_text(s_prov_hint, "浏览器打开上面的地址\n选 WiFi、填服务器地址后点「保存并连接」");
+
+    s_prov_result = make_label(s_prov_panel, 8, 198, UI_SCR_W - 16, 34,
+                               cjk_font(12), UI_C_GREEN, LV_TEXT_ALIGN_CENTER);
+}
+
 esp_err_t ui_init(void)
 {
     bsp_display_lock(0);
@@ -1077,6 +1154,7 @@ esp_err_t ui_init(void)
     build_tilt_panel(scr);
     build_axis_rows(scr);
     build_reply_card(scr);
+    build_prov_panel(scr);      /* 最后建：盖在所有面板之上 */
 
     lv_timer_create(ui_timer_cb, 500, NULL);
 
