@@ -392,6 +392,34 @@ static bool accel_input_try_probe_lis3dh_family(const uint8_t address)
     /* ODR=100Hz, all axes enabled; high resolution, +-2g */
     ESP_ERROR_CHECK_WITHOUT_ABORT(accel_input_write_reg(0x20, 0x57));
     ESP_ERROR_CHECK_WITHOUT_ABORT(accel_input_write_reg(0x23, 0x88));
+    vTaskDelay(pdMS_TO_TICKS(20));                                    /* wait for first frame */
+
+    /* Same defensive check as the QMA probe: if both config writes failed
+     * silently (ESP_ERROR_CHECK_WITHOUT_ABORT swallows the error) the chip
+     * would never start converting, and its data registers would read 0x00
+     * forever. |a| = 0 is exactly the free-fall signature downstream, so a
+     * dead chip would be reported as an endless fall. At rest a live chip
+     * always shows ~1 g on some axis, i.e. a non-zero data byte. */
+    uint8_t probe[6] = {0};
+    if (accel_input_read_reg(0x28 | 0x80, probe, sizeof(probe)) != ESP_OK) {
+        ESP_LOGW(TAG, "%s @0x%02X: data read failed after init, skipping",
+                 (who_am_i == 0x11) ? "SC7A20" : "LIS3DH", address);
+        accel_input_remove_device();
+        return false;
+    }
+    bool any_nonzero = false;
+    for (size_t i = 0; i < sizeof(probe); ++i) {
+        if (probe[i] != 0) {
+            any_nonzero = true;
+            break;
+        }
+    }
+    if (!any_nonzero) {
+        ESP_LOGW(TAG, "%s @0x%02X: data all zero after init, skipping",
+                 (who_am_i == 0x11) ? "SC7A20" : "LIS3DH", address);
+        accel_input_remove_device();
+        return false;
+    }
 
     s_source = ACCEL_SOURCE_LIS3DH;
     s_source_name = (who_am_i == 0x11) ? "SC7A20" : "LIS3DH";
@@ -494,6 +522,9 @@ esp_err_t accel_input_init(void)
 
     esp_err_t ret = accel_input_select_bsp_bus();
     if (ret == ESP_OK && accel_input_try_supported_sensors_on_current_bus()) {
+        ESP_LOGI(TAG, "init done: source=%s orient=%d%s (long-press BOOT to cycle)",
+                 s_source_name, s_orient,
+                 (s_orient == ACCEL_ORIENT_DEFAULT) ? " (default)" : " (calibrated)");
         return ESP_OK;
     }
 
@@ -504,6 +535,13 @@ esp_err_t accel_input_init(void)
     return accel_input_init_buttons();
 }
 
+/* A real sensor source must NEVER degrade to demo data on a read failure.
+ * The demo sample is (0, 0, 1) — physically indistinguishable from "lying
+ * flat and still". Injecting it after a transient I2C error would mask a
+ * genuine free-fall / fall event (the exact waveform the server looks for)
+ * and make the UI source name flicker to "Demo". Drop the sample instead;
+ * the caller counts it and the batch simply skips it. Demo data is only
+ * honest when no sensor was ever detected. */
 bool accel_input_poll(accel_input_sample_t *sample)
 {
     if (sample == NULL) {
@@ -514,34 +552,36 @@ bool accel_input_poll(accel_input_sample_t *sample)
 
     if (s_source == ACCEL_SOURCE_MPU6050) {
         uint8_t raw[6] = {0};
-        if (accel_input_read_reg(0x3B, raw, sizeof(raw)) == ESP_OK) {
-            const int16_t raw_x = (int16_t)((raw[0] << 8) | raw[1]);
-            const int16_t raw_y = (int16_t)((raw[2] << 8) | raw[3]);
-            const int16_t raw_z = (int16_t)((raw[4] << 8) | raw[5]);
-            sample->x_g = (float)raw_x / 16384.0f;
-            sample->y_g = (float)raw_y / 16384.0f;
-            sample->z_g = (float)raw_z / 16384.0f;
-            sample->valid = true;
-            sample->source_name = s_source_name;
-            return true;
+        if (accel_input_read_reg(0x3B, raw, sizeof(raw)) != ESP_OK) {
+            return false;
         }
+        const int16_t raw_x = (int16_t)((raw[0] << 8) | raw[1]);
+        const int16_t raw_y = (int16_t)((raw[2] << 8) | raw[3]);
+        const int16_t raw_z = (int16_t)((raw[4] << 8) | raw[5]);
+        sample->x_g = (float)raw_x / 16384.0f;
+        sample->y_g = (float)raw_y / 16384.0f;
+        sample->z_g = (float)raw_z / 16384.0f;
+        sample->valid = true;
+        sample->source_name = s_source_name;
+        return true;
     } else if (s_source == ACCEL_SOURCE_LIS3DH) {
         uint8_t raw[6] = {0};
-        if (accel_input_read_reg(0x28 | 0x80, raw, sizeof(raw)) == ESP_OK) {
-            const int16_t raw_x = (int16_t)(((uint16_t)raw[1] << 8) | raw[0]) >> 4;
-            const int16_t raw_y = (int16_t)(((uint16_t)raw[3] << 8) | raw[2]) >> 4;
-            const int16_t raw_z = (int16_t)(((uint16_t)raw[5] << 8) | raw[4]) >> 4;
-            sample->x_g = (float)raw_x / 1024.0f;
-            sample->y_g = (float)raw_y / 1024.0f;
-            sample->z_g = (float)raw_z / 1024.0f;
-            sample->valid = true;
-            sample->source_name = s_source_name;
-            return true;
+        if (accel_input_read_reg(0x28 | 0x80, raw, sizeof(raw)) != ESP_OK) {
+            return false;
         }
+        const int16_t raw_x = (int16_t)(((uint16_t)raw[1] << 8) | raw[0]) >> 4;
+        const int16_t raw_y = (int16_t)(((uint16_t)raw[3] << 8) | raw[2]) >> 4;
+        const int16_t raw_z = (int16_t)(((uint16_t)raw[5] << 8) | raw[4]) >> 4;
+        sample->x_g = (float)raw_x / 1024.0f;
+        sample->y_g = (float)raw_y / 1024.0f;
+        sample->z_g = (float)raw_z / 1024.0f;
+        sample->valid = true;
+        sample->source_name = s_source_name;
+        return true;
     } else if (s_source == ACCEL_SOURCE_QMA7981) {
-        if (accel_input_fill_qma(sample)) {
-            return true;
-        }
+        /* fill_qma already returns false on a bus error or an all-zero
+         * block; no demo fallback here either. */
+        return accel_input_fill_qma(sample);
     } else if (s_source == ACCEL_SOURCE_BUTTONS) {
         return accel_input_fill_buttons(sample);
     }

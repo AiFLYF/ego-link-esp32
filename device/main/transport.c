@@ -91,6 +91,7 @@ static char s_ask_text[64] = "我现在的运动状态怎么样？";
 static uint32_t s_post_count;
 static int s_btn_pending;      /* 自上次成功上报以来 BOOT 被按了几次（第 3 周） */
 static uint32_t s_bad_samples; /* 累计丢弃的不可用样本数（P1-4，只统计不上报） */
+static uint32_t s_poll_fail;   /* 连续 accel_input_poll 失败次数（真实源读失败） */
 static char s_last_reply[TRANSPORT_REPLY_LEN];   /* 上一次看到过的服务器回复 */
 
 /* [(x,y,z)] in screen frame, filled by the sampling loop. */
@@ -654,6 +655,29 @@ static bool post_batch(int n, bool ask)
     return false;
 }
 
+/* ---------------- 1 Hz IMU diagnostic line (validation aid) -----------------
+ *
+ * Prints one line per second with the raw sensor sample, the screen-frame
+ * values and |a|. Hold the board in a known pose (flat / on each edge) and
+ * compare with the expected numbers to validate the sensor->screen mapping
+ * and the per-axis scale live — no debugger, no extra tooling, just the log.
+ * See Kconfig.projbuild (RW1_IMU_DEBUG_LOG) for the expected values. */
+#if CONFIG_RW1_IMU_DEBUG_LOG
+static void imu_debug_log(const accel_input_sample_t *s, float sx, float sy)
+{
+    static uint32_t n = 0;
+    const uint32_t period = 1000u / (uint32_t)CONFIG_RW1_SAMPLE_PERIOD_MS;
+    if (period == 0 || ++n < period) {
+        return;
+    }
+    n = 0;
+    const float mag = sqrtf(s->x_g * s->x_g + s->y_g * s->y_g + s->z_g * s->z_g);
+    ESP_LOGI(TAG, "imu: src=%s o=%d raw[%+.3f %+.3f %+.3f] scr[%+.3f %+.3f] |a|=%.3f",
+             s->source_name ? s->source_name : "?", accel_input_get_orientation(),
+             s->x_g, s->y_g, s->z_g, sx, sy, mag);
+}
+#endif
+
 static void transport_task(void *arg)
 {
     ESP_LOGI(TAG, "waiting for WiFi...");
@@ -676,11 +700,15 @@ static void transport_task(void *arg)
     while (true) {
         accel_input_sample_t sample = {0};
         if (accel_input_poll(&sample)) {
+            s_poll_fail = 0;
             last_source = sample.source_name ? sample.source_name : "?";
             /* Upload screen-frame axes so the server's tilt labels match what
              * the LCD shows (see accel_input_map_to_screen). */
             float sx, sy;
             accel_input_map_to_screen(sample.x_g, sample.y_g, &sx, &sy);
+#if CONFIG_RW1_IMU_DEBUG_LOG
+            imu_debug_log(&sample, sx, sy);
+#endif
             float xyz[3];
             if (sanitize3(sx, sy, sample.z_g, xyz)) {
                 if (n < TX_BATCH_MAX) {
@@ -696,6 +724,16 @@ static void transport_task(void *arg)
                  * 只计数不打日志，避免坏传感器把日志刷爆。 */
                 s_bad_samples++;
             }
+        } else {
+            /* poll 只会在真实传感器源读失败时返回 false（demo/buttons 永远成功）。
+             * 丢弃该样本并计数；限频告警，避免总线濒死时刷爆日志。
+             * 注意这里**绝不能**用假数据顶上——那会把失重特征掩盖掉。 */
+            if (s_poll_fail == 0 || (s_poll_fail % 1000u) == 0u) {
+                ESP_LOGW(TAG, "accel read failed (streak %u, ~%u ms) — samples dropped",
+                         (unsigned)(s_poll_fail + 1),
+                         (unsigned)((s_poll_fail + 1) * CONFIG_RW1_SAMPLE_PERIOD_MS));
+            }
+            s_poll_fail++;
         }
         check_capture_timeout();
 
