@@ -296,17 +296,16 @@ class Renderer:
              link, self.cjk[12], lc, "left")
         text(d, e["UI_HZ_X"], sy + (e["UI_STATUS_H"] - 14) // 2, e["UI_HZ_W"], 14,
              "%dHz" % st["hz"], self.num[14], C["DIM"], "center")
-        text(d, e["UI_POSTS_X"], sy + (e["UI_STATUS_H"] - 14) // 2, e["UI_POSTS_W"], 14,
-             "↑%d" % st["posts"], self.num[14], C["DIM"], "center")
 
+        # 指令徽章出现时顶替上报数（与板端互斥逻辑一致）
         if st["cmd"] == 0:
-            text(d, e["UI_INFO_X"], sy + (e["UI_STATUS_H"] - 12) // 2, e["UI_INFO_W"], 12,
-                 "%s o%d" % (st["source"], st["orient"]), self.cjk[12], C["FAINT"], "right")
+            text(d, e["UI_POSTS_X"], sy + (e["UI_STATUS_H"] - 14) // 2, e["UI_POSTS_W"], 14,
+                 "↑%d" % st["posts"], self.cjk[12], C["DIM"], "right")
         else:
             bx = e["UI_BADGE_X"]
             by = sy + (e["UI_STATUS_H"] - e["UI_BADGE_H"]) // 2
             bc = [C["AMBER"], C["AMBER"], C["GREEN"], C["RED"]][st["cmd"]]
-            bt = ["", "···", "OK", "NG"][st["cmd"]]
+            bt = ["", "...", "OK", "NG"][st["cmd"]]
             box(d, bx, by, e["UI_BADGE_W"], e["UI_BADGE_H"], fill=bc,
                 radius=e["UI_BADGE_H"] // 2)
             text(d, bx, by, e["UI_BADGE_W"], e["UI_BADGE_H"], bt, self.num[14],
@@ -314,8 +313,10 @@ class Renderer:
 
         # ---------------- 左面板：活动环 ----------------
         px, py = e["UI_PANEL_LX"], e["UI_PANEL_Y"]
+        # 边框随活动色微染（板端 border_opa=80/255 ≈ 31% 活动色与 LINE 混合）
+        edge = tuple(int(C["LINE"][i] + (act_c[i] - C["LINE"][i]) * 80 / 255) for i in range(3))
         box(d, px, py, e["UI_PANEL_W"], e["UI_PANEL_H"], fill=C["CARD"],
-            outline=C["LINE"], radius=16)
+            outline=edge, radius=16)
 
         if kind == 5:      # 跌落：环外呼吸红光（预览图取呼吸中段的不透明度）
             gd = e["UI_RING_D"] + 14
@@ -342,6 +343,11 @@ class Renderer:
         text(d, px + (e["UI_PANEL_W"] - e["UI_ABS_W"]) // 2, py + e["UI_ABS_Y"],
              e["UI_ABS_W"], e["UI_ABS_H"], "%.2fg" % st["mag"], self.num[14],
              C["DIM"], "center")
+        # 细节行左侧语义色圆点
+        cdr = e["UI_CAP_DOT_D"]
+        circle(d, px + e["UI_CAP_DOT_X"] + cdr // 2,
+               py + e["UI_PANEL_CAP_Y"] + e["UI_PANEL_CAP_H"] // 2,
+               cdr // 2, fill=act_c)
         text(d, px + (e["UI_PANEL_W"] - e["UI_PANEL_CAP_W"]) // 2, py + e["UI_PANEL_CAP_Y"],
              e["UI_PANEL_CAP_W"], e["UI_PANEL_CAP_H"], st["detail"], self.cjk[12],
              C["DIM"], "center")
@@ -359,6 +365,12 @@ class Renderer:
         half = e["UI_CROSS_LEN"] // 2
         d.line([(bcx, bcy - half), (bcx, bcy + half)], fill=C["LINE"])
         d.line([(bcx - half, bcy), (bcx + half, bcy)], fill=C["LINE"])
+        # 45° 斜辅助线（半透明，比主十字弱）
+        diag = int(e["UI_CROSS_DIAG"] / 2 * 0.7071 + 0.5)
+        d.line([(bcx - diag, bcy - diag), (bcx + diag, bcy + diag)],
+               fill=C["MARK"], width=1)
+        d.line([(bcx - diag, bcy + diag), (bcx + diag, bcy - diag)],
+               fill=C["MARK"], width=1)
         circle(d, bcx, bcy, e["UI_LEVEL_D"] // 2, outline=C["TRACK"])
 
         ox = int(max(-1.0, min(1.0, st["x"])) * e["UI_BUBBLE_MAX"])
@@ -385,8 +397,12 @@ class Renderer:
         else:
             import math
             tilt = "倾角 %d°" % round(math.degrees(math.acos(min(1.0, abs(st["z"]) / st["mag"]))))
+        # 倾角文字跟随球的语义色（与板端 s_lbl_tilt 同步）
+        tilt_c = (C["FAINT"] if ball_c == C["FAINT"] else
+                  C["GREEN"] if ball_c == C["GREEN"] else
+                  C["AMBER"] if ball_c == C["AMBER"] else C["RED"])
         text(d, px + (e["UI_PANEL_W"] - e["UI_PANEL_CAP_W"]) // 2, py + e["UI_PANEL_CAP_Y"],
-             e["UI_PANEL_CAP_W"], e["UI_PANEL_CAP_H"], tilt, self.cjk[12], C["DIM"], "center")
+             e["UI_PANEL_CAP_W"], e["UI_PANEL_CAP_H"], tilt, self.cjk[12], tilt_c, "center")
 
         # ---------------- 三轴对称条 ----------------
         for i, (name, val) in enumerate(zip("XYZ", (st["x"], st["y"], st["z"]))):
@@ -404,8 +420,12 @@ class Renderer:
                                            else e["UI_AXIS_BAR_W"] / 2 - half_w)
                 box(d, x0, byy, half_w, e["UI_AXIS_BAR_H"], fill=ac,
                     radius=e["UI_AXIS_BAR_H"] // 2)
+            # 0 位中轴亮线（比轨道高 1px，最后画，压在最上层）
+            box(d, e["UI_AXIS_BAR_X"] + e["UI_AXIS_BAR_W"] // 2,
+                ry + (e["UI_AXIS_ROW_H"] - (e["UI_AXIS_BAR_H"] + 2)) // 2,
+                1, e["UI_AXIS_BAR_H"] + 2, fill=C["MARK"], radius=0)
             text(d, e["UI_AXIS_VAL_X"], ry, e["UI_AXIS_VAL_W"], e["UI_AXIS_ROW_H"],
-                 "%+.2f" % val, self.num[14], C["DIM"], "right")
+                 "%+.2f" % val, self.num[14], ac, "right")
 
         # ---------------- AI 回复卡片 ----------------
         cy0 = e["UI_CARD_Y"]
@@ -418,6 +438,10 @@ class Renderer:
                     (e["UI_CARD_X"] + e["UI_CARD_W"] - 2, cy0 + 1 + i)],
                    fill=tuple(min(255, C["CARD"][k] + a) for k in range(3)))
 
+        # 左侧 AI 蓝竖条（在渐变叠色之后画，避免被盖）
+        box(d, e["UI_CARD_X"], cy0 + 12, e["UI_STRIPE_W"], e["UI_CARD_H"] - 24,
+            fill=C["BLUE"], radius=2)
+
         tag_bg = tuple(int(C["CARD"][k] + (C["BLUE"][k] - C["CARD"][k]) * 48 / 255)
                        for k in range(3))
         box(d, e["UI_TAG_X"], cy0 + e["UI_TAG_Y"], e["UI_TAG_W"], e["UI_TAG_H"],
@@ -425,24 +449,34 @@ class Renderer:
         text(d, e["UI_TAG_X"], cy0 + e["UI_TAG_Y"], e["UI_TAG_W"], e["UI_TAG_H"],
              "AI", self.num[14], C["BLUE"], "center")
 
+        body = st["reply"] if st["reply"] else "按 BOOT 键向电脑服务器的 AI 提问"
+        _, total = reply_page(body, 0, e["UI_REPLY_COLS"])
+
         if st["pending"]:
             sr = e["UI_SPIN_D"] // 2 - 1
             scx = e["UI_SPIN_X"] + e["UI_SPIN_D"] // 2
             scy = cy0 + e["UI_SPIN_Y"] + e["UI_SPIN_D"] // 2
             arc(d, scx, scy, sr, 0, 360, C["TRACK"], 2)
             arc(d, scx, scy, sr, -60, 60, C["AMBER"], 2)
-        else:
-            page_txt, total = reply_page(st["reply"], 0, e["UI_REPLY_COLS"])
-            if total > 1:
-                text(d, e["UI_PAGE_X"], cy0 + e["UI_TAG_Y"], e["UI_PAGE_W"], e["UI_TAG_H"],
-                     "1/%d" % total, self.num[14], C["FAINT"], "right")
+        elif 1 < total <= e["UI_PDOTS_N"]:
+            # 分页圆点：当前页（预览固定第 1 页）琥珀，其余 MARK
+            n = e["UI_PDOTS_N"]
+            dw = n * e["UI_PDOT_D"] + (n - 1) * e["UI_PDOT_GAP"]
+            for i in range(total):
+                dx = e["UI_PDOTS_RIGHT"] - dw + i * (e["UI_PDOT_D"] + e["UI_PDOT_GAP"])
+                circle(d, dx + e["UI_PDOT_D"] // 2,
+                       cy0 + e["UI_PDOTS_Y"], e["UI_PDOT_D"] // 2,
+                       fill=C["AMBER"] if i == 0 else C["MARK"])
+        elif total > 1:
+            text(d, e["UI_PAGE_X"], cy0 + e["UI_TAG_Y"], e["UI_PAGE_W"], e["UI_TAG_H"],
+                 "1/%d" % total, self.num[14], C["FAINT"], "right")
 
-        body = st["reply"] if st["reply"] else "按 BOOT 键向电脑服务器的 AI 提问"
         page_txt, _ = reply_page(body, 0, e["UI_REPLY_COLS"])
         shown = fit_text(d, page_txt, self.cjk[14], e["UI_REPLY_W"], max_lines=2)
+        body_c = C["DIM"] if st["pending"] else (C["AMBER"] if st["reply"] else C["FAINT"])
         text(d, e["UI_CARD_X"] + e["UI_REPLY_X"], cy0 + e["UI_REPLY_Y"],
              e["UI_REPLY_W"], e["UI_REPLY_H"], shown, self.cjk[14],
-             C["DIM"] if st["pending"] else C["AMBER"], "left", line_gap=5)
+             body_c, "left", line_gap=5)
 
         return img
 

@@ -803,10 +803,12 @@ DASHBOARD_HTML = """<!doctype html>
   color-scheme:dark;
   --bg:#0a0e14; --bg-deep:#05070a;
   --card:#141a23; --card-hi:#1b2230;
-  --line:#252d3a; --track:#1e2530;
+  --line:#252d3a; --track:#232c39; --mark:#3d4757;
   --text:#e6edf3; --dim:#8b949e; --faint:#5a6472;
   --green:#3fb950; --teal:#2dd4bf; --blue:#58a6ff;
   --amber:#e3b341; --red:#f85149; --purple:#a371f7;
+  /* 当前活动语义色（JS 按 classify 结果注入 RGB 分量），驱动 hero 卡片与环的联动 */
+  --act-rgb:63,185,80;
   --r:16px;
 }
 *{box-sizing:border-box;margin:0}
@@ -854,6 +856,13 @@ h1{font-size:19px;line-height:1.35}
   background:linear-gradient(180deg,var(--card-hi),var(--card));
   border:1px solid var(--line);border-radius:var(--r);
   padding:16px;min-width:0;
+  transition:border-color .25s ease,transform .25s ease,box-shadow .25s ease;
+}
+.card:hover{border-color:#37445a;transform:translateY(-1px)}
+/* hero 卡片随当前活动色微染：边框一圈淡色 + 外发光，和板端面板边框一个语言 */
+.card.hero{
+  border-color:rgba(var(--act-rgb),.38);
+  box-shadow:0 0 0 1px rgba(var(--act-rgb),.10),0 22px 60px -30px rgba(var(--act-rgb),.55);
 }
 .card.wide{max-width:1400px;margin:14px auto 0}
 .card-head{display:flex;align-items:baseline;justify-content:space-between;gap:10px;margin-bottom:12px}
@@ -865,14 +874,20 @@ h2{font-size:13px;color:var(--text)}
 .gauge svg{width:100%;height:100%;display:block;transform:rotate(135deg)}
 .gauge circle{fill:none;stroke-linecap:round;transform-origin:70px 70px}
 .gauge .track{stroke:var(--track);stroke-width:11;stroke-dasharray:263.9 351.9}
-.gauge .val{stroke:var(--green);stroke-width:11;stroke-dasharray:0 351.9;transition:stroke-dasharray .5s cubic-bezier(.22,1,.36,1),stroke .4s}
+.gauge .val{
+  stroke:var(--green);stroke-width:11;stroke-dasharray:0 351.9;
+  transition:stroke-dasharray .5s cubic-bezier(.22,1,.36,1),stroke .4s;
+  filter:drop-shadow(0 0 5px rgba(var(--act-rgb),.55));
+}
 .gauge-mid{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px}
 .act{font-size:30px;font-weight:700;letter-spacing:2px;line-height:1.1;transition:color .4s}
+.act.pop{animation:pop .42s cubic-bezier(.16,1,.3,1)}
+@keyframes pop{0%{opacity:.2;transform:translateY(4px)}100%{opacity:1;transform:none}}
 .abs{font-size:14px;color:var(--dim)}
 .stats{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;border-top:1px solid var(--line);padding-top:12px}
 .stats>div{display:flex;flex-direction:column;gap:2px;text-align:center}
 .stats span{font-size:11px;color:var(--faint)}
-.stats b{font-size:16px;font-weight:650}
+.stats b{font-size:16px;font-weight:650;font-variant-numeric:tabular-nums}
 .stats b.sm{font-size:12px;font-weight:500;color:var(--dim)}
 
 /* ---------- 曲线 ---------- */
@@ -890,6 +905,11 @@ h2{font-size:13px;color:var(--text)}
 .ball .cross::before,.ball .cross::after{content:"";position:absolute;background:var(--line)}
 .ball .cross::before{left:50%;top:14%;bottom:14%;width:1px}
 .ball .cross::after{top:50%;left:14%;right:14%;height:1px}
+/* 45° 斜辅助线：与板端同一套水平仪刻度，更弱 */
+.ball .cross2{position:absolute;left:50%;top:50%;width:52%;height:52%;transform:translate(-50%,-50%) rotate(45deg)}
+.ball .cross2::before,.ball .cross2::after{content:"";position:absolute;background:var(--mark);opacity:.7}
+.ball .cross2::before{left:50%;top:0;bottom:0;width:1px}
+.ball .cross2::after{top:50%;left:0;right:0;height:1px}
 .ball .dot{
   position:absolute;left:50%;top:50%;width:20px;height:20px;margin:-10px 0 0 -10px;border-radius:50%;
   background:var(--green);box-shadow:0 0 18px -2px var(--green);
@@ -898,17 +918,20 @@ h2{font-size:13px;color:var(--text)}
 .bars{display:flex;flex-direction:column;gap:9px}
 .bar{display:grid;grid-template-columns:14px 1fr 52px;gap:9px;align-items:center;font-size:12px}
 .bar em{font-style:normal;font-weight:700}
-.bar .t{position:relative;height:7px;border-radius:4px;background:var(--track);overflow:hidden}
+.bar .t{position:relative;height:7px;border-radius:4px;background:var(--track);overflow:visible}
 .bar .t i{position:absolute;top:0;height:100%;border-radius:4px;left:50%;width:0;transition:left .3s,width .3s,background .3s}
-.bar .v{text-align:right;color:var(--dim);font-size:12px}
+/* 0 位中线：和板端轴条同色同位 */
+.bar .t::after{content:"";position:absolute;left:50%;top:-1px;bottom:-1px;width:1px;transform:translateX(-.5px);background:var(--mark)}
+.bar .v{text-align:right;font-size:12px;font-variant-numeric:tabular-nums}
 
 /* ---------- AI 回复 ---------- */
-.reply{margin-top:14px;padding:12px 14px;border-radius:12px;background:#0d1219;border:1px solid var(--line);position:relative}
+.reply{margin-top:14px;padding:12px 14px 12px 12px;border-radius:12px;background:#0d1219;border:1px solid var(--line);border-left:3px solid rgba(88,166,255,.6);position:relative}
 .reply .tag{
   display:inline-block;font-size:10px;font-weight:700;letter-spacing:.5px;
   color:var(--blue);background:#1f6feb33;border-radius:99px;padding:2px 9px;margin-bottom:7px;
 }
-.reply .txt{font-size:13px;color:var(--amber);white-space:pre-wrap;word-break:break-word}
+.reply .txt{font-size:13px;color:var(--dim);white-space:pre-wrap;word-break:break-word;transition:color .3s}
+.reply.has .txt{color:var(--amber)}
 .reply.pending .txt{color:var(--dim)}
 .reply.pending::after{
   content:"";position:absolute;right:14px;top:14px;width:13px;height:13px;border-radius:50%;
@@ -932,7 +955,8 @@ button:disabled{opacity:.45;cursor:not-allowed}
 
 /* ---------- 指令 / 事件列表 ---------- */
 .list{display:flex;flex-direction:column}
-.item{display:flex;gap:10px;align-items:baseline;padding:8px 2px;border-bottom:1px dashed #1b2230;font-size:12px;flex-wrap:wrap}
+.item{display:flex;gap:10px;align-items:baseline;padding:8px 6px;border-bottom:1px dashed #1b2230;font-size:12px;flex-wrap:wrap;border-radius:8px;transition:background .18s}
+.item:hover{background:rgba(255,255,255,.025)}
 .item:last-child{border-bottom:0}
 .st{padding:2px 9px;border-radius:99px;font-size:11px;white-space:nowrap;flex:none}
 .st-queued{background:#21262d;color:var(--dim)}
@@ -970,7 +994,7 @@ footer{max-width:1400px;margin:18px auto 0;color:var(--faint);font-size:11px;lin
     <div class="logo"></div>
     <div>
       <h1>Ego Link · 实时仪表盘</h1>
-      <p class="sub">ESP32-S3-EYE 板载 IMU 100Hz 采样 → 每 500ms 批量上报 → 本机 Python 服务器分类/大模型分析 → 回传板端显示 + 本页实时推送 + JSONL 落盘</p>
+      <p class="sub">板载 IMU 100Hz 采样 → 本机服务器实时分类与 AI 分析 → 回传板端并推送到本页</p>
     </div>
   </div>
   <div class="pills">
@@ -1018,6 +1042,7 @@ footer{max-width:1400px;margin:18px auto 0;color:var(--faint);font-size:11px;lin
     <div class="card-head"><h2>姿态（屏幕坐标系）</h2><span class="src" id="tilt">倾角 —</span></div>
     <div class="ball">
       <div class="cross"></div>
+      <div class="cross2"></div>
       <div class="ring2"></div>
       <div class="dot" id="ball"></div>
     </div>
@@ -1060,14 +1085,17 @@ var $ = function(id){ return document.getElementById(id); };
 /* ---------------- 语义色（与 device/main/ui.c 同一套） ---------------- */
 var C = { green:"#3fb950", blue:"#58a6ff", amber:"#e3b341", red:"#f85149",
           purple:"#a371f7", teal:"#2dd4bf", dim:"#8b949e", faint:"#5a6472" };
+/* 同一颜色的 RGB 分量，用来染 hero 卡片边框/光晕（CSS 变量 --act-rgb） */
+var CRGB = { green:"63,185,80", blue:"88,166,255", amber:"227,179,65", red:"248,81,73",
+             purple:"163,113,247", teal:"45,212,191", dim:"139,148,158", faint:"90,100,114" };
 
 /* 服务器文案 → 活动词 + 颜色（与板端 classify() 同一套规则） */
 var ACT = [
-  { k:["跌落","失重"], word:"跌落", color:C.red },
-  { k:["晃动"],        word:"晃动", color:C.amber },
-  { k:["步行"],        word:"步行", color:C.purple },
-  { k:["运动"],        word:"运动", color:C.blue },
-  { k:["静置"],        word:"静置", color:C.green }
+  { k:["跌落","失重"], word:"跌落", color:C.red,   rgb:CRGB.red },
+  { k:["晃动"],        word:"晃动", color:C.amber, rgb:CRGB.amber },
+  { k:["步行"],        word:"步行", color:C.purple,rgb:CRGB.purple },
+  { k:["运动"],        word:"运动", color:C.blue,  rgb:CRGB.blue },
+  { k:["静置"],        word:"静置", color:C.green, rgb:CRGB.green }
 ];
 function classify(s){
   for (var i=0;i<ACT.length;i++){
@@ -1075,7 +1103,7 @@ function classify(s){
       if (s.indexOf(ACT[i].k[j]) >= 0) return ACT[i];
     }
   }
-  return { word: s ? s.slice(0,4) : "等待", color:C.faint };
+  return { word: s ? s.slice(0,4) : "等待", color:C.faint, rgb:CRGB.faint };
 }
 
 /* 指令 → 按钮文案与参数（按钮从 /api/commands 的 names 动态生成，
@@ -1088,7 +1116,8 @@ var CMD_UI = {
 
 /* ---------------- 环形仪表（270°，与板端同款） ---------------- */
 var RING_R = 56, RING_C = 2*Math.PI*RING_R, RING_ARC = RING_C*0.75, ABS_FULL = 2.0;
-var lastRing = -1, lastAct = "", lastBall = "", lastTilt = "";
+var lastRing = -1, lastAct = "", lastBall = "", lastBallColor = "", lastTilt = "";
+var lastActColor = "rgb(90,100,114)";      /* 曲线读数胶囊描边用，随活动色更新 */
 
 function setRing(mag){
   var pct = Math.max(0, Math.min(1, mag/ABS_FULL));
@@ -1172,9 +1201,22 @@ function drawChart(){
   ctx.beginPath(); ctx.arc(last[0], last[1], 8*dpr, 0, 6.2832);
   ctx.fillStyle = "rgba(88,166,255,.22)"; ctx.fill();
 
-  ctx.fillStyle = C.dim; ctx.textAlign = "left"; ctx.textBaseline = "top";
+  /* 末端读数胶囊：半透明深色底 + 当前活动色描边，贴在末端点上方，不出右界 */
+  var label = last[2].toFixed(2) + " g";
   ctx.font = (11*dpr)+"px Consolas,monospace";
-  ctx.fillText(last[2].toFixed(2)+" g", last[0]-30*dpr, padT+2*dpr);
+  var tw = ctx.measureText(label).width;
+  var lx = Math.max(padL + 4*dpr, Math.min(last[0] - tw/2, W - padR - tw - 12*dpr));
+  var ly = Math.max(padT, padT - 2*dpr);
+  ctx.beginPath();
+  if (ctx.roundRect) ctx.roundRect(lx - 6*dpr, ly, tw + 12*dpr, 16*dpr, 8*dpr);
+  else ctx.rect(lx - 6*dpr, ly, tw + 12*dpr, 16*dpr);
+  ctx.fillStyle = "rgba(13,18,25,.88)";
+  ctx.fill();
+  ctx.lineWidth = 1*dpr;
+  ctx.strokeStyle = lastActColor.replace(")", ",.45)").replace("rgb", "rgba");
+  ctx.stroke();
+  ctx.fillStyle = C.dim; ctx.textAlign = "left"; ctx.textBaseline = "middle";
+  ctx.fillText(label, lx, ly + 8*dpr);
 }
 addEventListener("resize", fitCanvas);
 
@@ -1185,35 +1227,45 @@ function setBall(x, y, mag){
   var by = Math.max(-1, Math.min(1, y)) * BUBBLE_MAX;
   var key = bx.toFixed(0)+","+by.toFixed(0);
   var horiz = Math.sqrt(x*x + y*y);
-  var color = (mag < 0.35) ? C.red : (horiz < 0.15 ? C.green : (horiz < 0.7 ? C.amber : C.red));
-  if (key !== lastBall){
+  /* 与板端同一套判据：mag<0.05 是还没有效读数（灰），<0.35 才是失重红 */
+  var color = (mag < 0.05) ? C.faint
+            : (mag < 0.35) ? C.red
+            : (horiz < 0.15) ? C.green
+            : (horiz < 0.7) ? C.amber : C.red;
+  if (key !== lastBall || color !== lastBallColor){
     lastBall = key;
+    lastBallColor = color;
     var d = $("ball");
     d.style.transform = "translate(" + bx.toFixed(1) + "px," + by.toFixed(1) + "px)";
     d.style.background = color;
     d.style.boxShadow = "0 0 18px -2px " + color;
   }
-  var t;
-  if (mag < 0.35){ t = "失重"; }
-  else {
-    var c = Math.min(1, Math.abs(0) );  /* 占位，真实值由 setTilt 计算 */
-    t = null;
-  }
-  if (t && t !== lastTilt){ lastTilt = t; $("tilt").textContent = t; }
 }
 function setTilt(z, mag){
-  if (mag < 0.35){ return; }
-  var c = Math.min(1, Math.abs(z)/mag);
-  var deg = Math.round(Math.acos(c)*180/Math.PI);
-  var t = "倾角 " + deg + "°";
-  if (t !== lastTilt){ lastTilt = t; $("tilt").textContent = t; }
+  var t, color;
+  if (mag < 0.05){ t = "无读数"; color = C.faint; }
+  else if (mag < 0.35){ t = "失重"; color = C.red; }
+  else {
+    var c = Math.min(1, Math.abs(z)/mag);
+    var deg = Math.round(Math.acos(c)*180/Math.PI);
+    t = "倾角 " + deg + "°";
+    color = deg === 0 ? C.green : (deg < 40 ? C.amber : C.red);
+  }
+  if (t !== lastTilt){
+    lastTilt = t;
+    var el = $("tilt");
+    el.textContent = t;
+    el.style.color = color;
+  }
 }
 function setBar(i, v){
   var el = $(["bx","by","bz"][i]), vl = $(["vx","vy","vz"][i]);
   var pct = Math.min(Math.abs(v), 2)/2*50;      /* 对称：从中点往两边长 */
   el.style.width = pct + "%";
   el.style.left = (v >= 0 ? 50 : 50-pct) + "%";
-  el.style.background = [C.red, C.green, C.blue][i];
+  var ac = [C.red, C.green, C.blue][i];
+  el.style.background = ac;
+  vl.style.color = ac;                           /* 数值与 X/Y/Z 标签同色，与板端一致 */
   vl.textContent = (v >= 0 ? "+" : "") + v.toFixed(2);
 }
 
@@ -1333,13 +1385,24 @@ function render(s){
     e.textContent = a.word;
     e.style.color = a.color;
     $("ring").style.stroke = a.color;
+    /* hero 卡片边框/光晕染成活动色（CSS 变量联动），活动词淡入一次 */
+    document.querySelector(".card.hero").style.setProperty("--act-rgb", a.rgb);
+    lastActColor = "rgb(" + a.rgb + ")";
+    e.classList.remove("pop");
+    void e.offsetWidth;
+    e.classList.add("pop");
   }
 
+  /* 有真回复才用琥珀色并加 has；空回复回到引导语（dim），与板端一致 */
   if (s.ai_reply && s.ai_reply !== aiReply){
     aiReply = s.ai_reply;
     $("reply").textContent = aiReply;
+  } else if (!s.ai_reply && aiReply !== ""){
+    aiReply = "";
+    $("reply").textContent = "按板子 BOOT 键即可向服务器 AI 提问。";
   }
-  $("replybox").className = "reply" + (s.ai_pending ? " pending" : "");
+  var rbox = $("replybox");
+  rbox.className = "reply" + (s.ai_pending ? " pending" : "") + (s.ai_reply ? " has" : "");
 
   if (s.latest){
     var x = s.latest[1], y = s.latest[2], z = s.latest[3];

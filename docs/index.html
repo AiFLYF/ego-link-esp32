@@ -472,7 +472,7 @@ footer .note{max-width:72ch;line-height:1.75;margin-top:18px;font-size:12.5px;co
 
     <div class="feats" style="margin-top:16px">
       <div class="feat card rv" style="--d:60ms"><span class="tag">语义色</span><h3>颜色就是结论</h3><p>静置绿 / 步行紫 / 运动蓝 / 晃动琥珀 / 跌落红 —— 五类活动各一个色；姿态球的颜色还跟着倾斜量走（水平绿、倾斜琥珀、大角度红），判定跌落时活动环外多一圈呼吸红光，隔两米也看得见。</p><i class="spot"></i></div>
-      <div class="feat a card rv" style="--d:110ms"><span class="tag">不丢字</span><h3>AI 回复自动分页</h3><p>回复按显示宽度切页（中文记 2 列、优先在空格处断），每 4 秒翻一页，右下角显示 <code>1/N</code>；服务端生成中显示转圈并把正文压暗。长回复不再被 <code>…</code> 吃掉，而是逐页读全。</p><i class="spot"></i></div>
+      <div class="feat a card rv" style="--d:110ms"><span class="tag">不丢字</span><h3>AI 回复自动分页</h3><p>回复按显示宽度切页（中文记 2 列、优先在空格处断），每 4 秒翻一页，右上角用一排小圆点指示页码（当前页点亮成琥珀色，超长回复才退回 <code>1/N</code>）；服务端生成中显示转圈并把正文压暗。长回复不再被 <code>…</code> 吃掉，而是逐页读全。</p><i class="spot"></i></div>
       <div class="feat v card rv" style="--d:160ms"><span class="tag">可验证</span><h3>没有硬件也能看界面</h3><p><code>tools/ui_preview.py</code> <b>解析 <code>ui.c</code> 里的 <code>UI_*</code> 宏</b>渲染像素级预览图，并做布局自检（控件是否越界、环心文字是否落在环内、回复是否 ≤2 行不超宽）—— 改布局时预览自动跟着变，不会出现「代码改了、预览图还是旧的」。</p><i class="spot"></i></div>
     </div>
   </div>
