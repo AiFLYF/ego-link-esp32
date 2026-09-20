@@ -82,6 +82,19 @@ def _expect_400(url, payload):
         return False
 
 
+def _wait_cmd(port, cid, timeout):
+    """等一条指令走到终态，返回它的记录（超时则返回最后看到的样子）。"""
+    deadline = time.time() + timeout
+    rec = None
+    while time.time() < deadline:
+        cmds = get_json("http://127.0.0.1:%d/api/commands" % port).get("commands", [])
+        rec = next((c for c in cmds if c["id"] == cid), None)
+        if rec and rec["state"] in ("done", "failed", "timeout"):
+            return rec
+        time.sleep(0.3)
+    return rec
+
+
 def firmware_body(samples, source="SC7A20", ask=False, question=None):
     """逐字节复刻 device/main/transport.c build_body() 的输出。
 
@@ -329,6 +342,13 @@ def main():
         check("50 样本固件帧分类正确", out4.get("activity") == "静置·水平",
               "实际: %s" % out4.get("activity"))
 
+        # 先把 8 秒窗口灌满「向右倾斜」，再发 ask 帧。
+        # 注意：不灌的话窗口里还留着上一节的 (0,0,1) 样本，均值被稀释，
+        # 方向会被判成「水平」。修 P1-6（晚到帧不再污染时间轴）之前，
+        # 被夸大的 dt 会把旧样本挤出窗口，这条断言是**靠那个 bug 才通过**的。
+        for _ in range(4):
+            post_raw("http://127.0.0.1:%d/api/telemetry" % port,
+                     firmware_body([(0.7, 0.0, 0.71)] * 50))
         raw_ask = firmware_body([(0.7, 0.0, 0.71)] * 50, ask=True,
                                 question="我现在的运动状态怎么样？")
         out5 = post_raw("http://127.0.0.1:%d/api/telemetry" % port, raw_ask)
@@ -365,21 +385,17 @@ def main():
         check("下发响应带设备在线状态", r.get("device_online") is True,
               "实际: %s" % r.get("device_online"))
 
-        states, rec = [], None
-        deadline = time.time() + 14
-        while time.time() < deadline:
-            cmds = get_json("http://127.0.0.1:%d/api/commands" % port).get("commands", [])
-            rec = next((c for c in cmds if c["id"] == cid), None)
-            if rec and (not states or states[-1] != rec["state"]):
-                states.append(rec["state"])
-            if rec and rec["state"] in ("done", "failed", "timeout"):
-                break
-            time.sleep(0.3)
+        rec = _wait_cmd(port, cid, 14)
         board.wait(timeout=25)
 
+        # 用服务端记录的状态迁移历史断言，**不再靠轮询捕捉中间态**：
+        # sent 只在下发帧和回传帧之间存活约一个遥测周期（0.5 s），
+        # 用 0.3 s 轮询去抓它本质是竞态断言，会因为采样时机随机失败（P0-1）。
+        states = [s for s, _ in (rec or {}).get("history", [])]
         check("指令最终走到 done", rec is not None and rec["state"] == "done",
-              "实际: %s（经历 %s）" % (rec and rec["state"], "→".join(states)))
-        check("中间经过了 sent 状态", "sent" in states, "实际: %s" % states)
+              "实际: %s（历史 %s）" % (rec and rec["state"], "→".join(states)))
+        check("历史里完整记录了 queued→sent→done",
+              states[:3] == ["queued", "sent", "done"], "实际: %s" % states)
         if rec and rec.get("result"):
             res = rec["result"]
             check("回传里带着同一个 request_id", res.get("id") == cid)
@@ -417,8 +433,86 @@ def main():
         check("超时事件进了事件流",
               any("超时" in (e.get("text") or "") for e in latest(port).get("events", [])))
 
-        # ---- 14. 命令历史有上限 --------------------------------------------
-        print("\n[14] 命令历史不无限增长")
+        # ---- 15. 远端物理反馈指令（第 3 周）--------------------------------
+        print("\n[14] 物理反馈指令 led_blink / led_set")
+        board2 = subprocess.Popen(
+            [PY, os.path.join(HERE, "fake_board.py"),
+             "--url", "http://127.0.0.1:%d" % port,
+             "--scenario", "idle", "--seconds", "18", "--quiet"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        time.sleep(2.0)
+
+        r3 = post_json("http://127.0.0.1:%d/api/command" % port,
+                       {"name": "led_blink", "params": {"n": 3, "on_ms": 80, "off_ms": 80}})
+        rec3 = _wait_cmd(port, r3.get("id"), 14)
+        check("led_blink 走到 done", rec3 is not None and rec3["state"] == "done",
+              "实际: %s" % (rec3 and rec3["state"]))
+        check("led_blink 参数被保留", (rec3 or {}).get("params", {}).get("n") == 3,
+              "实际: %s" % (rec3 or {}).get("params"))
+        check("led_blink 不回传测量值（只有 ok/ms）",
+              "x" not in ((rec3 or {}).get("result") or {}),
+              "实际: %s" % ((rec3 or {}).get("result")))
+
+        r4 = post_json("http://127.0.0.1:%d/api/command" % port,
+                       {"name": "led_set", "params": {"on": True}})
+        rec4 = _wait_cmd(port, r4.get("id"), 14)
+        check("led_set 走到 done", rec4 is not None and rec4["state"] == "done",
+              "实际: %s" % (rec4 and rec4["state"]))
+        check("led_set 的 on 参数被保留", (rec4 or {}).get("params", {}).get("on") is True,
+              "实际: %s" % (rec4 or {}).get("params"))
+
+        # 越界参数必须被夹住（外部输入不信任）
+        r5 = post_json("http://127.0.0.1:%d/api/command" % port,
+                       {"name": "led_blink",
+                        "params": {"n": 999, "on_ms": 1, "off_ms": 999999}})
+        rec5 = _wait_cmd(port, r5.get("id"), 14)
+        p5 = (rec5 or {}).get("params", {})
+        check("越界参数被夹到安全范围",
+              p5.get("n") == 12 and p5.get("on_ms") == 20 and p5.get("off_ms") == 5000,
+              "实际: %s" % p5)
+
+        # pattern 参数：认的值保留，不认的静默丢掉（不报错、不下发脏数据）
+        r6 = post_json("http://127.0.0.1:%d/api/command" % port,
+                       {"name": "led_blink", "params": {"pattern": "alert"}})
+        rec6 = _wait_cmd(port, r6.get("id"), 14)
+        check("合法 pattern=alert 被保留",
+              (rec6 or {}).get("params", {}).get("pattern") == "alert",
+              "实际: %s" % (rec6 or {}).get("params"))
+        r7 = post_json("http://127.0.0.1:%d/api/command" % port,
+                       {"name": "led_blink", "params": {"pattern": "rm -rf /"}})
+        rec7 = _wait_cmd(port, r7.get("id"), 14)
+        check("非法 pattern 被静默丢掉",
+              "pattern" not in (rec7 or {}).get("params", {}),
+              "实际: %s" % (rec7 or {}).get("params"))
+
+        board2.wait(timeout=30)
+
+        # ---- 16. 跌落 → 远端物理告警闭环（第 3 周）--------------------------
+        print("\n[15] 跌落自动触发 LED 物理告警")
+        t_mark = time.time()
+        # 连灌几帧失重数据（|a|≈0.02g）。dt 由"批大小/到达间隔"自校准，
+        # 所以要多帧快速连发，采样窗口里才会真的有连续失重样本。
+        for _ in range(6):
+            post_json("http://127.0.0.1:%d/api/telemetry" % port,
+                      {"batch": [[0.02, -0.01, 0.01]] * 20,
+                       "x": 0.02, "y": -0.01, "z": 0.01, "source": "SC7A20"})
+            time.sleep(0.03)
+        time.sleep(0.5)
+
+        cmds = get_json("http://127.0.0.1:%d/api/commands" % port).get("commands", [])
+        auto = [c for c in cmds if c["name"] == "led_blink" and c["created"] >= t_mark]
+        check("判定跌落后自动排队了 led_blink", len(auto) > 0,
+              "实际: 新增 %d 条" % len(auto))
+        if auto:
+            check("自动告警带 alert 语义图案",
+                  auto[0].get("params", {}).get("pattern") == "alert",
+                  "实际: %s" % auto[0].get("params"))
+        check("自动告警进了事件流",
+              any("跌落" in (e.get("text") or "") and "LED 告警" in (e.get("text") or "")
+                  for e in latest(port).get("events", [])))
+
+        # ---- 17. 命令历史有上限（放最后，因为它会堆一队列指令）--------------
+        print("\n[16] 命令历史不无限增长")
         for _ in range(25):
             post_json("http://127.0.0.1:%d/api/command" % port, {"name": "capture_once"})
         n = len(get_json("http://127.0.0.1:%d/api/commands" % port).get("commands", []))
