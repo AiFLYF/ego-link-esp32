@@ -18,6 +18,7 @@
 #include "lvgl.h"
 
 #include "transport.h"
+#include "provisioning.h"
 #include "wifi_link.h"
 
 #if CONFIG_LV_USE_TINY_TTF
@@ -35,6 +36,7 @@ static lv_obj_t *s_lbl_data;
 static lv_obj_t *s_lbl_reply;
 static char s_last_reply[TRANSPORT_REPLY_LEN];
 static bool s_last_pending;
+static bool s_prov_shown;      /* 上一帧是否在显示配网屏幕（用于切回时重画） */
 
 /* LVGL's built-in CJK demo fonts cover only a handful of random glyphs, so we
  * embed a proper SimHei subset (tools/gen_font.py) and rasterise it with
@@ -75,6 +77,38 @@ static void ui_timer_cb(lv_timer_t *timer)
     transport_get_status(&st);
 
     char buf[128];
+
+    /* 配网模式：这时候板子还没连上任何网络，遥测数据没有意义，
+     * 而屏幕是用户唯一的"说明书"——必须把 AP 名、4 位密码、要打开的地址
+     * 显示清楚（PROPOSAL §1.8 验收 #1）。整屏让给配网提示。 */
+    if (provisioning_is_active()) {
+        s_prov_shown = true;
+
+        lv_label_set_text(s_lbl_status, "配网模式 · 请用手机连接下面的热点");
+        lv_obj_set_style_text_color(s_lbl_status, lv_color_hex(0xe3b341), 0);
+
+        snprintf(buf, sizeof(buf), "① WiFi: %s\n② 密码: %s",
+                 provisioning_ap_ssid(), provisioning_ap_pass());
+        lv_label_set_text(s_lbl_act, buf);
+        lv_obj_set_style_text_color(s_lbl_act, lv_color_hex(0x7ee787), 0);
+
+        lv_label_set_text(s_lbl_data, "③ 浏览器打开 " PROV_AP_IP);
+        lv_obj_set_style_text_color(s_lbl_data, lv_color_hex(0x79c0ff), 0);
+
+        const char *res = provisioning_last_result();
+        lv_label_set_text(s_lbl_reply, res[0] ? res : "④ 选 WiFi、填服务器地址，点「保存并连接」");
+        lv_obj_set_style_text_color(s_lbl_reply, lv_color_hex(0xe3b341), 0);
+        return;
+    }
+
+    if (s_prov_shown) {
+        /* 刚从配网屏幕切回来：清掉回复文本的缓存，强制重画那一行 ——
+         * 否则若回复内容与配网前恰好相同，下面那段"只在变化时才写"会跳过它，
+         * 屏幕上就残留着配网提示。 */
+        s_prov_shown = false;
+        s_last_reply[0] = '\0';
+    }
+
     snprintf(buf, sizeof(buf), "%s · 服务器:%s · %dHz",
              wifi_link_state_str(), st.server_ok ? "OK" : "无连接",
              (int)(1000 / CONFIG_RW1_SAMPLE_PERIOD_MS));
@@ -116,7 +150,9 @@ esp_err_t ui_init(void)
     lv_obj_set_style_bg_color(scr, lv_color_hex(0x0d1117), 0);
 
     lv_obj_t *title = lv_label_create(scr);
-    lv_label_set_text(title, "AI交互课 · 第1周");
+    /* 周次不写进 UI：每周都要改一遍，已经漂移过两次（REVIEW P2-1）。
+     * 周次只出现在 README 的进度行里。 */
+    lv_label_set_text(title, "AI交互课 · Ego Link");
     lv_obj_set_style_text_font(title, CJK_FONT(), 0);
     lv_obj_set_style_text_color(title, lv_color_hex(0x8b949e), 0);
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 4);
