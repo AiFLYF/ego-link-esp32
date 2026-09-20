@@ -27,6 +27,7 @@
 
 #include "accel_input.h"
 #include "led_feedback.h"
+#include "net_config.h"
 #include "wifi_link.h"
 
 static const char *TAG = "transport";
@@ -91,6 +92,7 @@ static char s_ask_text[64] = "我现在的运动状态怎么样？";
 static uint32_t s_post_count;
 static int s_btn_pending;      /* 自上次成功上报以来 BOOT 被按了几次（第 3 周） */
 static uint32_t s_bad_samples; /* 累计丢弃的不可用样本数（P1-4，只统计不上报） */
+static char s_url[NET_URL_MAX];/* 上报地址：来自 net_config（运行期可变，不再编译期写死） */
 static uint32_t s_poll_fail;   /* 连续 accel_input_poll 失败次数（真实源读失败） */
 static char s_last_reply[TRANSPORT_REPLY_LEN];   /* 上一次看到过的服务器回复 */
 
@@ -595,8 +597,8 @@ static esp_err_t http_event_handler(esp_http_client_event_t *evt)
 
 static bool post_batch(int n, bool ask)
 {
-    char url[160];
-    snprintf(url, sizeof(url), "%s%s", CONFIG_RW1_SERVER_URL, TX_PATH);
+    char url[NET_URL_MAX + 16];
+    snprintf(url, sizeof(url), "%s%s", s_url, TX_PATH);
 
     char source[16];
     status_lock();
@@ -687,8 +689,9 @@ static void transport_task(void *arg)
 
     const TickType_t sample_ticks = pdMS_TO_TICKS(CONFIG_RW1_SAMPLE_PERIOD_MS);
     const TickType_t post_ticks = pdMS_TO_TICKS(CONFIG_RW1_TELEMETRY_PERIOD_MS);
+    transport_reload_config();
     ESP_LOGI(TAG, "telemetry -> %s%s : %d samples @ %d ms, upload every %d ms",
-             CONFIG_RW1_SERVER_URL, TX_PATH,
+             s_url, TX_PATH,
              (int)(CONFIG_RW1_TELEMETRY_PERIOD_MS / CONFIG_RW1_SAMPLE_PERIOD_MS),
              CONFIG_RW1_SAMPLE_PERIOD_MS, CONFIG_RW1_TELEMETRY_PERIOD_MS);
 
@@ -828,6 +831,17 @@ void transport_start(void)
         s_lock = xSemaphoreCreateMutex();
     }
     xTaskCreatePinnedToCore(transport_task, "transport", 8192, NULL, 5, NULL, 0);
+}
+
+void transport_reload_config(void)
+{
+    /* 地址来自 net_config（NVS 优先 / 回退 Kconfig），配网改完立即生效。
+     * 缓存成静态而不是每次上报都读 NVS：post_batch 和采样循环在同一个任务里，
+     * 每次 2 Hz 去开关 NVS 句柄会白占锁、拖慢采样。 */
+    net_config_t cfg;
+    net_config_load(&cfg);
+    strlcpy(s_url, cfg.url, sizeof(s_url));
+    ESP_LOGI(TAG, "server url -> '%s' (source=%s)", s_url, net_config_source());
 }
 
 void transport_request_ask(const char *question)

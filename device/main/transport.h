@@ -66,6 +66,12 @@ typedef struct {
 /** Start the telemetry task (waits for WiFi internally). */
 void transport_start(void);
 
+/**
+ * 重新从 net_config 读取上报地址。
+ * 配网保存成功后调用，让新地址立即生效（不用重启）。
+ */
+void transport_reload_config(void);
+
 /** Ask the server's AI a question on the next telemetry frame. */
 void transport_request_ask(const char *question);
 
