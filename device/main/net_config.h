@@ -3,15 +3,18 @@
  *
  * 运行期可变配置的唯一入口（第 4 周配网功能）。
  *
- * 背景：`RW1_WIFI_SSID` / `RW1_SERVER_URL` 这些原本只能靠 menuconfig 改，
- * 改一次要全量重编译 + 烧录，PC 换个 DHCP 地址就得再来一遍；更要命的是
- * **编译出来的固件里 WiFi 密码是明文**，把固件发给同学等于把密码一起发出去。
+ * 背景：WiFi 账号 / 服务器地址原本只能靠 menuconfig 改，改一次要全量重编译 + 烧录，
+ * PC 换个 DHCP 地址就得再来一遍；更要命的是**编译出来的固件里 WiFi 密码是明文**，
+ * 把固件发给同学等于把密码一起发出去。
  *
- * 这个模块把"配置"从编译期挪到运行期，但**刻意做得很薄**：
- *   - NVS 里有值就用 NVS 的
- *   - NVS 里没有就回退 `CONFIG_RW1_*`（出厂默认值）
- * 于是老 `sdkconfig` 一字不改仍然能跑，Kconfig 那两项从"唯一来源"平滑降级为
- * "出厂默认值"，迁移是渐进的。
+ * 这个模块把"配置"从编译期挪到运行期，而且**只有一个来源：配网写进去的 NVS**。
+ * 2026-09-23 的决定：刻意**不再回退 Kconfig** ——
+ *   - 原来那条回退路径实际到不了（`net_config_present()` 只看 NVS，NVS 空就进配网），
+ *     所以"老 sdkconfig 一字不改仍然能跑"是一句兑现不了的承诺；
+ *   - 只要凭据不从 sdkconfig 来，**固件里就永远不可能包含 WiFi 密码**。
+ *
+ * 唯一保留的 Kconfig 值是上报周期（`RW1_TELEMETRY_PERIOD_MS`）：它不是凭据，
+ * 而且配网页"留空用默认"要用它。
  *
  * 注意：本模块只负责"存/取"，不碰 WiFi。真正连网在 wifi_link.c。
  */
@@ -54,7 +57,7 @@ void net_config_clear(void);
 /** NVS 里是否已有完整配置（决定开机是否要进 AP）。 */
 bool net_config_present(void);
 
-/** "NVS" / "Kconfig" / "default" —— 供开机自检打印。 */
+/** "NVS" / "default" —— 供开机自检打印（不再有 "Kconfig" 这一档）。 */
 const char *net_config_source(void);
 
 /**

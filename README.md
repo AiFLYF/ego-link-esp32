@@ -60,7 +60,7 @@
 | `server/data/` | **运行时生成**的 JSONL 日志（git-ignored，见下文"数据落盘"） |
 | `device/` | 开发板 ESP-IDF 工程（ESP-IDF v5.4.x，目标 esp32s3） |
 | `device/main/` | `main.c` 启动、`accel_input.c` IMU驱动（SC7A20/LIS3DH/MPU6050/QMA7981 自动识别）、`wifi_link.c` WiFi STA、`net_config.c` 运行期配置、`provisioning.c` SoftAP 配网、`transport.c` 采样+HTTP遥测、`led_feedback.c` LED图案播放器、`ui.c` LVGL 图形化仪表盘（见下文"板端界面"） |
-| `device/main/net_config.c` | **运行期配置的唯一入口**：NVS 优先，为空时逐项回退 Kconfig（向后兼容） |
+| `device/main/net_config.c` | **运行期配置的唯一入口**：凭据只从配网写进的 NVS 来（不再回退 Kconfig，见下） |
 | `device/main/provisioning.c` | SoftAP + `esp_http_server` 配网页；`provisioning_page.h` 是内联的单页 HTML |
 | `device/main/prov_form.c` | 配网表单的解析与校验。**刻意零 IDF 依赖**，可用 host 侧编译器直接测 |
 | `device/main/Kconfig.projbuild` | WiFi 账号、服务器 URL、采样周期、上报周期——现在只是**出厂默认值**，优先用配网页改 |
@@ -102,8 +102,11 @@ python server\server.py
   要换网络/换电脑 IP：**双击 BOOT** 重新进配网，或长按……都不用，双击就行。
 - 服务器地址填电脑 `ipconfig` → WLAN 的 IPv4（**不能** 127.0.0.1）；
   配网页上可以点「测试连接」当场验证通不通。
-- `menuconfig` 里的 `RW1_WIFI_*` / `RW1_SERVER_URL` 现在只是**出厂默认值**——
-  NVS 为空时才生效。老 `sdkconfig` 一字不改仍然能跑（向后兼容）。
+- **WiFi 账号和服务器地址现在只从配网页来**（存在 NVS 里）。
+  `menuconfig` 里**已经没有了** `RW1_WIFI_SSID` / `RW1_WIFI_PASSWORD` / `RW1_SERVER_URL` ——
+  2026-09-23 的决定，见下面「运行期配置」一节：那条"回退 Kconfig"的路实际到不了
+  （NVS 空就进配网），而且凭据一旦能从 sdkconfig 来，**固件里就会带上 WiFi 密码**。
+  唯一保留的 Kconfig 值是上报周期（配网页留空时用它当默认）。
 - Windows 防火墙弹窗请**允许**；否则以管理员执行：
   `netsh advfirewall firewall add rule name="rw1-server" dir=in action=allow protocol=TCP localport=8000`
 - **离线/国内网络**：首次编译在线拉取组件可先走代理：`set https_proxy=http://127.0.0.1:10808`（按自己代理端口）；完全离线则把已解析的 `managed_components/` 拷入 `device/`（`dependencies.lock` 已提供，保证版本一致）。
@@ -258,8 +261,15 @@ WiFi 密码是明文**——把固件发给同学/老师，等于把自己的 Wi
 存进去，导致下次开机直接失联。这正是"配完了没数据、不知道是 WiFi 还是服务器地址错"
 那个排查地狱的解药——所以服务器地址旁边还有个「测试连接」按钮当场验。
 
-**向后兼容**：`net_config_load()` 在 NVS 为空时**逐项**回退 `CONFIG_RW1_*`，
-所以老 `sdkconfig` 一字不改仍然能跑，Kconfig 那两项从"唯一来源"平滑降级为"出厂默认值"。
+**配置只有一个来源：配网**（2026-09-23 决定）。
+原来这里写着"`net_config_load()` 在 NVS 为空时逐项回退 `CONFIG_RW1_*`，
+所以老 `sdkconfig` 一字不改仍然能跑"——**那句话在实机上不成立**：
+`net_config_present()` 只看 NVS，NVS 空就进配网，**根本走不到那条回退路径**
+（PROPOSAL §1.8 验收 #9 因此也没实现）。
+
+现在的取舍是"配网是唯一入口"，好处很硬：**固件里永远不可能包含 WiFi 密码**。
+代价是每块新板子都要用手机配一次网（双击 BOOT 进热点 → 填表），
+换来的是"改网络/改服务器地址永远不用重编译"。
 
 **三条重新配网的入口**（缺一条就可能"配错了只能重烧"）：
 
@@ -439,7 +449,7 @@ python server\server.py
 
 | 现象 | 处理 |
 |---|---|
-| 屏幕显示"服务器:无连接" | 服务器没启动 / 防火墙拦截 / `RW1_SERVER_URL` IP 不对 |
+| 屏幕显示"服务器:无连接" | 服务器没启动 / 防火墙拦截 / **配网页里填的服务器地址 IP 不对**（`menuconfig` 里已经没有这一项了，改地址要双击 BOOT 进配网改） |
 | 连不上 WiFi（反复 retry） | 路由器侧问题（密码改了/AP重启/信道）；板子会自动无限重试，恢复后自动重连 |
 | 编译报 `rw1_font.c missing` | 先跑 `python tools/gen_font.py`（见首次上手①） |
 | 屏幕中文显示成方块 | 跑 `gen_font.py`，它会报告"板端文案缺字"；换了显示文案后要重跑再编译 |
@@ -451,7 +461,7 @@ python server\server.py
 | 倾斜方向左右/上下反了 | **长按 BOOT 键**循环切换校准值（屏幕上 `o0`–`o7`），存在 NVS 里，不用重编译 |
 | 板子日志每隔 10 秒出现一行 `link OK` | 正常心跳（每 20 次上报一次） |
 | 启动日志有 `Detected size(16384k) larger than the size in the binary image header(4096k)` | **不影响运行**，但值得知道：手上的 ESP32-S3-EYE 实际是 **16MB flash**，而 `sdkconfig.bsp.esp32_s3_eye` 里写的是 4MB（2026-09-22 真机读出来的）。当前分区表只有 3MB 的 `factory`，所以没事；**做 OTA 时这条很关键**——16MB 足够放两个 3MB 的 app 分区，不用先换模块 |
-| 改 WiFi/服务器地址 | `idf.py menuconfig` → `RW1 AI Interaction`（值只存在本地 sdkconfig，不会被提交） |
+| 改 WiFi/服务器地址 | **双击 BOOT 进配网**，手机上填表（`menuconfig` 里已经没有任何凭据项了，见上面「运行期配置」） |
 | **`git switch -c feature/xxx` 建出来的分支是 unborn**（`git branch` 里看不到、`git status` 把全部文件显示成 `A`） | `.git/refs/heads/feature/` 这个**目录不存在**：松散引用写不进去时 git 会**静默成功**（退出码 0 但不落盘），`git switch -c` 只改得动 HEAD → HEAD 指向一个不存在的 ref。用**写文件的方式**建出该目录（bash 里 `mkdir -p .git/refs/heads/feature` 会被沙箱回滚），之后 `git branch` / `git switch -c` 即正常。注意 `packed-refs` 乱序是**另一个**独立故障 |
 | 两个会话在同一工作区里干活，工作区文件大面积消失 / 引用丢失 | 一个工作区同时只能有一个 HEAD，两个 `git switch` 并发会把索引和工作区交替写坏。**并发必须各用独立工作区**：`git worktree add ../rw1-x <branch>` |
 | 编译报 `ninja: error: build.ninja:30: loading 'CMakeFiles/rules.ninja': The system cannot find the path specified` | `device/build/` 被中断的构建或分支切换弄成了半残状态。先 `idf.py reconfigure` 再 build；还不行就删掉 `device/build/` 全量重编 |
