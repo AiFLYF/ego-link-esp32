@@ -3,10 +3,15 @@
 """
 渲染开发板屏幕（240x240）的预览图，用于在没有硬件的情况下验证界面美观度与布局正确性。
 
-**单一事实来源**：本脚本不重新定义任何尺寸或颜色，而是**解析 `device/main/ui.c` 里的
-`UI_*` 宏**（几何）与 `UI_C_*` 宏（配色），连活动词的语义色都从 `ACT_COLOR` / `ACT_WORD`
-两个数组里抠出来。所以改 ui.c 的布局常量后重跑本脚本，预览图会自动跟着变——
-不会出现「代码改了、预览图还是旧的」这种验证失真。
+**单一事实来源**（**仅限几何与配色**）：本脚本不重新定义任何尺寸或颜色，而是**解析
+`device/main/ui.c` 里的 `UI_*` 宏**（几何）与 `UI_C_*` 宏（配色），连活动词的语义色都从
+`ACT_COLOR` / `ACT_WORD` 两个数组里抠出来。所以改 ui.c 的布局常量后重跑本脚本，
+预览图会自动跟着变。
+
+⚠️ **但文案不在此列**：像倾角那行 `倾角 29° o4` 是**镜像**实现的（ui.c 里是 snprintf
+的格式串，没法直接解析）。改 ui.c 的文案时**必须同步改这里**，否则会出现
+「代码改了、预览图还是旧的」这种失真 —— 2026-09-23 真踩过（加了 oN 但预览图没变，
+差点以为改没生效）。
 
 另外这里把 `reply_page()` 的分页算法**照搬**了一份（同样 30 列、中文记 2 列），
 所以预览图上的 AI 回复就是板子上真正会显示的那一页。
@@ -390,13 +395,20 @@ class Renderer:
         circle(d, bcx + ox, bcy + oy, br + 4, fill=tuple(int(c * 0.18) for c in ball_c))
         circle(d, bcx + ox, bcy + oy, br, fill=ball_c)
 
+        # ⚠️ 这三行文案是**从 ui.c 镜像过来的**（ui.c 里是 snprintf 的格式串，
+        #    没法直接解析）。**改 ui.c 的倾角文案时必须同步改这里**，
+        #    否则预览图会显示旧文案 —— 本脚本开头那句"不会失真"只对
+        #    几何/配色（UI_* / UI_C_* 宏）成立，对文案不成立。
+        #    2026-09-23：加了方向档位 oN（标定时屏幕上要能看见自己在哪一档）。
+        ori = st.get("orient", 0)
         if st["mag"] < 0.05:
-            tilt = "无读数"
+            tilt = "无读数 o%d" % ori
         elif st["mag"] < 0.35:
-            tilt = "失重"
+            tilt = "失重 o%d" % ori
         else:
             import math
-            tilt = "倾角 %d°" % round(math.degrees(math.acos(min(1.0, abs(st["z"]) / st["mag"]))))
+            tilt = "倾角 %d° o%d" % (
+                round(math.degrees(math.acos(min(1.0, abs(st["z"]) / st["mag"])))), ori)
         # 倾角文字跟随球的语义色（与板端 s_lbl_tilt 同步）
         tilt_c = (C["FAINT"] if ball_c == C["FAINT"] else
                   C["GREEN"] if ball_c == C["GREEN"] else
