@@ -45,7 +45,13 @@ void provisioning_stop(void);
 /** 配网是否进行中（UI 据此切"配网中"屏幕）。 */
 bool provisioning_is_active(void);
 
-/** AP 名（EGO-LINK-XXXX）与 4 位随机密码，屏幕要显示给用户。 */
+/**
+ * AP 名（EGO-LINK-XXXX）与随机密码，屏幕要显示给用户。
+ *
+ * 密码是 **8 位数字**（不是 4 位）：WPA2 要求 8–63 位，4 位会被
+ * `esp_wifi_set_config()` 拒绝 —— 2026-09-22 真机实测，那会让板子一开机就 abort
+ * 重启，配网完全不可用。改 8 位后仍是纯数字，手机端好输入。
+ */
 const char *provisioning_ap_ssid(void);
 const char *provisioning_ap_pass(void);
 
