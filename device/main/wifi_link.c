@@ -156,9 +156,13 @@ void wifi_link_start(void)
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg));
     ESP_ERROR_CHECK(esp_wifi_start());
 
-    /* PROPOSAL §1.8 验收 #10：开机自检一行，看清配置到底从哪来 */
+    /* PROPOSAL §1.8 验收 #10：开机自检一行，看清配置到底从哪来。
+     * 设备名打的是**生效 id**（留空时按 MAC 生成的 rw1-XXXX），
+     * 因为那才是仪表盘上会出现的名字 —— 打印空串会让人以为没配好。 */
+    char dev[NET_DEV_MAX];
+    net_config_device_id(&cfg, dev, sizeof(dev));
     ESP_LOGI(TAG, "net: ssid='%s' url='%s' device='%s' source=%s",
-             cfg.ssid, cfg.url, cfg.device, net_config_source());
+             cfg.ssid, cfg.url, dev, net_config_source());
     ESP_LOGI(TAG, "Connecting to SSID '%s' (endless retries until it comes back)", cfg.ssid);
     /* Connection + reconnect are fully event-driven from here on. */
 }

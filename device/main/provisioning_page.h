@@ -68,8 +68,9 @@ static const char PROV_PAGE_HTML[] =
 "<button class=\"sec\" onclick=\"testUrl()\">测试连接</button></fieldset>"
 
 "<fieldset><legend>③ 设备名</legend>"
-"<input id=\"device\" value=\"rw1\" autocomplete=\"off\">"
-"<div class=\"hint\">多块板同时用时，仪表盘靠这个名字区分</div></fieldset>"
+"<input id=\"device\" placeholder=\"留空 = 自动用 MAC 命名\" autocomplete=\"off\">"
+"<div class=\"hint\">多块板同时用时，仪表盘靠这个名字区分；留空则按网卡 MAC 自动生成"
+"（和热点名 EGO-LINK-XXXX 后四位一致）</div></fieldset>"
 
 "<fieldset><legend>④ 高级</legend>"
 "<label for=\"period\">上报周期（ms，留空用默认）</label>"
@@ -94,6 +95,9 @@ static const char PROV_PAGE_HTML[] =
 "o.value=n.ssid;o.textContent=n.ssid+(n.rssi?'  ('+n.rssi+'dBm)':'')+(n.open?'  开放':'');"
 "s.appendChild(o)});"
 "if(!(d.nets||[]).length)s.innerHTML='<option value=\"\">（没扫到，请手动填写）</option>';"
+/* 设备端扫描失败时必须说出来：以前列表空白 + 只写"没扫到"，用户看不出
+   是设备端出错还是周围真没有 WiFi（2026-09-22 实测踩过）。 */
+"if(d.err)say(d.err+'，请在下面手动填写 WiFi 名称','err');"
 "}).catch(function(){s.innerHTML='<option value=\"\">（扫描失败，请手动填写）</option>'})}"
 "function body(){var ssid=$('ssid2').value||$('ssid').value;"
 "return 'ssid='+encodeURIComponent(ssid)+'&pass='+encodeURIComponent($('pass').value)"

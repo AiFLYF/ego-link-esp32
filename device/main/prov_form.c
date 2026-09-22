@@ -139,8 +139,8 @@ bool prov_parse_form(const char *body, size_t len, const net_config_t *base,
         }
     }
 
-    if (out->device[0] == '\0') {
-        strlcpy(out->device, "rw1", sizeof(out->device));
-    }
+    /* 设备名**刻意允许留空**：留空 = 用 MAC 自动命名（net_config_device_id）。
+     * 以前这里兜底填 "rw1"，于是所有没改过名的板子在服务端是同一台设备、
+     * 姿态球互相覆盖 —— 多板场景下这个"贴心默认值"反而是坑。 */
     return prov_validate(out, err, errcap);
 }
