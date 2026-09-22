@@ -82,16 +82,49 @@ static esp_err_t h_root(httpd_req_t *req)
     return httpd_resp_send(req, PROV_PAGE_HTML, HTTPD_RESP_USE_STRLEN);
 }
 
+/* 每条扫描记录的最大长度。
+ *
+ * **不能用拍脑袋的常数**：`snprintf` 返回的是"本应写入的长度"，一旦被截断，
+ * 游标 `w` 就会越过实际写入位置 → 下一次 `out + w` 写到分配区外（堆溢出），
+ * 而且截断出来的 JSON 是坏的（页面 `JSON.parse` 失败 → 下拉框空白）。
+ * 这里按最坏情况算：SSID 32 字节，json_escape 每个字节最多膨胀成 2 字符
+ * （`"` / `\` 转义；控制字符 `\uXXXX` 理论上 6 字符），再加固定字段。
+ */
+#define PROV_SCAN_REC_MAX (PROV_MAX_SSID_LEN * 6 + 64)
+
 /* GET /scan —— 扫周边 AP，返回 {nets:[{ssid,rssi,open}]} */
 static esp_err_t h_scan(httpd_req_t *req)
 {
     note_activity();
 
+    /* **扫描必须在 STA 接口启用的情况下做。**
+     * ESP-IDF 的 esp_wifi_scan_start() 要求 STA 已启用，纯 AP 模式下会失败
+     * （ESP_ERR_WIFI_MODE）→ 页面下拉框永远是空的。
+     * 2026-09-22 用户真机实测报的就是这个：周围明明有 WiFi，列表却是空的、刷新也没用
+     * （README 里"页面/扫描阶段保持纯 AP"那句设计说明是错的）。
+     *
+     * 这里切 APSTA 但不 esp_wifi_connect()，所以 STA 只是"存在且空闲"，
+     * 热点不会被 STA 的频道带走，手机上正开着的配网页不会断。
+     * 扫完也**不切回纯 AP**：来回切模式反而更容易把手机连接抖掉，
+     * 而"APSTA + STA 空闲"与纯 AP 在射频行为上是一样的（同频道、不发起关联）。 */
+    esp_err_t err = esp_wifi_set_mode(WIFI_MODE_APSTA);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "scan: 切 APSTA 失败: %s", esp_err_to_name(err));
+        send_json(req, "{\"nets\":[],\"err\":\"无法启用扫描（STA 模式切换失败）\"}");
+        return ESP_OK;
+    }
+
     wifi_scan_config_t sc = {.show_hidden = false};
-    esp_err_t err = esp_wifi_scan_start(&sc, true);   /* 阻塞式，最多几秒 */
+    err = esp_wifi_scan_start(&sc, true);   /* 阻塞式，最多几秒 */
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "scan failed: %s", esp_err_to_name(err));
-        send_json(req, "{\"nets\":[]}");
+        /* 带上 err 字段：页面才能把"扫描失败"和"周围真没有 WiFi"区分开。
+         * 2026-09-22 用户报的正是这个困惑 —— 列表空白、刷新没用，
+         * 而页面只说"没扫到"，看不出是设备端失败。 */
+        char out[128];
+        snprintf(out, sizeof(out), "{\"nets\":[],\"err\":\"扫描失败：%s\"}",
+                 esp_err_to_name(err));
+        send_json(req, out);
         return ESP_OK;
     }
 
@@ -108,7 +141,7 @@ static esp_err_t h_scan(httpd_req_t *req)
     esp_wifi_scan_get_ap_records(&n, recs);
 
     /* 手工拼 JSON：cJSON 会把 SSID 里的非 ASCII 转义得很难读，这里直接透传 */
-    char *out = malloc(64 + (size_t)n * 140);
+    char *out = malloc(64 + (size_t)n * PROV_SCAN_REC_MAX);
     if (out == NULL) {
         free(recs);
         send_json(req, "{\"nets\":[]}");
@@ -118,7 +151,7 @@ static esp_err_t h_scan(httpd_req_t *req)
     for (uint16_t i = 0; i < n; i++) {
         char esc[PROV_MAX_SSID_LEN * 6 + 8];
         json_escape(esc, sizeof(esc), (const char *)recs[i].ssid);
-        w += snprintf(out + w, 140,
+        w += snprintf(out + w, PROV_SCAN_REC_MAX,
                       "%s{\"ssid\":\"%s\",\"rssi\":%d,\"open\":%s}",
                       i ? "," : "", esc, (int)recs[i].rssi,
                       recs[i].authmode == WIFI_AUTH_OPEN ? "true" : "false");
@@ -126,6 +159,7 @@ static esp_err_t h_scan(httpd_req_t *req)
     snprintf(out + w, 8, "]}");
     free(recs);
 
+    ESP_LOGI(TAG, "scan: %u 个 AP", (unsigned)n);
     send_json(req, out);
     free(out);
     return ESP_OK;

@@ -95,6 +95,9 @@ static const char PROV_PAGE_HTML[] =
 "o.value=n.ssid;o.textContent=n.ssid+(n.rssi?'  ('+n.rssi+'dBm)':'')+(n.open?'  开放':'');"
 "s.appendChild(o)});"
 "if(!(d.nets||[]).length)s.innerHTML='<option value=\"\">（没扫到，请手动填写）</option>';"
+/* 设备端扫描失败时必须说出来：以前列表空白 + 只写"没扫到"，用户看不出
+   是设备端出错还是周围真没有 WiFi（2026-09-22 实测踩过）。 */
+"if(d.err)say(d.err+'，请在下面手动填写 WiFi 名称','err');"
 "}).catch(function(){s.innerHTML='<option value=\"\">（扫描失败，请手动填写）</option>'})}"
 "function body(){var ssid=$('ssid2').value||$('ssid').value;"
 "return 'ssid='+encodeURIComponent(ssid)+'&pass='+encodeURIComponent($('pass').value)"
