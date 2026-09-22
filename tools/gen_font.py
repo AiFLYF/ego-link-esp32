@@ -36,10 +36,29 @@ from fontTools.ttLib import TTFont
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
+
+# **只给浏览器看的**文件：里面的字符串永远不进 LVGL，用的是手机/电脑自己的字体，
+# 所以既不该拉进子集（白占几百 KB），更不该参与"板端缺字"判定。
+#
+# 为什么单列出来：provisioning_page.h 是一整页内联 HTML/JS（配网时手机连的是板子
+# 自己的热点、没有外网，所以必须自包含）。它里面有 ✓/✗ 这类装饰字符，simhei 没有；
+# 不排除的话每次生成字体都会报"板端会显示方块"并 exit 1 —— 一个纯粹的假故障，
+# 会让人去改一个根本不存在的显示问题。
+BROWSER_ONLY = {
+    os.path.join(ROOT, "device", "main", "provisioning_page.h"),
+}
+
+
+def _device_sources():
+    """板端（会真的画到 LVGL 上）的源码文件。"""
+    files = (glob.glob(os.path.join(ROOT, "device", "main", "*.c"))
+             + glob.glob(os.path.join(ROOT, "device", "main", "*.h")))
+    return [p for p in files if p not in BROWSER_ONLY]
+
+
 SRC_FILES = (
     [os.path.join(ROOT, "server", "server.py")]
-    + glob.glob(os.path.join(ROOT, "device", "main", "*.c"))
-    + glob.glob(os.path.join(ROOT, "device", "main", "*.h"))
+    + _device_sources()
 )
 OUT_C = os.path.join(ROOT, "device", "main", "rw1_font.c")
 OUT_H = os.path.join(ROOT, "device", "main", "rw1_font.h")
@@ -152,8 +171,7 @@ def main() -> int:
     # 覆盖率自检：板端源码里出现在字符串里的每个非 ASCII 字符都必须被子集包含；
     # 仅服务器/仪表盘文案里的装饰字符（如 ✔）缺失只作警告。
     board_chars = set()
-    for path in glob.glob(os.path.join(ROOT, "device", "main", "*.c")) + \
-                glob.glob(os.path.join(ROOT, "device", "main", "*.h")):
+    for path in _device_sources():
         with open(path, encoding="utf-8", errors="replace") as fh:
             # 注释里的字符可能出现在字符串外，宁可多报不漏报：只挑字符串行
             for line in fh:
