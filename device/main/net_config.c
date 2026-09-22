@@ -16,20 +16,8 @@ static const char *TAG = "net_config";
 
 #define NVS_NS "netcfg"
 
-/* 开机自检用：本次生效的配置来自哪里 */
+/* 开机自检用：本次生效的配置来自哪里（现在只有 "NVS" / "default" 两种） */
 static const char *s_source = "default";
-
-static void copy_str(char *dst, size_t cap, const char *src)
-{
-    if (cap == 0) {
-        return;
-    }
-    if (src == NULL) {
-        dst[0] = '\0';
-        return;
-    }
-    strlcpy(dst, src, cap);
-}
 
 /* 逐项读 NVS：任何一项读不到就保留调用方已经填好的默认值。
  * 这样"只配了一半"的 NVS 不会把其余字段清空。 */
@@ -71,18 +59,24 @@ void net_config_load(net_config_t *out)
 {
     memset(out, 0, sizeof(*out));
 
-    /* 1) 先铺 Kconfig 出厂默认值 —— 这就是"向后兼容老固件行为"的那一层 */
-    copy_str(out->ssid, sizeof(out->ssid), CONFIG_RW1_WIFI_SSID);
-    copy_str(out->pass, sizeof(out->pass), CONFIG_RW1_WIFI_PASSWORD);
-    copy_str(out->url, sizeof(out->url), CONFIG_RW1_SERVER_URL);
-    /* 设备名默认**留空** = "没起名字"，由 net_config_device_id() 按 MAC 生成
-     * rw1-XXXX。以前这里写死 "rw1"，结果 20 块没改过名的板子在服务端是同一个
-     * 设备、姿态球互相覆盖 —— 配网做好了，多板场景却白做。 */
-    out->device[0] = '\0';
+    /* **凭据只从配网来，不再回退 Kconfig**（用户 2026-09-23 的决定）。
+     *
+     * 原来这里会把 CONFIG_RW1_WIFI_SSID / PASSWORD / SERVER_URL 铺成"出厂默认值"，
+     * 于是 PROPOSAL §1.8 验收 #9 和 README 都写着"老 sdkconfig 一字不改仍然能跑"。
+     * 但实机上那句话**不成立**：`net_config_present()` 只看 NVS，NVS 空就进配网，
+     * 根本走不到这条回退路径 —— 文档承诺了一个到不了的分支。
+     *
+     * 现在的选择是"配网是唯一入口"，顺带解决一个更硬的隐患：
+     * **编译期塞进去的 WiFi 密码会随固件一起分发出去**（发固件 = 发密码）。
+     * 只要凭据不再从 sdkconfig 来，固件里就永远不可能包含 WiFi 密码。
+     *
+     * 唯一保留的 Kconfig 值是上报周期：它不是凭据，而且配网页"留空用默认"要用它。
+     */
+    out->device[0] = '\0';   /* 留空 = 由 net_config_device_id() 按 MAC 生成 rw1-XXXX */
     out->period_ms = CONFIG_RW1_TELEMETRY_PERIOD_MS;
-    s_source = (out->ssid[0] != '\0') ? "Kconfig" : "default";
+    s_source = "default";
 
-    /* 2) NVS 覆盖 */
+    /* NVS 是唯一来源 */
     if (load_from_nvs(out)) {
         s_source = "NVS";
     }

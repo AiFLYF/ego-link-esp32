@@ -51,6 +51,7 @@
 #include "esp_log.h"
 #include "lvgl.h"
 
+#include "accel_input.h"    /* accel_input_get_orientation()：倾角小字里要显示档位 oN */
 #include "provisioning.h"
 #include "transport.h"
 #include "wifi_link.h"
@@ -811,19 +812,25 @@ static void ui_timer_cb(lv_timer_t *timer)
         lv_obj_set_style_text_color(s_lbl_tilt, lv_color_hex(tilt_c), 0);
     }
 
+    /* 倾角小字里**带上当前方向档位 `oN`**。
+     * 为什么必须显示：档位只能在串口日志里看到，于是"长按 BOOT 校准方向"这件事
+     * 变成了必须插着电脑开串口才能做 —— 2026-09-23 真机标定时就是这么卡住的
+     * （屏幕上没有 oN，用户按了也分不清自己在哪一档）。
+     * 显示出来之后，标定就是纯屏上操作：长按换档 → 看方向对不对 → 对了就停。 */
+    const int ori = accel_input_get_orientation();
     if (mag < 0.05f) {
-        lv_label_set_text(s_lbl_tilt, "无读数");
+        snprintf(buf, sizeof(buf), "无读数 o%d", ori);
     } else if (mag < 0.35f) {
-        lv_label_set_text(s_lbl_tilt, "失重");
+        snprintf(buf, sizeof(buf), "失重 o%d", ori);
     } else {
         float c = fabsf(st.z_g) / mag;
         if (c > 1.0f) {
             c = 1.0f;
         }
         int deg = (int)(acosf(c) * 57.29578f + 0.5f);
-        snprintf(buf, sizeof(buf), "倾角 %d°", deg);
-        lv_label_set_text(s_lbl_tilt, buf);
+        snprintf(buf, sizeof(buf), "倾角 %d° o%d", deg, ori);
     }
+    lv_label_set_text(s_lbl_tilt, buf);
 
     /* ---------- 三轴对称条 ---------- */
     float axis[3] = {st.x_g, st.y_g, st.z_g};

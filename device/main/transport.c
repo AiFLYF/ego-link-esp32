@@ -761,12 +761,34 @@ static void transport_task(void *arg)
         const TickType_t now = xTaskGetTickCount();
         if (n > 0 && ((now - last_post) >= post_ticks || n >= TX_BATCH_MAX)) {
             bool ask = s_ask_pending;
+
+            /* ⚠️ 必须在 post_batch **之前**把"这一帧要发出去的结果"记下来。
+             *
+             * 为什么：post_batch() 内部会解析服务器回复，而 LED 类指令是**同步执行**的
+             * —— run_command() 直接调 finish_command()，于是 s_cmd.ready 在 post_batch
+             * 返回**之前**就被设成了 true。原来的写法是 post_batch 之后无条件清 ready，
+             * 结果"刚设好的结果"在同一轮里被立刻清掉，**永远发不出去**，
+             * 服务器只能判超时（现象：灯确实闪了，网页上却显示超时/失败）。
+             * capture_once 不中招，因为它只 start_capture()，结果要等 200ms 后由采样
+             * 循环补上 —— 那时早过了清除点。所以这个 bug 只打 LED 指令。
+             * （2026-09-23 真机实测：capture_once 往返 782ms 正常，led_blink / led_set
+             *   连续 6 次全部 10 秒超时，就是这个原因。）
+             *
+             * 按 rid 精确清除而不是按布尔值：同一帧里完全可能"发走旧结果 + 收到新指令
+             * 并立刻完成"，只比对布尔会把新结果一起清掉。 */
+            char sent_rid[TRANSPORT_CMD_ID_LEN];
+            const bool had_result = s_cmd.ready;
+            sent_rid[0] = '\0';
+            if (had_result) {
+                strlcpy(sent_rid, s_cmd.rid, sizeof(sent_rid));
+            }
+
             bool ok = post_batch(n, ask);
 
             /* 结果与按键计数只在成功送达后才清；失败就下一帧重发
              * （与 ask 的重试策略一致，不丢东西） */
             if (ok) {
-                if (s_cmd.ready) {
+                if (had_result && strcmp(s_cmd.rid, sent_rid) == 0) {
                     s_cmd.ready = false;
                 }
                 s_btn_pending = 0;
