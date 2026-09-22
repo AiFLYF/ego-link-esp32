@@ -18,6 +18,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -55,6 +56,21 @@ bool net_config_present(void);
 
 /** "NVS" / "Kconfig" / "default" —— 供开机自检打印。 */
 const char *net_config_source(void);
+
+/**
+ * 生效的设备 id（多板场景下仪表盘区分板子的唯一依据）。
+ *
+ * 规则：`cfg->device` 填了就用它（课堂里"第三组-07"比一串 MAC 好认得多）；
+ * 留空就按 MAC 后两字节生成 `rw1-XXXX` —— **刻意和热点名 EGO-LINK-XXXX 用同样
+ * 两个字节**，学生看到热点名就知道该在仪表盘里点哪个。
+ *
+ * 为什么要保证非空：设备名是服务端分片的 key，20 块板都叫 "rw1" 的话
+ * 仪表盘上它们会互相覆盖，配网就白做了（PROPOSAL §4.1）。
+ *
+ * @param cfg 已加载的配置，可为 NULL（等价于"没填"）
+ * @param out 输出缓冲，至少 NET_DEV_MAX 字节
+ */
+void net_config_device_id(const net_config_t *cfg, char *out, size_t cap);
 
 #ifdef __cplusplus
 }

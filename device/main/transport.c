@@ -93,6 +93,9 @@ static uint32_t s_post_count;
 static int s_btn_pending;      /* 自上次成功上报以来 BOOT 被按了几次（第 3 周） */
 static uint32_t s_bad_samples; /* 累计丢弃的不可用样本数（P1-4，只统计不上报） */
 static char s_url[NET_URL_MAX];/* 上报地址：来自 net_config（运行期可变，不再编译期写死） */
+/* 设备 id：服务端按它分片（多板场景下仪表盘区分板子的唯一依据）。
+ * 由 net_config_device_id() 解析：配网页填了就用填的，留空则按 MAC 生成 rw1-XXXX。 */
+static char s_device[NET_DEV_MAX];
 static uint32_t s_poll_fail;   /* 连续 accel_input_poll 失败次数（真实源读失败） */
 static char s_last_reply[TRANSPORT_REPLY_LEN];   /* 上一次看到过的服务器回复 */
 
@@ -396,13 +399,28 @@ static char *build_body(int n, bool ask, const char *source)
         return NULL;
     }
     size_t cap = 256 + (size_t)n * 28 + strlen(s_ask_text) * 2 + 64
-                 + (s_cmd.ready ? 320 : 0) + 32;
+                 + (s_cmd.ready ? 320 : 0) + 32
+                 + strlen(s_device) * 6 + 24;   /* "dev" 字段：设备名是用户输入，转义后可能翻倍 */
     char *buf = malloc(cap);
     if (buf == NULL) {
         return NULL;
     }
 
-    int off = snprintf(buf, cap, "{\"batch\":[");
+    /* 设备 id 放最前面：服务端拿到第一件事就是按它分片，不用先解析完 50 个样本。
+     * 字段名用 **"device"**（不是缩写 "dev"）：要和查询参数 ?device=、
+     * 以及 net_config 里的字段名一致 —— 三处一个名字，才不会有"板端发了 dev、
+     * 服务端找 device"这种对不上的静默失败（verify_server.py 的固件格式契约用例
+     * 就是钉这个的）。 */
+    int off = snprintf(buf, cap, "{\"device\":\"");
+    if (!json_escape_append(buf, cap, &off, s_device)) {
+        free(buf);
+        return NULL;
+    }
+    if ((size_t)off + 16 > cap) {
+        free(buf);
+        return NULL;
+    }
+    off += snprintf(buf + off, cap - (size_t)off, "\",\"batch\":[");
     for (int i = 0; i < n; ++i) {
         if ((size_t)off + 48 > cap) {
             free(buf);
@@ -835,13 +853,26 @@ void transport_start(void)
 
 void transport_reload_config(void)
 {
-    /* 地址来自 net_config（NVS 优先 / 回退 Kconfig），配网改完立即生效。
+    /* 地址与设备 id 都来自 net_config（NVS 优先 / 回退 Kconfig），配网改完立即生效。
      * 缓存成静态而不是每次上报都读 NVS：post_batch 和采样循环在同一个任务里，
      * 每次 2 Hz 去开关 NVS 句柄会白占锁、拖慢采样。 */
     net_config_t cfg;
     net_config_load(&cfg);
     strlcpy(s_url, cfg.url, sizeof(s_url));
-    ESP_LOGI(TAG, "server url -> '%s' (source=%s)", s_url, net_config_source());
+
+    /* 设备 id：本函数会被 provisioning 的 httpd 任务调用，而 build_body 在 transport
+     * 任务里读它。**值没变就不写** —— 开机写一次之后基本不再变动，把并发窗口压到最小
+     * （万一真读到半截，服务端只会多出一个设备条目，随后自然过期淘汰，不影响数据）。 */
+    char dev[NET_DEV_MAX];
+    net_config_device_id(&cfg, dev, sizeof(dev));
+    if (strcmp(dev, s_device) != 0) {
+        status_lock();
+        strlcpy(s_device, dev, sizeof(s_device));
+        status_unlock();
+    }
+
+    ESP_LOGI(TAG, "server url -> '%s' device -> '%s' (source=%s)",
+             s_url, s_device, net_config_source());
 }
 
 void transport_request_ask(const char *question)

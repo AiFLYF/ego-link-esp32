@@ -4,9 +4,11 @@
  */
 #include "net_config.h"
 
+#include <stdio.h>
 #include <string.h>
 
 #include "esp_log.h"
+#include "esp_mac.h"
 #include "nvs.h"
 #include "sdkconfig.h"
 
@@ -73,7 +75,10 @@ void net_config_load(net_config_t *out)
     copy_str(out->ssid, sizeof(out->ssid), CONFIG_RW1_WIFI_SSID);
     copy_str(out->pass, sizeof(out->pass), CONFIG_RW1_WIFI_PASSWORD);
     copy_str(out->url, sizeof(out->url), CONFIG_RW1_SERVER_URL);
-    copy_str(out->device, sizeof(out->device), "rw1");
+    /* 设备名默认**留空** = "没起名字"，由 net_config_device_id() 按 MAC 生成
+     * rw1-XXXX。以前这里写死 "rw1"，结果 20 块没改过名的板子在服务端是同一个
+     * 设备、姿态球互相覆盖 —— 配网做好了，多板场景却白做。 */
+    out->device[0] = '\0';
     out->period_ms = CONFIG_RW1_TELEMETRY_PERIOD_MS;
     s_source = (out->ssid[0] != '\0') ? "Kconfig" : "default";
 
@@ -148,4 +153,25 @@ bool net_config_present(void)
 const char *net_config_source(void)
 {
     return s_source;
+}
+
+void net_config_device_id(const net_config_t *cfg, char *out, size_t cap)
+{
+    if (out == NULL || cap == 0) {
+        return;
+    }
+    if (cfg != NULL && cfg->device[0] != '\0') {
+        strlcpy(out, cfg->device, cap);
+        return;
+    }
+
+    /* 没起名字就按 MAC 生成。用 SOFTAP 的 MAC 是为了和 provisioning.c 里的
+     * 热点名 EGO-LINK-%02X%02X 取**同样两个字节** —— 学生看到热点名就能在
+     * 仪表盘上找到对应的那台板。 */
+    uint8_t mac[6] = {0};
+    if (esp_read_mac(mac, ESP_MAC_WIFI_SOFTAP) != ESP_OK) {
+        strlcpy(out, "rw1", cap);       /* 读不到 MAC 也别返回空：空会退化成"默认设备" */
+        return;
+    }
+    snprintf(out, cap, "rw1-%02X%02X", mac[4], mac[5]);
 }

@@ -14,7 +14,8 @@
 | 1 | 传感数据采集 + 服务器接收/存储 + Web 展示 | ✅ |
 | 2 | Web 远程"采集一次"指令（request_id）与执行结果反馈 | ✅ |
 | 3 | 按键触发 + 本地/远端物理反馈闭环 | ✅ |
-| — | **运行期配置：SoftAP 配网 + NVS**（工程改进，非课程周次） | ✅ 本仓库当前内容 |
+| — | **运行期配置：SoftAP 配网 + NVS**（工程改进，非课程周次） | ✅ |
+| — | **多设备：`device_id` 贯穿板端 → 服务端 → 仪表盘**（工程改进，非课程周次） | ✅ 本仓库当前内容 |
 | 4–6 | 自然语言查询/请求、按键说话语音链路、澄清与停止 | |
 | 7–9 | 按需取图、视觉推理反馈、视觉事件主动询问 | |
 | 10–12 | 观测 vs 当前状态（数据年龄）、多源上下文、纠错记忆 | |
@@ -122,13 +123,19 @@ python server\server.py
 
 | 方法/路径 | 说明 |
 |---|---|
-| `POST /api/telemetry` | 请求 `{batch:[[x,y,z],…], x, y, z, source, ask, q[, result][, btn]}` → 响应 `{ok, activity, reply, pending[, cmd]}` |
-| `POST /api/command` | 下发远程指令 `{"name":"capture_once"}` → 响应 `{ok, id, device_online}` |
-| `GET /api/commands` | 最近 20 条指令及其状态、执行结果 |
-| `GET /api/latest` | 快照（状态 + 8s 曲线降采样 + 事件流 + 指令列表），JSON |
-| `GET /api/stream` | SSE 实时推送（仪表盘用） |
+| `POST /api/telemetry` | 请求 `{device, batch:[[x,y,z],…], x, y, z, source, ask, q[, result][, btn]}` → 响应 `{ok, activity, reply, pending[, cmd]}` |
+| `POST /api/command` | 下发远程指令 `{"name":"capture_once"[, "device":"rw1-07"]}` → 响应 `{ok, id, device, device_online}` |
+| `GET /api/devices` | 所有上报过的设备列表（在线/离线、最后上报距今秒数、当前活动、上报帧数） |
+| `GET /api/commands` | 最近 20 条指令及其状态、执行结果。可加 `?device=` 看指定设备 |
+| `GET /api/latest` | 快照（状态 + 8s 曲线降采样 + 事件流 + 指令列表），JSON。可加 `?device=` |
+| `GET /api/stream` | SSE 实时推送（仪表盘用）。可加 `?device=`；首帧同时带 `devices` 列表 |
 | `GET /api/logs` | 落盘目录与文件大小 |
 | `GET /` | 网页仪表盘 |
+
+- **`device` 是设备名**（可选字段，老固件不发）。所有带 `?device=` 的接口，
+  **不传就回退到"最近上报过的那台"** —— 所以单板场景和以前完全一样，
+  老固件、老脚本一行都不用改。传了一个不存在的名字也会回退（并在响应里回带真实
+  `device`），不会返回 404 让页面白屏。详见下面「多设备」一节。
 
 - `batch` 是本次周期内的全部样本；`x/y/z` 是最后一帧，供旧版服务端或快速查看。
   只发 `x/y/z`（不带 `batch`）也能用，服务端按单帧处理。
@@ -231,7 +238,7 @@ WiFi 密码是明文**——把固件发给同学/老师，等于把自己的 Wi
 首次上电 / NVS 里没有凭据 / 双击 BOOT
             │
             ▼
-  板子开热点 EGO-LINK-<MAC后2字节>，密码是屏幕上的 4 位随机数
+  板子开热点 EGO-LINK-<MAC后2字节>，密码是屏幕上的 8 位随机数
             │   手机连上 → 浏览器打开 192.168.4.1
             ▼
   填表：① 扫描选 WiFi  ② 服务器地址（可当场「测试连接」）  ③ 设备名  ④ 上报周期
@@ -277,6 +284,37 @@ AP 存活 **5 分钟无操作自动关闭**回 STA（避免忘记关热点长期
 但验收要求"密码错误时页面红字报错、**不关 AP**"。如果试连时切成纯 STA，手机连接会
 立刻断，用户永远看不到那个错误提示。所以页面/扫描阶段保持**纯 AP**（规避信道干扰），
 只在"试连"那一小段切 **APSTA**（手机保持连着才能收到结果）。
+
+### 多设备（一个班 20 块板）
+
+单板时代服务端只有一个全局 `STATE`，两台板一起上报会**互相覆盖**——姿态球在两台之间跳。
+课堂场景下这是硬伤：配网做得再好，20 块板也只是"一起挤进同一个单设备仪表盘"。
+
+现在按设备分片：
+
+```
+板端每一帧都带 device  ──►  服务端 DEVICES[device_id] 各自一份状态
+                              （各自的 8s 窗口 / 事件流 / 指令队列 / AI 回复）
+                                        │
+                                        ▼
+                     仪表盘顶部「设备」卡片：每台一行，点一下切过去看详情
+```
+
+- **设备名从哪来**：配网页的「设备名」填了就用它（`第三组-07` 这种比 MAC 好认）；
+  **留空则按网卡 MAC 自动生成 `rw1-XXXX`**，且刻意和热点名 `EGO-LINK-XXXX` 用
+  同样两个字节 —— 学生看到热点名就知道该在列表里点哪个。
+- **不填也不会撞车**：以前这里兜底填死 `"rw1"`，20 块没改过名的板子在服务端就是
+  同一台设备。现在"留空"是一个有意义的值（自动命名），不再是坑。
+- **向后兼容**：老固件不带 `device` 字段 → 全部归到默认设备 `-`，
+  所有不带 `?device=` 的接口也照旧回退到"最近上报过的那台"。**单板场景行为不变。**
+- **指令定向下发**：网页上选中哪台，指令就只进哪台的队列；跌落告警也只发给摔的那台
+  （20 块板同时闪灯是噪音）。
+- **上限**：同时在册 32 台，超出时淘汰最久没上报的那台。
+- **落盘**：`telemetry-*.jsonl` / `events-*.jsonl` 每行都带 `dev` 字段，事后能按板分析。
+
+设备名是**外部输入**（用户在配网页手填），所以两端各夹一道：板端用
+`json_escape_append()` 转义（一个裸引号就能把整帧 JSON 打坏），服务端剥掉不可打印
+字符并限长 32 字符（`\n` 会破坏 SSE 的"一行一个 data:"分帧）。
 
 ### 板端界面（240x240 图形化仪表盘）
 
@@ -374,8 +412,8 @@ python tools\verify_server.py
 ```
 
 它会自己拉起一个临时服务器、灌入各场景、检查分类/计步/跌落/落盘/超时解耦/畸形载荷/
-**指令往返与超时**/**物理反馈指令**/**跌落自动告警**，共 56 项断言，全程不需要硬件，
-也不需要真实大模型（用一个故意慢 6 秒的假大模型验证不阻塞）。
+**指令往返与超时**/**物理反馈指令**/**跌落自动告警**/**多设备分片与定向下发**，共 72 项断言，
+全程不需要硬件，也不需要真实大模型（用一个故意慢 6 秒的假大模型验证不阻塞）。
 
 ### 可选：接入真实大模型
 
@@ -398,11 +436,14 @@ python server\server.py
 | 连不上 WiFi（反复 retry） | 路由器侧问题（密码改了/AP重启/信道）；板子会自动无限重试，恢复后自动重连 |
 | 编译报 `rw1_font.c missing` | 先跑 `python tools/gen_font.py`（见首次上手①） |
 | 屏幕中文显示成方块 | 跑 `gen_font.py`，它会报告"板端文案缺字"；换了显示文案后要重跑再编译 |
+| 仪表盘「设备」卡片里有两台，但实际只插了一块板 | 两块板的设备名撞了。配网页的「设备名」留空会自动按 MAC 命名；如果手动填了同名（比如都填 `rw1`）就会合并成一台。双击 BOOT 进配网改掉其中一个 |
+| 配网时手机搜不到 `EGO-LINK-XXXX`，或板子一开机就重启循环 | 2026-09-22 前的固件有这个 bug：AP 密码是 4 位，而 WPA2 要求 8–63 位，`esp_wifi_set_config()` 会拒绝；当时那行用的是 `ESP_ERROR_CHECK`，于是直接 `abort()` → 重启循环，连屏幕都看不到。已修（密码改 8 位数字 + 失败不再 abort）。**注意：如果只是个别情况，先确认手机没连在 5GHz-only 的网络**——AP 只跑 2.4GHz channel 1 |
 | 首次编译卡在拉取组件 | 离线场景拷入 `managed_components/`；在线场景检查能否访问 components.espressif.com |
 | 改了 `idf_component.yml` 后编译报 `[safe-delete]` 或重新下载组件 | 删掉 `device/managed_components/` 让它按 `dependencies.lock` 重建即可 |
 | **在 Git Bash 里跑 `idf.py` 只打印一句 "MSys/Mingw is no longer supported" 就退出** | ESP-IDF 5.4 的 `idf.py` 只要环境里存在 `MSYSTEM` 变量（Git for Windows 会强制注入，`unset` 也删不掉）就**直接跳过 `main()`**。用 `build_device.bat`，或 `python tools/idf_build.py -D SDKCONFIG_DEFAULTS=sdkconfig.bsp.esp32_s3_eye build` |
 | 倾斜方向左右/上下反了 | **长按 BOOT 键**循环切换校准值（屏幕上 `o0`–`o7`），存在 NVS 里，不用重编译 |
 | 板子日志每隔 10 秒出现一行 `link OK` | 正常心跳（每 20 次上报一次） |
+| 启动日志有 `Detected size(16384k) larger than the size in the binary image header(4096k)` | **不影响运行**，但值得知道：手上的 ESP32-S3-EYE 实际是 **16MB flash**，而 `sdkconfig.bsp.esp32_s3_eye` 里写的是 4MB（2026-09-22 真机读出来的）。当前分区表只有 3MB 的 `factory`，所以没事；**做 OTA 时这条很关键**——16MB 足够放两个 3MB 的 app 分区，不用先换模块 |
 | 改 WiFi/服务器地址 | `idf.py menuconfig` → `RW1 AI Interaction`（值只存在本地 sdkconfig，不会被提交） |
 | **`git switch -c feature/xxx` 建出来的分支是 unborn**（`git branch` 里看不到、`git status` 把全部文件显示成 `A`） | `.git/refs/heads/feature/` 这个**目录不存在**：松散引用写不进去时 git 会**静默成功**（退出码 0 但不落盘），`git switch -c` 只改得动 HEAD → HEAD 指向一个不存在的 ref。用**写文件的方式**建出该目录（bash 里 `mkdir -p .git/refs/heads/feature` 会被沙箱回滚），之后 `git branch` / `git switch -c` 即正常。注意 `packed-refs` 乱序是**另一个**独立故障 |
 | 两个会话在同一工作区里干活，工作区文件大面积消失 / 引用丢失 | 一个工作区同时只能有一个 HEAD，两个 `git switch` 并发会把索引和工作区交替写坏。**并发必须各用独立工作区**：`git worktree add ../rw1-x <branch>` |

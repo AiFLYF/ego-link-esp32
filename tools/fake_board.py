@@ -17,6 +17,11 @@ ask（等价于按一下 BOOT 键）。
     python tools/fake_board.py --scenario fall --ask-at 5
     python tools/fake_board.py --url http://192.168.1.20:8000 --scenario shake
     python tools/fake_board.py --scenario walk --expect-steps 8  # 带断言
+    python tools/fake_board.py --device 第三组-07 --scenario tilt   # 多板：带设备名
+    python tools/fake_board.py --scenario idle --no-cmd          # 故意不执行指令
+
+多板（课堂 20 块板）场景：同时起多个实例、各给一个 --device 名字即可。
+不带 --device 时**不发该字段**，等价于老固件 → 服务端会归到默认设备。
 
 场景：
     idle    静置水平
@@ -34,6 +39,7 @@ import random
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 SAMPLE_HZ = 100.0
@@ -115,6 +121,9 @@ def main():
     ap.add_argument("--sample-hz", type=float, default=SAMPLE_HZ,
                     help="本地采样率（Hz），对应固件的 RW1_SAMPLE_PERIOD_MS")
     ap.add_argument("--source", default="SC7A20")
+    ap.add_argument("--device", default=None,
+                    help="设备名（对应固件的 device 字段）。不带则**省略该字段**，"
+                         "模拟不带 device 的老固件；多板场景下每块板给一个不同的名字")
     ap.add_argument("--noise", type=float, default=0.012, help="传感器噪声幅度（g）")
     ap.add_argument("--ask-at", type=float, action="append", default=[],
                     help="在第 N 秒发一次 ask（等价于按 BOOT），可重复")
@@ -169,6 +178,8 @@ def main():
             "batch": batch,
             "ask": b in ask_marks,
         }
+        if args.device:
+            payload["device"] = args.device
         if b in ask_marks:
             payload["q"] = "我现在的运动状态怎么样？"
 
@@ -239,7 +250,12 @@ def main():
         rc = 1
     if args.expect_steps is not None:
         try:
-            with OPENER.open(args.url.rstrip("/") + "/api/latest", timeout=5) as r:
+            # 带 --device 时必须查那一台：不带参数会落到"最近上报过的设备"，
+            # 多板同时在跑时可能查到别的板子上，断言就失去意义了。
+            url = args.url.rstrip("/") + "/api/latest"
+            if args.device:
+                url += "?device=" + urllib.parse.quote(args.device, safe="")
+            with OPENER.open(url, timeout=5) as r:
                 snap = json.loads(r.read().decode("utf-8"))
             steps = snap.get("step_count", 0)
             print("服务端窗口内步数 = %d（期望 >= %d）" % (steps, args.expect_steps))

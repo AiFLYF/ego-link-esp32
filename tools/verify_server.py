@@ -24,6 +24,7 @@ import tempfile
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -95,17 +96,42 @@ def _wait_cmd(port, cid, timeout):
     return rec
 
 
-def firmware_body(samples, source="SC7A20", ask=False, question=None):
+def _c_json_escape(s):
+    """逐字节复刻 transport.c 的 json_escape_append()。
+
+    固件只转义这五个字符，其余（含非 ASCII）原样输出 UTF-8 字节 —— 设备名是
+    用户在配网页手填的，一个裸引号就能把整帧 JSON 打坏，所以这个转义是硬契约。
+    """
+    out = []
+    for ch in s:
+        if ch == '"':
+            out.append('\\"')
+        elif ch == "\\":
+            out.append("\\\\")
+        elif ch == "\n":
+            out.append("\\n")
+        elif ch == "\r":
+            out.append("\\r")
+        elif ch == "\t":
+            out.append("\\t")
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def firmware_body(samples, source="SC7A20", ask=False, question=None, device="rw1-AB12"):
     """逐字节复刻 device/main/transport.c build_body() 的输出。
 
     固件是**手写** JSON（刻意不用 cJSON，因为 cJSON 用 %1.15g 打印 double，
     float 0.012f 会输出 "0.0120000001634057"，50 样本批次要 2.7KB）。所以
     C 那边的格式串和服务端解析器之间是一份隐式契约——这里把它钉死：
     任何一边改了格式，这个用例都会红。
+
+    字段顺序也照抄：device 在最前（服务端拿到第一件事就是按它分片）。
     """
     pts = ",".join("[%.3f,%.3f,%.3f]" % s for s in samples)
-    body = ('{"batch":[%s],"x":%.3f,"y":%.3f,"z":%.3f,"source":"%s","ask":%s'
-            % (pts, samples[-1][0], samples[-1][1], samples[-1][2],
+    body = ('{"device":"%s","batch":[%s],"x":%.3f,"y":%.3f,"z":%.3f,"source":"%s","ask":%s'
+            % (_c_json_escape(device), pts, samples[-1][0], samples[-1][1], samples[-1][2],
                source, "true" if ask else "false"))
     if ask:
         body += ',"q":"%s"' % question
@@ -517,6 +543,103 @@ def main():
             post_json("http://127.0.0.1:%d/api/command" % port, {"name": "capture_once"})
         n = len(get_json("http://127.0.0.1:%d/api/commands" % port).get("commands", []))
         check("命令条数被限制在 20 条以内", n <= 20, "实际: %d 条" % n)
+
+        # ---- 18. 多设备（PROPOSAL §4.1 / 优先级 ③）---------------------------
+        # 这一节必须放在最后：它往服务端注册了新设备，会改变"最近上报过的设备"
+        # 是哪一台，而前面所有小节都是靠那个回退语义（不带 ?device=）工作的。
+        print("\n[17] 多设备：按 device 分片 + 定向下发 + 名字清洗")
+        dev_a = "第三组-07"          # 中文名（课堂里学生多半这么起名）
+        dev_b = "rw1 A1B2"           # 带空格，顺带验证空白压缩
+        quote_ = lambda s: urllib.parse.quote(s, safe="")
+
+        def api(path, dev=None):
+            url = "http://127.0.0.1:%d%s" % (port, path)
+            if dev is not None:
+                url += ("&" if "?" in path else "?") + "device=" + quote_(dev)
+            return get_json(url)
+
+        # A 向右倾斜、B 向上倾斜（屏幕坐标系 +y 向下，所以 y<0 是"上"）
+        for _ in range(6):
+            post_raw("http://127.0.0.1:%d/api/telemetry" % port,
+                     firmware_body([(0.72, 0.0, 0.70)] * 50, device=dev_a))
+            post_raw("http://127.0.0.1:%d/api/telemetry" % port,
+                     firmware_body([(0.0, -0.99, 0.10)] * 50, device="  " + dev_b + "  "))
+            time.sleep(0.03)
+
+        a = api("/api/latest", dev_a)
+        b = api("/api/latest", dev_b)
+        check("A 台的活动独立（向右倾斜）", a["activity"] == "静置·向右倾斜",
+              "实际: %s" % a["activity"])
+        check("B 台的活动独立（向上倾斜）", b["activity"] == "静置·向上倾斜",
+              "实际: %s" % b["activity"])
+        check("设备名首尾空白被压缩", b.get("device") == dev_b, "实际: %r" % b.get("device"))
+
+        devs = api("/api/devices").get("devices", [])
+        ids = [d["id"] for d in devs]
+        check("设备列表里两台都在", dev_a in ids and dev_b in ids, "实际: %s" % ids)
+        check("设备列表带在线状态与最后上报时间",
+              bool(devs) and all(("online" in d and "age" in d and "posts_ok" in d)
+                                 for d in devs), "实际: %s" % (devs[:1],))
+        # 正确的判据不是"'-' 不在列表里"——前面各节不带 device 的帧本来就会落到
+        # 默认设备 '-' 上，它是**真的上报过**的。要钉的是"从没上报过的占位设备
+        # 不该被列出来"（否则单板场景下页面会多出一个空的 '- ' 条目）。
+        check("设备列表里每一项都真的上报过（无空占位）",
+              bool(devs) and all(d["posts_ok"] > 0 for d in devs),
+              "实际: %s" % [(d["id"], d["posts_ok"]) for d in devs])
+
+        # 定向下发：只发给 A，B 的队列必须干净
+        ra = post_json("http://127.0.0.1:%d/api/command" % port,
+                       {"name": "led_blink", "device": dev_a})
+        check("下发响应回带目标设备", ra.get("device") == dev_a,
+              "实际: %s" % ra.get("device"))
+        ca = api("/api/commands", dev_a).get("commands", [])
+        cb = api("/api/commands", dev_b).get("commands", [])
+        check("命令只进了 A 的队列",
+              any(c["id"] == ra["id"] for c in ca) and not any(c["id"] == ra["id"] for c in cb),
+              "A=%d 条 / B=%d 条" % (len(ca), len(cb)))
+
+        # 未知设备名 → 回退到"最近上报过的那台"，而不是 404 让页面白屏
+        fb = api("/api/latest", "这个设备不存在")
+        check("未知设备名回退到最近上报的设备", fb.get("device") in (dev_a, dev_b),
+              "实际: %s" % fb.get("device"))
+
+        # 设备名是**用户输入**（配网页手填），必须能安全穿过手写 JSON：
+        # 引号/反斜杠由固件端 json_escape_append() 转义，服务端要能原样还原。
+        weird = 'a"b\\c'
+        post_raw("http://127.0.0.1:%d/api/telemetry" % port,
+                 firmware_body([(0.0, 0.0, 1.0)] * 20, device=weird))
+        ids2 = [d["id"] for d in api("/api/devices")["devices"]]
+        check("带引号/反斜杠的设备名能安全往返", weird in ids2, "实际: %s" % ids2)
+
+        # 控制字符必须剥掉：\n 会把 SSE 的"一行一个 data:"分帧打断
+        post_raw("http://127.0.0.1:%d/api/telemetry" % port,
+                 firmware_body([(0.0, 0.0, 1.0)] * 20, device="bad\tname\nx"))
+        ids3 = [d["id"] for d in api("/api/devices")["devices"]]
+        check("设备名里的控制字符被剥掉", "badnamex" in ids3, "实际: %s" % ids3)
+
+        # 过长的设备名要截断（否则畸形负载能把内存顶爆）
+        post_raw("http://127.0.0.1:%d/api/telemetry" % port,
+                 firmware_body([(0.0, 0.0, 1.0)] * 20, device="y" * 40))
+        ids4 = [d["id"] for d in api("/api/devices")["devices"]]
+        check("过长的设备名被截到 32 字符", ("y" * 32 in ids4) and ("y" * 33 not in ids4),
+              "实际: %s" % [i for i in ids4 if i.startswith("y")])
+
+        # SSE 也要按设备过滤，并带上设备列表（前端靠它画设备卡片）
+        try:
+            with OPENER.open("http://127.0.0.1:%d/api/stream?device=%s"
+                             % (port, quote_(dev_a)), timeout=6) as r:
+                line = r.readline().decode("utf-8", "replace")
+            sse_ok = line.startswith("data: ") and dev_b in line
+        except Exception as exc:  # noqa: BLE001
+            line, sse_ok = "读取失败: %s" % exc, False
+        check("SSE 首帧带设备列表", sse_ok, "实际: %s" % line[:90])
+
+        # 旧固件（不带 device 字段）仍然落在默认设备上，不报错
+        post_raw("http://127.0.0.1:%d/api/telemetry" % port,
+                 firmware_body([(0.0, 0.0, 1.0)] * 20).replace('"device":"rw1-AB12",', ""))
+        check("去掉 device 字段的旧固件仍被接受（归到默认设备）",
+              api("/api/latest").get("device") == "-",
+              "实际: %s" % api("/api/latest").get("device"))
 
 
     finally:

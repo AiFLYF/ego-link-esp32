@@ -39,6 +39,7 @@ import time
 import urllib.request
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import unquote
 
 # --------------------------------------------------------------------------
 # 可调参数
@@ -79,38 +80,174 @@ FALL_AUTO_ALERT = True    # 判定跌落时自动下发 LED 告警（远端物�
 ACTIVITY_IDLE = "等待数据…"
 
 # --------------------------------------------------------------------------
-# 全局状态（GIL + 一把锁保护即可，数据量极小）
+# 全局状态
+#
+# 单板时代只有一个 STATE 字典；多板场景（一个班 20 块板连同一个服务器）必须按设备
+# 分开，否则两块板的姿态球会互相覆盖 —— 那正是"配网做完了，结果 20 块板一起挤进
+# 同一个单设备仪表盘"的尴尬局面（PROPOSAL §4.1）。
+#
+# 分片原则：**一把锁保护全部设备**。每台设备的数据量极小（一个 8 秒窗口 + 200 条
+# 事件），拆成多把锁只会引入死锁风险、换不到任何并发收益；而跨设备操作
+# （命令超时看护、设备列表）本来就要同时看多台，一把锁反而更简单。
 # --------------------------------------------------------------------------
 LOCK = threading.Lock()
-SAMPLES = deque(maxlen=MAX_WINDOW)        # [(ts, x, y, z)]，x/y 为屏幕坐标
-SHAKE_TIMES = deque(maxlen=256)           # 晃动事件时间戳（窗口内计数用）
-EVENTS = deque(maxlen=200)                # 事件流（网页显示）
-COMMANDS = {}                             # request_id -> 命令记录
-COMMAND_QUEUE = deque()                   # 待下发的 request_id（FIFO）
-CMD_SEQ = 0                               # 生成可读 request_id 的递增序号
-STATE = {
-    "device_online": False,
-    "last_post": 0.0,
-    "source": "-",
-    "latest": None,                        # 最近一帧原始数据
-    "activity": ACTIVITY_IDLE,
-    "step_count": 0,
-    "shake_count": 0,
-    "ai_reply": "",
-    "ai_pending": False,
-    "ai_mode": "规则AI",
-    "sample_hz": 0.0,                      # 实测采样率（由批量大小与到达间隔推算）
-    "dt_trusted": 0.0,                     # 最近一次可信的采样间隔（P1-6：晚到帧不参与）
-    "boot_time": time.time(),
-}
+
+DEFAULT_DEVICE = "-"        # 不带 device 字段的老固件都归到这里（向后兼容）
+DEVICE_ID_MAX = 32          # 设备名长度上限，够写「第三组-07」这种
+MAX_DEVICES = 32            # 同时在册设备上限；超出时淘汰最久没上报的那台
+
+
+class Device:
+    """一台板子在服务端的全部状态。
+
+    刻意用 __slots__：设备数上限 32，但每台都可能持有 1200 样本的窗口，
+    固定布局能少一层每实例字典。
+    """
+
+    __slots__ = ("id", "samples", "shake_times", "events", "commands",
+                 "queue", "seq", "st")
+
+    def __init__(self, did):
+        self.id = did
+        self.samples = deque(maxlen=MAX_WINDOW)   # [(ts, x, y, z)]，x/y 为屏幕坐标
+        self.shake_times = deque(maxlen=256)      # 晃动事件时间戳（窗口内计数用）
+        self.events = deque(maxlen=200)           # 事件流（网页显示）
+        self.commands = {}                        # request_id -> 命令记录
+        self.queue = deque()                      # 待下发的 request_id（FIFO）
+        self.seq = 0                              # 生成可读 request_id 的递增序号
+        self.st = {
+            "device": did,
+            "device_online": False,
+            "last_post": 0.0,
+            "posts_ok": 0,                        # 成功上报帧数（网页顶栏「↑N 帧」）
+            "source": "-",
+            "latest": None,                       # 最近一帧原始数据
+            "activity": ACTIVITY_IDLE,
+            "step_count": 0,
+            "shake_count": 0,
+            "ai_reply": "",
+            "ai_pending": False,
+            "ai_mode": "规则AI",
+            "sample_hz": 0.0,                     # 实测采样率（由批量大小与到达间隔推算）
+            "dt_trusted": 0.0,                    # 最近一次可信的采样间隔（P1-6：晚到帧不参与）
+            "fall_active": False,
+            "boot_time": time.time(),
+        }
+
+
+DEVICES = {DEFAULT_DEVICE: Device(DEFAULT_DEVICE)}
 
 LOGGER = None                              # 由 main() 注入的 JsonlLogger
 
 
-def push_event(kind, text):
-    EVENTS.appendleft({"ts": time.time(), "kind": kind, "text": text})
+def clean_device_id(raw):
+    """把上报/查询里的设备名收敛成安全的 key。
+
+    **允许中文**：课堂里学生多半会填「第三组-07」这种名字，用 ASCII 白名单会把它们
+    整串吃成空串、全班退化成同一个设备。JSON 与 SSE 对任意 Unicode 都是安全的，
+    HTML 侧的转义由前端负责，所以这里只做三件真正必要的事：
+      - 去掉不可打印字符（换行/制表/NUL 会破坏 SSE 的「一行一个 data:」分帧）
+      - 把连续空白压成一个空格（否则「rw1  07」和「rw1 07」是两台板）
+      - 限长（避免一个 4 MB 的畸形 device 字段把内存顶爆）
+    """
+    if raw is None:
+        return DEFAULT_DEVICE
+    s = raw if isinstance(raw, str) else str(raw)
+    s = "".join(ch for ch in s if ch.isprintable())
+    s = " ".join(s.split())[:DEVICE_ID_MAX]
+    return s or DEFAULT_DEVICE
+
+
+def get_device(did):
+    """按 id 取设备，没有就新建一台。**调用方必须已持有 LOCK。**"""
+    dev = DEVICES.get(did)
+    if dev is None:
+        if len(DEVICES) >= MAX_DEVICES:
+            # 淘汰最久没上报的那台。正在上报的设备永远不会被选中，
+            # 因为它的 last_post 一定比谁都新。
+            victim = min(DEVICES.values(), key=lambda d: d.st["last_post"])
+            if victim.id != did:
+                DEVICES.pop(victim.id, None)
+        dev = Device(did)
+        DEVICES[did] = dev
+    return dev
+
+
+def pick_device(did=None):
+    """解析「这次要操作哪台设备」。**调用方必须已持有 LOCK。**
+
+    - 给了 did 且在册 → 就用它
+    - 没给 did → 用**最近上报过**的那台（老固件不带 device 字段、单板场景下
+      /api/latest 与 /api/commands 都不带 ?device=，向后兼容全靠这条）
+    - 给了 did 但不在册（拼错、或刚被淘汰）→ 也退回「最近上报过」的那台；
+      响应里会带上真实的 device id，前端据此自我纠正。
+      比返回 404 让整个页面白屏友好得多。
+    """
+    if did is not None:
+        dev = DEVICES.get(did)
+        if dev is not None:
+            return dev
+    live = [d for d in DEVICES.values() if d.st["last_post"] > 0.0]
+    if live:
+        return max(live, key=lambda d: d.st["last_post"])
+    return DEVICES[DEFAULT_DEVICE]
+
+
+def snapshot(dev):
+    """一台设备的完整快照。**调用方必须已持有 LOCK。**"""
+    snap = dict(dev.st)
+    snap["events"] = list(dev.events)
+    snap["commands"] = commands_snapshot(dev)
+    return snap
+
+
+def devices_snapshot(now=None):
+    """所有「上报过」的设备的一句话摘要，给仪表盘的设备列表用。
+
+    **调用方必须已持有 LOCK。** 从没上报过的占位设备不列出来 —— 否则单板场景下
+    页面会多出一个空的「-」条目。
+    """
+    now = time.time() if now is None else now
+    out = []
+    for dev in DEVICES.values():
+        st = dev.st
+        if st["last_post"] <= 0.0:
+            continue
+        out.append({
+            "id": dev.id,
+            "online": bool(st["device_online"]),
+            "age": round(max(0.0, now - st["last_post"]), 1),
+            "source": st["source"],
+            "activity": st["activity"],
+            "sample_hz": st["sample_hz"],
+            "step_count": st["step_count"],
+            "shake_count": st["shake_count"],
+            "posts_ok": st["posts_ok"],
+        })
+    # 在线的排前面，同状态按名字排 —— 列表顺序稳定，刷新时不会跳来跳去
+    out.sort(key=lambda d: (not d["online"], d["id"]))
+    return out
+
+
+def query_param(query, name):
+    """从原始查询串里取一个参数（只需要一层，不必上 parse_qs）。
+
+    用 unquote 而不是 unquote_plus：前端用 encodeURIComponent 编码，
+    空格会变成 %20；把裸 '+' 当空格解释反而会把设备名里的 '+' 改掉。
+    """
+    for part in (query or "").split("&"):
+        if not part:
+            continue
+        key, _, value = part.partition("=")
+        if key == name:
+            return unquote(value)
+    return None
+
+
+def push_event(dev, kind, text):
+    dev.events.appendleft({"ts": time.time(), "kind": kind, "text": text})
     if LOGGER is not None:
-        LOGGER.event(kind, text)
+        LOGGER.event(dev.id, kind, text)
 
 
 def clip_utf8(text, limit):
@@ -180,13 +317,12 @@ def _mark(rec, state, ts=None):
     rec["history"].append([state, ts if ts is not None else time.time()])
 
 
-def new_command(name, params=None):
-    """建一条待下发的命令，返回 request_id。"""
-    global CMD_SEQ
+def new_command(dev, name, params=None):
+    """给某台设备建一条待下发的命令，返回 request_id。"""
     with LOCK:
-        CMD_SEQ += 1
-        cid = "c-%d-%d" % (int(time.time()), CMD_SEQ)
-        COMMANDS[cid] = {
+        dev.seq += 1
+        cid = "c-%d-%d" % (int(time.time()), dev.seq)
+        dev.commands[cid] = {
             "id": cid,
             "name": name,
             "params": sanitize_params(name, params),
@@ -197,27 +333,27 @@ def new_command(name, params=None):
             "done": None,
             "result": None,
         }
-        COMMAND_QUEUE.append(cid)
+        dev.queue.append(cid)
         # 只保留最近 CMD_MAX_HISTORY 条，避免长跑时无限增长
-        while len(COMMANDS) > CMD_MAX_HISTORY:
-            oldest = min(COMMANDS, key=lambda k: COMMANDS[k]["created"])
-            COMMANDS.pop(oldest, None)
+        while len(dev.commands) > CMD_MAX_HISTORY:
+            oldest = min(dev.commands, key=lambda k: dev.commands[k]["created"])
+            dev.commands.pop(oldest, None)
             try:
-                COMMAND_QUEUE.remove(oldest)
+                dev.queue.remove(oldest)
             except ValueError:
                 pass
     return cid
 
 
-def take_command_for_board():
-    """取一条待下发的命令并标记为 sent。**调用方必须已持有 LOCK。**
+def take_command_for_board(dev):
+    """取一条该设备待下发的命令并标记为 sent。**调用方必须已持有 LOCK。**
 
     返回给板端的 {"id","name","params"}，或 None。一次只发一条，
     板子也一次只执行一条，语义简单、不会乱序。
     """
-    while COMMAND_QUEUE:
-        cid = COMMAND_QUEUE.popleft()
-        rec = COMMANDS.get(cid)
+    while dev.queue:
+        cid = dev.queue.popleft()
+        rec = dev.commands.get(cid)
         if rec is None or rec["state"] != "queued":
             continue
         rec["sent"] = time.time()
@@ -226,8 +362,8 @@ def take_command_for_board():
     return None
 
 
-def apply_command_result(res):
-    """处理板端回传的 result，返回一句给人看的事件文本（无关/不匹配则 None）。
+def apply_command_result(dev, res):
+    """处理某台设备回传的 result，返回一句给人看的事件文本（无关/不匹配则 None）。
 
     注意本函数内部会取 LOCK，不能在持有 LOCK 时调用。
     """
@@ -236,7 +372,7 @@ def apply_command_result(res):
     cid = str(res.get("id", ""))[:32]
     keep = ("id", "ok", "ms", "n", "x", "y", "z", "std", "err")
     with LOCK:
-        rec = COMMANDS.get(cid)
+        rec = dev.commands.get(cid)
         if rec is None:
             return None                      # 可能是被淘汰的老命令，静默忽略
         rec["done"] = time.time()
@@ -247,41 +383,45 @@ def apply_command_result(res):
         r = rec["result"]
         if rec["state"] == "done":
             if "x" in r:      # capture_once 有测量值
-                text = ("命令 %s 完成（往返 %.0f ms）：x=%+.3f y=%+.3f z=%+.3f，%d 样本，标准差 %.4f g"
-                        % (name, latency * 1000, r.get("x", 0.0), r.get("y", 0.0), r.get("z", 0.0),
+                text = ("[%s] 命令 %s 完成（往返 %.0f ms）：x=%+.3f y=%+.3f z=%+.3f，%d 样本，标准差 %.4f g"
+                        % (dev.id, name, latency * 1000, r.get("x", 0.0), r.get("y", 0.0), r.get("z", 0.0),
                            r.get("n", 0), r.get("std", 0.0)))
             else:             # led_blink / led_set 只有执行确认
-                text = "命令 %s 完成（往返 %.0f ms）" % (name, latency * 1000)
+                text = "[%s] 命令 %s 完成（往返 %.0f ms）" % (dev.id, name, latency * 1000)
         else:
-            text = "命令 %s 执行失败：%s" % (name, r.get("err", "未说明"))
+            text = "[%s] 命令 %s 执行失败：%s" % (dev.id, name, r.get("err", "未说明"))
     return text
 
 
 def expire_commands():
-    """把长时间没有进展的命令判为超时，返回超时的命令名列表。
+    """把长时间没有进展的命令判为超时，返回 [(设备, 命令名)] 列表。
 
-    **`queued` 也要算**：设备离线时下发的命令会一直停在 queued，而 COMMANDS
-    上限只有 CMD_MAX_HISTORY 条——长时间离线会把历史全占满，新命令被挤掉；
+    **`queued` 也要算**：设备离线时下发的命令会一直停在 queued，而每台设备的命令
+    上限只有 CMD_MAX_HISTORY 条 —— 长时间离线会把历史全占满，新命令被挤掉；
     设备几小时后重新上线还会被补发一批几小时前的操作（比如"闪灯"）。
     所以 queued 以 created 为基准计时，sent 以 sent 为基准。
+
+    看护必须扫**全部**设备：课堂场景下离线的是其中几块板，不能只盯着当前选中的那台。
     """
     now = time.time()
     expired = []
     with LOCK:
-        for rec in COMMANDS.values():
-            if rec["state"] not in ("queued", "sent"):
-                continue
-            base = rec["sent"] or rec["created"]
-            if (now - base) > CMD_TIMEOUT_S:
-                rec["done"] = now
-                _mark(rec, "timeout", now)
-                expired.append(rec["name"])
+        for dev in list(DEVICES.values()):
+            for rec in dev.commands.values():
+                if rec["state"] not in ("queued", "sent"):
+                    continue
+                base = rec["sent"] or rec["created"]
+                if (now - base) > CMD_TIMEOUT_S:
+                    rec["done"] = now
+                    _mark(rec, "timeout", now)
+                    expired.append((dev, rec["name"]))
     return expired
 
 
-def commands_snapshot():
-    """按时间倒序返回最近若干条命令的副本（**调用方必须已持有 LOCK**）。"""
-    return [dict(r) for r in sorted(COMMANDS.values(), key=lambda r: r["created"], reverse=True)]
+def commands_snapshot(dev):
+    """按时间倒序返回该设备最近若干条命令的副本（**调用方必须已持有 LOCK**）。"""
+    return [dict(r) for r in sorted(dev.commands.values(),
+                                    key=lambda r: r["created"], reverse=True)]
 
 
 # --------------------------------------------------------------------------
@@ -309,7 +449,7 @@ class JsonlLogger:
         threading.Thread(target=self._run, name="jsonl", daemon=True).start()
 
     # ---- 生产者 ----------------------------------------------------------
-    def telemetry(self, ts, source, pts, dt):
+    def telemetry(self, ts, device, source, pts, dt):
         if not self.log_telemetry or not pts:
             return
         hz = 1.0 / dt if dt > 0 else 0.0
@@ -318,13 +458,15 @@ class JsonlLogger:
         self._put({
             "k": "t",
             "ts": round(ts, 3),
+            "dev": device,
             "src": source,
             "hz": round(hz, 1),
             "s": [[round(x, 3), round(y, 3), round(z, 3)] for (x, y, z) in thin],
         })
 
-    def event(self, kind, text):
-        self._put({"k": "e", "ts": round(time.time(), 3), "kind": kind, "text": text})
+    def event(self, device, kind, text):
+        self._put({"k": "e", "ts": round(time.time(), 3), "dev": device,
+                   "kind": kind, "text": text})
 
     def _put(self, rec):
         try:
@@ -477,17 +619,17 @@ def zero_cross_rate(mags, dt):
     return (crossings / span / 2.0) if span > 0 else 0.0
 
 
-def analyze(now, pts, dt):
-    """把一批样本并入滑动窗口，返回 (活动标签, 事件列表)。"""
+def analyze(dev, now, pts, dt):
+    """把一批样本并入该设备的滑动窗口，返回 (活动标签, 事件列表)。"""
     events = []
-    prev_activity = STATE["activity"]
-    prev_fall = STATE.get("fall_active", False)
+    prev_activity = dev.st["activity"]
+    prev_fall = dev.st.get("fall_active", False)
 
     n = len(pts)
     for i, (x, y, z) in enumerate(pts):
-        SAMPLES.append((now - (n - 1 - i) * dt, x, y, z))
+        dev.samples.append((now - (n - 1 - i) * dt, x, y, z))
 
-    win = [s for s in SAMPLES if now - s[0] <= WINDOW_S]
+    win = [s for s in dev.samples if now - s[0] <= WINDOW_S]
     if not win:
         return ACTIVITY_IDLE, events
 
@@ -503,26 +645,26 @@ def analyze(now, pts, dt):
     r_peak = max(r_mags)
 
     steps = count_steps(win, mags, mean)
-    STATE["step_count"] = steps
+    dev.st["step_count"] = steps
 
     zcr = zero_cross_rate(r_mags, dt)          # 起伏频率，用来区分步行与晃动
 
     # ---- 晃动：窗口内计数（修复前是开机累计值，文案却说"最近 8 秒内"）----
     shaking = r_std > MOTION_STD and zcr > SHAKE_ZCR
     if shaking:
-        if not SHAKE_TIMES or (now - SHAKE_TIMES[-1]) >= SHAKE_MIN_GAP_S:
-            SHAKE_TIMES.append(now)
+        if not dev.shake_times or (now - dev.shake_times[-1]) >= SHAKE_MIN_GAP_S:
+            dev.shake_times.append(now)
             events.append(("shake", "检测到晃动/敲击（%.1f Hz）" % zcr))
-    while SHAKE_TIMES and (now - SHAKE_TIMES[0]) > WINDOW_S:
-        SHAKE_TIMES.popleft()
-    STATE["shake_count"] = len(SHAKE_TIMES)
+    while dev.shake_times and (now - dev.shake_times[0]) > WINDOW_S:
+        dev.shake_times.popleft()
+    dev.st["shake_count"] = len(dev.shake_times)
 
     # ---- 跌落：短窗内的连续失重 ----
     fall_run = max_freefall_run(r_mags, dt)
     fall_active = fall_run > 0
     if fall_active and not prev_fall:
         events.append(("fall", "检测到疑似跌落（失重 %.0f ms）" % (fall_run * dt * 1000)))
-    STATE["fall_active"] = fall_active
+    dev.st["fall_active"] = fall_active
 
     # ---- 分类 ----
     if fall_active:
@@ -545,16 +687,16 @@ def analyze(now, pts, dt):
     return activity, events
 
 
-def ai_summary():
-    """基于统计窗口生成中文摘要（本地模板 / LLM 均可复用）。"""
+def ai_summary(dev):
+    """基于该设备的统计窗口生成中文摘要（本地模板 / LLM 均可复用）。"""
     now = time.time()
     with LOCK:
-        n = len(SAMPLES)
-        steps = STATE["step_count"]
-        shakes = STATE["shake_count"]
-        act = STATE["activity"]
-        src = STATE["source"]
-        last = STATE["latest"] or (0, 0, 0, 0)
+        n = len(dev.samples)
+        steps = dev.st["step_count"]
+        shakes = dev.st["shake_count"]
+        act = dev.st["activity"]
+        src = dev.st["source"]
+        last = dev.st["latest"] or (0, 0, 0, 0)
     if n == 0:
         return "我还没有收到任何传感器数据，请检查开发板是否连上了 WiFi 和服务器。"
     x, y, z = last[1], last[2], last[3]
@@ -573,7 +715,7 @@ def ai_summary():
     return base
 
 
-def ask_llm(question):
+def ask_llm(dev, question):
     """可选：调用 OpenAI 兼容大模型。未配置/失败返回 None → 回退本地模板。"""
     key = os.environ.get("RW1_LLM_API_KEY")
     if not key:
@@ -586,7 +728,7 @@ def ask_llm(question):
             {"role": "system",
              "content": "你是嵌入式课堂助手。回答要简短（120 字以内），口语化，用中文，"
                         "不要用 Markdown 标题或列表。"},
-            {"role": "user", "content": "开发板传感器情况：%s\n同学想问：%s" % (ai_summary(), question)},
+            {"role": "user", "content": "开发板传感器情况：%s\n同学想问：%s" % (ai_summary(dev), question)},
         ],
         "max_tokens": 300,
     }
@@ -600,50 +742,52 @@ def ask_llm(question):
             data = json.loads(resp.read().decode("utf-8"))
         return data["choices"][0]["message"]["content"].strip()
     except Exception as exc:  # noqa: BLE001 —— 任何失败都回退本地模板
-        push_event("warn", "大模型调用失败(%s)，已用本地AI回复" % exc.__class__.__name__)
+        push_event(dev, "warn", "大模型调用失败(%s)，已用本地AI回复" % exc.__class__.__name__)
         return None
 
 
-def _llm_worker(question):
-    """后台线程：调大模型，完成后把结果写回 STATE。
+def _llm_worker(dev, question):
+    """后台线程：调大模型，完成后把结果写回该设备的状态。
 
     注意 ai_summary() 内部会取 LOCK，必须在进入 with LOCK 之前调用，否则自锁。
     """
-    reply = ask_llm(question)
+    reply = ask_llm(dev, question)
     mode = "大模型" if reply else "规则AI"
     if not reply:
-        reply = ai_summary()
+        reply = ai_summary(dev)
     with LOCK:
-        STATE["ai_pending"] = False
-        STATE["ai_reply"] = reply
-        STATE["ai_mode"] = mode
-    push_event("ai" if mode == "大模型" else "warn",
+        dev.st["ai_pending"] = False
+        dev.st["ai_reply"] = reply
+        dev.st["ai_mode"] = mode
+    push_event(dev, "ai" if mode == "大模型" else "warn",
                "%s回复：%s" % (mode, reply[:60]))
 
 
-def request_ai(question):
+def request_ai(dev, question):
     """处理一次板端提问，**立即**返回文本；大模型在后台生成，稍后自动生效。
 
     板端每个遥测周期都会带回最新的 ai_reply，所以后台结果下一帧就会显示，
     不需要板端等待，也就彻底消除了"板端 3s 超时 vs 服务端 8s 等待"的死结。
+
+    `ai_pending` 是**按设备**的：A 板在等大模型不该让 B 板的提问被吞掉。
     """
     if os.environ.get("RW1_LLM_API_KEY"):
         with LOCK:
-            if STATE["ai_pending"]:
-                return STATE["ai_reply"] or "我还在想上一个问题，稍等一下…"
-            STATE["ai_pending"] = True
-            STATE["ai_reply"] = "正在思考…"
-            STATE["ai_mode"] = "大模型"
-        push_event("ask", "板端提问「%s」→ 已转交大模型" % question)
-        threading.Thread(target=_llm_worker, args=(question,), daemon=True,
+            if dev.st["ai_pending"]:
+                return dev.st["ai_reply"] or "我还在想上一个问题，稍等一下…"
+            dev.st["ai_pending"] = True
+            dev.st["ai_reply"] = "正在思考…"
+            dev.st["ai_mode"] = "大模型"
+        push_event(dev, "ask", "板端提问「%s」→ 已转交大模型" % question)
+        threading.Thread(target=_llm_worker, args=(dev, question), daemon=True,
                          name="llm").start()
         return "正在思考…"
 
-    reply = ai_summary()
+    reply = ai_summary(dev)
     with LOCK:
-        STATE["ai_reply"] = reply
-        STATE["ai_mode"] = "规则AI"
-    push_event("ask", "板端提问「%s」→ %s" % (question, reply[:40]))
+        dev.st["ai_reply"] = reply
+        dev.st["ai_mode"] = "规则AI"
+    push_event(dev, "ask", "板端提问「%s」→ %s" % (question, reply[:40]))
     return reply
 
 
@@ -698,26 +842,34 @@ class Handler(BaseHTTPRequestHandler):
         self._send(204, b"")
 
     def do_GET(self):
-        path = self.path.split("?")[0]
+        path, _, query = self.path.partition("?")
         if path == "/":
             self._send(200, DASHBOARD_HTML, "text/html; charset=utf-8")
-        elif path == "/api/latest":
+        elif path == "/api/devices":
             with LOCK:
-                snap = dict(STATE)
+                devs = devices_snapshot()
+            self._send(200, json.dumps({"ok": True, "devices": devs, "now": time.time()},
+                                       ensure_ascii=False))
+        elif path == "/api/latest":
+            want = query_param(query, "device")
+            with LOCK:
+                dev = pick_device(clean_device_id(want) if want else None)
+                snap = snapshot(dev)
                 snap["samples"] = [[round(t, 2), x, y, z]
-                                   for (t, x, y, z) in decimate(SAMPLES, 240)]
-                snap["events"] = list(EVENTS)
-                snap["commands"] = commands_snapshot()
+                                   for (t, x, y, z) in decimate(dev.samples, 240)]
             self._send(200, json.dumps(snap, ensure_ascii=False))
         elif path == "/api/commands":
+            want = query_param(query, "device")
             with LOCK:
-                cmds = commands_snapshot()
-            self._send(200, json.dumps({"ok": True, "commands": cmds,
+                dev = pick_device(clean_device_id(want) if want else None)
+                cmds = commands_snapshot(dev)
+                did = dev.id
+            self._send(200, json.dumps({"ok": True, "device": did, "commands": cmds,
                                         "names": list(CMD_NAMES)}, ensure_ascii=False))
         elif path == "/api/logs":
             self._send(200, json.dumps(LOGGER.stats() if LOGGER else {}, ensure_ascii=False))
         elif path == "/api/stream":
-            self._sse()
+            self._sse(query)
         else:
             self._send(404, json.dumps({"ok": False, "error": "not found"}))
 
@@ -738,15 +890,22 @@ class Handler(BaseHTTPRequestHandler):
             self._send(400, json.dumps(
                 {"ok": False, "error": "unknown command: %s" % name}, ensure_ascii=False))
             return
+        # 定向下发：带上 device 就发给那一台，不带就发给"最近上报过的"那台
+        # （单板场景下网页不带这个字段，行为和以前完全一样）。
+        want = msg.get("device")
+        did = clean_device_id(want) if want else None
         with LOCK:
-            online = STATE["device_online"]
-        cid = new_command(name, msg.get("params"))
+            dev = pick_device(did)
+            online = dev.st["device_online"]
+            target = dev.id
+        cid = new_command(dev, name, msg.get("params"))
         with LOCK:
-            rec = COMMANDS.get(cid)
+            rec = dev.commands.get(cid)
             pdesc = (" %s" % json.dumps(rec["params"], ensure_ascii=False)) if rec and rec["params"] else ""
-        push_event("cmd", "下发命令 %s%s（%s）" % (name, pdesc, cid))
+        push_event(dev, "cmd", "下发命令 %s%s（%s → %s）" % (name, pdesc, cid, target))
         self._send(200, json.dumps(
-            {"ok": True, "id": cid, "device_online": online}, ensure_ascii=False))
+            {"ok": True, "id": cid, "device": target, "device_online": online},
+            ensure_ascii=False))
 
     # ---- telemetry (板 → 服务器 → 板) --------------------------------------
     def _telemetry(self):
@@ -758,9 +917,14 @@ class Handler(BaseHTTPRequestHandler):
             self._send(400, json.dumps({"ok": False, "error": "bad payload"}))
             return
 
+        # 设备名是外部输入：清洗、限长，然后按它分片。老固件不带这个字段，
+        # clean_device_id(None) → "-"，全部落进默认设备，行为与单板时代一致。
+        dev = None
         with LOCK:
-            prev_post = STATE["last_post"]
-            was_online = STATE["device_online"]
+            dev = get_device(clean_device_id(msg.get("device")))
+            st = dev.st
+            prev_post = st["last_post"]
+            was_online = st["device_online"]
             # 采样间隔由"本批样本数 / 两批到达的间隔"自校准，不依赖板端上报
             # dt 由"本批样本数 / 两批到达的间隔"自校准。但**晚到的帧不可信**：
             # 若某帧因网络抖动晚到 3 秒，50 个样本的推断间隔会被算成 60 ms，
@@ -771,58 +935,60 @@ class Handler(BaseHTTPRequestHandler):
                 dt_est = (now - prev_post) / float(len(pts))
                 dt_est = min(0.6, max(0.002, dt_est))
                 if dt_est > DT_TRUST_MAX:
-                    dt = STATE["dt_trusted"] or DT_NOMINAL
+                    dt = st["dt_trusted"] or DT_NOMINAL
                 else:
                     dt = dt_est
-                    STATE["dt_trusted"] = dt_est
+                    st["dt_trusted"] = dt_est
             else:
                 dt = DT_NOMINAL
-            STATE["sample_hz"] = round(1.0 / dt, 1)
+            st["sample_hz"] = round(1.0 / dt, 1)
 
-            STATE["device_online"] = True
-            STATE["last_post"] = now
-            STATE["source"] = str(msg.get("source", "-"))[:24]
-            STATE["latest"] = (now, pts[-1][0], pts[-1][1], pts[-1][2])
+            st["device_online"] = True
+            st["last_post"] = now
+            st["posts_ok"] += 1
+            st["source"] = str(msg.get("source", "-"))[:24]
+            st["latest"] = (now, pts[-1][0], pts[-1][1], pts[-1][2])
             if not was_online:
-                push_event("info", "开发板已连接")
+                push_event(dev, "info", "设备 %s 已连接" % dev.id)
 
-            activity, events = analyze(now, pts, dt)
-            STATE["activity"] = activity
+            activity, events = analyze(dev, now, pts, dt)
+            st["activity"] = activity
             for kind, text in events:
-                push_event(kind, text)
+                push_event(dev, kind, text)
             fell = any(k == "fall" for k, _ in events)
-            src = STATE["source"]
+            src = st["source"]
             # 有排队中的命令就搭这一帧的响应发下去（一次一条）
-            cmd = take_command_for_board()
+            cmd = take_command_for_board(dev)
 
         if LOGGER is not None:
-            LOGGER.telemetry(now, src, pts, dt)
+            LOGGER.telemetry(now, dev.id, src, pts, dt)
 
         # 板端回传的上一条命令结果（必须在 LOCK 之外处理，apply_command_result 内部取锁）
-        cmd_text = apply_command_result(msg.get("result"))
+        cmd_text = apply_command_result(dev, msg.get("result"))
         if cmd_text:
-            push_event("cmd", cmd_text)
+            push_event(dev, "cmd", cmd_text)
 
         # 按键触发（第 3 周）：板子把 BOOT 按下的次数带上来，
         # 这样网页/日志能看到"物理动作真的发生了"，而不只是间接看到 ask。
         btn = msg.get("btn")
         if isinstance(btn, (int, float)) and btn > 0:
-            push_event("btn", "板端 BOOT 键按下 %d 次" % int(btn))
+            push_event(dev, "btn", "设备 %s 的 BOOT 键按下 %d 次" % (dev.id, int(btn)))
 
         # 远端物理反馈闭环：判定跌落就自动下发 LED 告警。
         # 必须在 LOCK 之外 —— new_command 内部要取锁，在锁里调用会死锁。
+        # 告警只发给摔的那台板：课堂里 20 块板同时闪灯就成噪音了。
         if fell and FALL_AUTO_ALERT:
-            aid = new_command("led_blink", {"pattern": "alert"})
-            push_event("alert", "判定跌落，自动下发 LED 告警（%s）" % aid)
+            aid = new_command(dev, "led_blink", {"pattern": "alert"})
+            push_event(dev, "alert", "判定跌落，自动下发 LED 告警（%s）" % aid)
 
         reply = ""
         if msg.get("ask"):                  # 板子 BOOT 键 → 请求一次 AI 交互
             question = str(msg.get("q", "我现在的状态怎么样？"))[:200]
-            reply = request_ai(question)    # 立刻返回；大模型走后台线程
+            reply = request_ai(dev, question)   # 立刻返回；大模型走后台线程
 
         with LOCK:
-            final_reply = reply or STATE["ai_reply"]
-            pending = STATE["ai_pending"]
+            final_reply = reply or dev.st["ai_reply"]
+            pending = dev.st["ai_pending"]
 
         out = {
             "ok": True,
@@ -853,7 +1019,8 @@ class Handler(BaseHTTPRequestHandler):
         return pts
 
     # ---- SSE (服务器 → 浏览器) ---------------------------------------------
-    def _sse(self):
+    def _sse(self, query=""):
+        want = query_param(query, "device")
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-store")
@@ -863,11 +1030,14 @@ class Handler(BaseHTTPRequestHandler):
         try:
             while True:
                 with LOCK:
-                    snap = dict(STATE)
-                    snap["events"] = list(EVENTS)
-                    snap["commands"] = commands_snapshot()
-                    snap["sample"] = list(SAMPLES[-1]) if SAMPLES else None
-                snap["now"] = time.time()
+                    now = time.time()
+                    # 每轮重新解析一次设备：选中的板子被淘汰/改名时，
+                    # 这里会自动退回"最近上报过的那台"，前端看到 device 变了就跟着切。
+                    dev = pick_device(clean_device_id(want) if want else None)
+                    snap = snapshot(dev)
+                    snap["devices"] = devices_snapshot(now)
+                    snap["sample"] = list(dev.samples[-1]) if dev.samples else None
+                snap["now"] = now
                 self.wfile.write(b"data: " + json.dumps(snap, ensure_ascii=False).encode("utf-8") + b"\n\n")
                 self.wfile.flush()
                 time.sleep(0.5)
@@ -942,6 +1112,23 @@ h1{font-size:19px;line-height:1.35}
 .pill.off i{animation:breathe 1.6s ease-in-out infinite}
 .pill.warn{color:var(--amber);border-color:#3a2f14;background:#1d1911}
 @keyframes breathe{0%,100%{opacity:1}50%{opacity:.25}}
+
+/* ---------- 设备列表（多板场景） ---------- */
+/* 只有 1 台板时不显示这一块 —— 单板课堂不该多出一张只有一个按钮的卡片 */
+.devlist{display:grid;gap:10px;grid-template-columns:repeat(auto-fill,minmax(240px,1fr))}
+.dev{
+  display:flex;flex-direction:column;gap:5px;text-align:left;
+  padding:11px 13px;border-radius:12px;cursor:pointer;
+  border:1px solid var(--line);background:var(--card-hi);
+  transition:border-color .18s,background .18s,box-shadow .18s;
+}
+.dev:hover{background:#222c3c;border-color:#37445a}
+.dev.sel{border-color:rgba(88,166,255,.7);background:#12202f;box-shadow:0 0 0 1px rgba(88,166,255,.22)}
+.dev .row1{display:flex;align-items:center;gap:8px;min-width:0}
+.dev .dot{width:8px;height:8px;border-radius:50%;flex:none}
+.dev .dot.off{animation:breathe 1.6s ease-in-out infinite}
+.dev .did{font-weight:650;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dev .meta{font-size:11px;color:var(--faint);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 
 /* ---------- 卡片网格 ---------- */
 .grid{display:grid;gap:14px;max-width:1400px;margin:0 auto;grid-template-columns:320px minmax(0,1fr) 320px}
@@ -1097,6 +1284,14 @@ footer{max-width:1400px;margin:18px auto 0;color:var(--faint);font-size:11px;lin
   </div>
 </header>
 
+<section class="card wide" id="devcard" hidden>
+  <div class="card-head">
+    <h2>设备</h2>
+    <span class="src" id="devcount"></span>
+  </div>
+  <div class="devlist" id="devs"></div>
+</section>
+
 <main class="grid">
   <section class="card hero">
     <div class="card-head"><h2>当前活动</h2><span class="src" id="src">—</span></div>
@@ -1150,7 +1345,7 @@ footer{max-width:1400px;margin:18px auto 0;color:var(--faint);font-size:11px;lin
 <section class="card wide">
   <div class="card-head">
     <h2>远程指令</h2>
-    <span class="src">指令搭在「下一帧遥测的响应」里下发，板子在再下一帧回传结果 —— 一次真实的硬件往返</span>
+    <span class="src">指令搭在「下一帧遥测的响应」里下发，板子在再下一帧回传结果 —— 一次真实的硬件往返；多台板时先在「设备」里点选目标</span>
   </div>
   <div class="row">
     <span id="cmdbts"></span>
@@ -1174,6 +1369,21 @@ footer{max-width:1400px;margin:18px auto 0;color:var(--faint);font-size:11px;lin
 "use strict";
 
 var $ = function(id){ return document.getElementById(id); };
+
+/* 设备名/事件文本都是**外部输入**（板端上报、且设备名由用户在配网页手填），
+   拼进 innerHTML 之前必须转义。 */
+var ESCMAP = { "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;" };
+function esc(s){
+  return String(s == null ? "" : s).replace(/[&<>"']/g, function(c){ return ESCMAP[c]; });
+}
+/* 「最后上报」的人话表述 */
+function ago(sec){
+  if (!(sec >= 0)) return "—";
+  if (sec < 1) return "刚刚";
+  if (sec < 60) return sec.toFixed(1) + " 秒前";
+  if (sec < 3600) return Math.round(sec/60) + " 分钟前";
+  return Math.round(sec/3600) + " 小时前";
+}
 
 /* ---------------- 语义色（与 device/main/ui.c 同一套） ---------------- */
 var C = { green:"#3fb950", blue:"#58a6ff", amber:"#e3b341", red:"#f85149",
@@ -1399,12 +1609,17 @@ function sendCmd(name, btn){
   var params = ui.toggle && name === "led_set" ? {on: !ledSteady} : (ui.params || {});
   if (btn) btn.disabled = true;
   $("cmdhint").textContent = "";
+  /* 带上当前选中的设备名 —— 不选就交给服务端用"最近上报的那台"（单板场景） */
+  var body = {name:name, params:params};
+  if (selDevice) body.device = selDevice;
   fetch("/api/command", {
     method:"POST", headers:{"Content-Type":"application/json"},
-    body: JSON.stringify({name:name, params:params})
+    body: JSON.stringify(body)
   }).then(function(r){ return r.json(); }).then(function(d){
     if (!d.ok){ $("cmdhint").textContent = "下发失败：" + (d.error || "未知错误"); return; }
-    $("cmdhint").textContent = "已下发 " + d.id + (d.device_online ? "" : "（注意：板子当前不在线）");
+    $("cmdhint").textContent = "已下发 " + d.id
+      + (d.device ? " → " + d.device : "")
+      + (d.device_online ? "" : "（注意：这块板子当前不在线）");
     pull();
   }).catch(function(e){
     $("cmdhint").textContent = "下发失败：" + e;
@@ -1456,13 +1671,70 @@ function renderEvents(evts){
   }
 }
 
+/* ---------------- 设备列表（多板） ---------------- */
+/* selDevice = null 表示"自动跟随最近上报的那台"（单板场景就是这样，永远不用点）。
+   用户点过某台之后就固定看它，直到那台消失。 */
+var selDevice = null, devHTML = "";
+
+function devQuery(){
+  return selDevice ? "?device=" + encodeURIComponent(selDevice) : "";
+}
+
+function renderDevices(list, current){
+  var card = $("devcard");
+  list = list || [];
+  /* 只有一台板时不显示这块 —— 单板课堂不该凭空多出一张卡片 */
+  if (list.length <= 1){ card.hidden = true; devHTML = ""; return; }
+  card.hidden = false;
+
+  var online = 0;
+  var h = list.map(function(d){
+    if (d.online) online++;
+    var color = d.online ? C.green : C.red;
+    var title = d.activity || "";
+    return '<div class="dev' + (d.id === current ? " sel" : "") + '" data-dev="' + esc(d.id) + '">'
+      + '<div class="row1"><span class="dot' + (d.online ? "" : " off") + '" style="background:' + color + '"></span>'
+      + '<span class="did">' + esc(d.id) + '</span></div>'
+      + '<div class="meta">' + (d.online ? "在线" : "离线") + ' · ' + ago(d.age)
+      + (d.source && d.source !== "-" ? " · " + esc(d.source) : "") + '</div>'
+      + '<div class="meta">' + esc(title) + '</div>'
+      + '</div>';
+  }).join("");
+
+  $("devcount").textContent = list.length + " 台 · 在线 " + online;
+  if (h === devHTML) return;
+  devHTML = h;
+  var host = $("devs");
+  host.innerHTML = h;
+  Array.prototype.forEach.call(host.querySelectorAll(".dev"), function(el){
+    el.onclick = function(){ selectDevice(el.getAttribute("data-dev")); };
+  });
+}
+
+function selectDevice(id){
+  if (!id || id === selDevice) return;
+  selDevice = id;
+  devHTML = "";        /* 清掉缓存，让选中态立刻重画 */
+  pull();              /* 先拉一次快照，不必等下一帧 SSE */
+  stream();            /* SSE 是按设备过滤的，换设备要重连 */
+}
+
 /* ---------------- 主刷新 ---------------- */
 var aiReply = "";
 function render(s){
+  /* 服务端实际给的是哪台：若和我们选的不一致（选中的被淘汰/改名了），跟着它走，
+     免得页面一直停在一个已经不存在的设备上。 */
+  if (selDevice && s.device && s.device !== selDevice){
+    selDevice = s.device;
+    devHTML = "";
+  }
+  renderDevices(s.devices, s.device || selDevice);
+
   devOnline = !!s.device_online;
   var dev = $("dev");
   dev.className = "pill " + (devOnline ? "on" : "off");
   dev.innerHTML = "<i></i>" + (devOnline ? "在线" : "离线");
+  if (selDevice) dev.title = selDevice;
 
   $("src").textContent = (s.source && s.source !== "-") ? s.source : "—";
   $("hzp").textContent = s.sample_hz ? (s.sample_hz + " Hz") : "— Hz";
@@ -1508,20 +1780,31 @@ function render(s){
 }
 
 function pull(){
-  fetch("/api/latest").then(function(r){ return r.json(); }).then(function(s){
+  fetch("/api/latest" + devQuery()).then(function(r){ return r.json(); }).then(function(s){
     samples = s.samples || [];
     drawChart();
     render(s);
   }).catch(function(){});
 }
 
+/* 换设备要重连 SSE（服务端按 ?device= 过滤）。用世代号防止旧连接的回调
+   把新连接的画面覆盖掉 —— 否则点一下设备，屏幕会闪回上一台的数据。 */
+var streamGen = 0, es = null;
 function stream(){
-  var es = new EventSource("/api/stream");
-  es.onmessage = function(e){
-    var s = JSON.parse(e.data);
-    render(s);
+  var gen = ++streamGen;
+  if (es){ try{ es.close(); }catch(e){} es = null; }
+  var s = new EventSource("/api/stream" + devQuery());
+  es = s;
+  s.onmessage = function(e){
+    if (gen !== streamGen) return;
+    render(JSON.parse(e.data));
   };
-  es.onerror = function(){ es.close(); setTimeout(stream, 2000); };
+  s.onerror = function(){
+    if (gen !== streamGen) return;
+    try{ s.close(); }catch(e){}
+    if (es === s) es = null;
+    setTimeout(stream, 2000);
+  };
 }
 
 /* ---------------- 启动 ---------------- */
@@ -1530,7 +1813,7 @@ fitCanvas();
 fetch("/api/logs").then(function(r){ return r.json(); }).then(function(l){
   if (l && l.dir) $("logdir").textContent = "落盘 " + l.dir;
 }).catch(function(){});
-fetch("/api/commands").then(function(r){ return r.json(); }).then(function(d){
+fetch("/api/commands" + devQuery()).then(function(r){ return r.json(); }).then(function(d){
   cmdNames = d.names || ["capture_once"];
   $("names").textContent = cmdNames.join(" / ");
   renderButtons();
@@ -1581,19 +1864,24 @@ def main():
         next_purge = time.time() + 86400
         while True:
             time.sleep(1.0)
+            now = time.time()
             with LOCK:
-                online = (time.time() - STATE["last_post"]) < DEVICE_TIMEOUT
-                if STATE["device_online"] and not online:
-                    push_event("info", "开发板连接超时，已标记离线")
-                    # P1-12：顺手复位跌落状态。否则掉线期间若正好处在跌落态，
-                    # 重新上线后第一次**真实**跌落不会触发事件
-                    # （analyze 里的判据是 fall_active and not prev_fall）。
-                    STATE["fall_active"] = False
-                    STATE["activity"] = ACTIVITY_IDLE
-                STATE["device_online"] = online
-            for name in expire_commands():
-                push_event("cmd", "命令 %s 超时（%.0f 秒内没有回传结果）"
-                           % (name, CMD_TIMEOUT_S))
+                for dev in list(DEVICES.values()):
+                    st = dev.st
+                    if st["last_post"] <= 0.0:
+                        continue          # 从没上报过的占位设备，不参与在线判定
+                    online = (now - st["last_post"]) < DEVICE_TIMEOUT
+                    if st["device_online"] and not online:
+                        push_event(dev, "info", "设备 %s 连接超时，已标记离线" % dev.id)
+                        # P1-12：顺手复位跌落状态。否则掉线期间若正好处在跌落态，
+                        # 重新上线后第一次**真实**跌落不会触发事件
+                        # （analyze 里的判据是 fall_active and not prev_fall）。
+                        st["fall_active"] = False
+                        st["activity"] = ACTIVITY_IDLE
+                    st["device_online"] = online
+            for dev, name in expire_commands():
+                push_event(dev, "cmd", "[%s] 命令 %s 超时（%.0f 秒内没有回传结果）"
+                           % (dev.id, name, CMD_TIMEOUT_S))
             # P1-11：日志清理原来只在 JsonlLogger 构造时跑一次，README 却写
             # 「保留 7 天」——服务器连续跑一个学期会一直涨。改成每天清一次。
             if LOGGER is not None and time.time() > next_purge:
@@ -1607,9 +1895,11 @@ def main():
     print(" AI 交互课 · PC 服务器已启动")
     print("   仪表盘:  http://localhost:%d/" % args.port)
     print("   遥测:    POST http://<本机IP>:%d/api/telemetry" % args.port)
+    print("   设备:    GET  http://<本机IP>:%d/api/devices" % args.port)
     print("   指令:    POST http://<本机IP>:%d/api/command   {\"name\":\"capture_once\"}" % args.port)
     print("   AI模式:  %s" % llm)
     print("   指令超时: %.0f 秒" % CMD_TIMEOUT_S)
+    print("   多设备:  最多 %d 台；?device=<名字> 可指定，不带则用最近上报的那台" % MAX_DEVICES)
     print("   落盘:    %s%s" % (args.data_dir,
           "（仅事件）" if args.no_log_telemetry else "（波形 %.0fHz + 事件，保留 %d 天）"
           % (args.log_hz, args.retain_days)))
