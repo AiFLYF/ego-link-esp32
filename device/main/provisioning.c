@@ -32,7 +32,8 @@ static httpd_handle_t s_server;
 static volatile bool  s_active;
 static volatile TickType_t s_last_activity;
 static char s_ap_ssid[NET_SSID_MAX];
-static char s_ap_pass[9];          /* 4 位数字 + NUL，留点余量 */
+static char s_ap_pass[12];         /* 8 位数字 + NUL（WPA2 要求 8–63 位），留点余量 */
+static bool s_netif_ready;         /* AP netif 只建一次，失败重试时不能重复建 */
 static char s_last_result[64];
 
 /* ------------------------------------------------------------------ */
@@ -290,8 +291,14 @@ static void build_ap_identity(void)
     esp_read_mac(mac, ESP_MAC_WIFI_SOFTAP);
     snprintf(s_ap_ssid, sizeof(s_ap_ssid), "EGO-LINK-%02X%02X", mac[4], mac[5]);
 
-    /* 4 位随机码：纯开放热点等于同教室任何人都能改你板子的配置 */
-    snprintf(s_ap_pass, sizeof(s_ap_pass), "%04u", (unsigned)(esp_random() % 10000u));
+    /* **必须是 8–63 位**：WPA2 的下限是 8，4 位会被 esp_wifi_set_config() 拒绝
+     * （ESP_ERR_WIFI_PASSWORD）。2026-09-22 真机实测：原来这里是 "%04u"，
+     * 于是配网一启动就 abort → 板子陷入"开机就重启"的死循环，
+     * 屏幕都来不及显示，双击 BOOT 也救不回来 —— 等于变砖。
+     * 改 8 位数字：手机端还是纯数字键盘、读屏一样快，而且 10^8 比原来的 10^4 更抗猜。
+     * （配网页只在 AP 网段内可达，这道密码的作用是"别让同教室的人随手改你板子"，
+     *   不是真安全边界。） */
+    snprintf(s_ap_pass, sizeof(s_ap_pass), "%08u", (unsigned)(esp_random() % 100000000u));
 }
 
 esp_err_t provisioning_start(void)
@@ -303,7 +310,11 @@ esp_err_t provisioning_start(void)
     build_ap_identity();
     s_last_result[0] = '\0';
 
-    esp_netif_create_default_wifi_ap();
+    /* netif 只能建一次：失败后用户双击 BOOT 重试时不能再建一遍（会 abort）。 */
+    if (!s_netif_ready) {
+        esp_netif_create_default_wifi_ap();
+        s_netif_ready = true;
+    }
 
     wifi_config_t ap = {0};
     strlcpy((char *)ap.ap.ssid, s_ap_ssid, sizeof(ap.ap.ssid));
@@ -313,9 +324,25 @@ esp_err_t provisioning_start(void)
     ap.ap.authmode = WIFI_AUTH_WPA2_PSK;
     ap.ap.channel = 1;                    /* 1/6/11 里挑最不挤的；教学场景 1 够用 */
 
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap));
-    ESP_ERROR_CHECK(esp_wifi_start());
+    /* 刻意**不用** ESP_ERROR_CHECK（REVIEW P2-5 的同一类问题）：AP 参数一旦不被
+     * 接受，ESP_ERROR_CHECK 会直接 abort，而 provisioning 正是"配置本身有问题时"
+     * 才走到的路径 —— 在这里 abort 等于把"参数错"升级成"板子变砖"。
+     * 现在改成：记下原因、返回失败、板子保持可操作（双击 BOOT 可重试）。 */
+    esp_err_t err = esp_wifi_set_mode(WIFI_MODE_AP);
+    if (err == ESP_OK) {
+        err = esp_wifi_set_config(WIFI_IF_AP, &ap);
+    }
+    if (err == ESP_OK) {
+        err = esp_wifi_start();
+    }
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "SoftAP 启动失败: %s（ssid='%s' pass_len=%d）—— 板子保持可操作，"
+                 "双击 BOOT 可重试", esp_err_to_name(err), s_ap_ssid,
+                 (int)strlen(s_ap_pass));
+        snprintf(s_last_result, sizeof(s_last_result), "热点启动失败：%s",
+                 esp_err_to_name(err));
+        return ESP_FAIL;
+    }
 
     if (start_httpd() != ESP_OK) {
         ESP_LOGE(TAG, "httpd start failed");
@@ -388,6 +415,7 @@ typedef struct {
     bool        want_ok;
     const char *want_ssid;
     const char *want_err_kw;   /* want_ok=false 时，err 里应包含的关键字 */
+    const char *want_device;   /* want_ok=true 时校验生效设备名；NULL = 不校验 */
 } selftest_case_t;
 
 void prov_form_selftest(void)
@@ -395,23 +423,32 @@ void prov_form_selftest(void)
     const selftest_case_t cases[] = {
         /* 正常 */
         {"ssid=Home&pass=12345678&url=http%3A%2F%2F192.168.1.5%3A8000&device=rw1&period=500",
-         "", true, "Home", NULL},
+         "", true, "Home", NULL, "rw1"},
         /* 开放网络（密码留空）*/
-        {"ssid=Cafe&pass=&url=http://a.b:1", "", true, "Cafe", NULL},
+        {"ssid=Cafe&pass=&url=http://a.b:1", "", true, "Cafe", NULL, NULL},
         /* URL 解码：%2B 应还原成 '+'，'+' 应还原成空格 */
-        {"ssid=A%2BB+C&pass=12345678&url=http://h:1", "", true, "A+B C", NULL},
+        {"ssid=A%2BB+C&pass=12345678&url=http://h:1", "", true, "A+B C", NULL, NULL},
         /* 缺 SSID（基线也为空）→ 拒绝 */
-        {"pass=12345678&url=http://h:1", "", false, NULL, "WiFi 名称"},
+        {"pass=12345678&url=http://h:1", "", false, NULL, "WiFi 名称", NULL},
         /* 缺 URL → 拒绝 */
-        {"ssid=A&pass=12345678&url=", "", false, NULL, "服务器地址"},
+        {"ssid=A&pass=12345678&url=", "", false, NULL, "服务器地址", NULL},
         /* URL 没有 scheme → 拒绝 */
-        {"ssid=A&pass=12345678&url=192.168.1.5:8000", "", false, NULL, "http"},
+        {"ssid=A&pass=12345678&url=192.168.1.5:8000", "", false, NULL, "http", NULL},
         /* 密码太短 → 拒绝 */
-        {"ssid=A&pass=123&url=http://h:1", "", false, NULL, "8"},
+        {"ssid=A&pass=123&url=http://h:1", "", false, NULL, "8", NULL},
         /* 周期越界 → 拒绝 */
-        {"ssid=A&pass=12345678&url=http://h:1&period=5", "", false, NULL, "100"},
-        /* 缺省字段沿用基线（配网页只提交改动项也能工作）*/
-        {"ssid=New", "Old", false, NULL, "服务器地址"},
+        {"ssid=A&pass=12345678&url=http://h:1&period=5", "", false, NULL, "100", NULL},
+        /* 缺省字段沿用基线（配网页只提交改动项也能工作）。
+         * 注意 want_ok 必须是 true：基线里 URL/密码都在，只改 SSID 当然应当通过。
+         * 2026-09-22 之前这里写的是 false，于是每次开机都打一行
+         * "selftest[8] FAIL" —— 一个纯粹的假警报（真机接上后才看见）。 */
+        {"ssid=New", "Old", true, "New", NULL, NULL},
+        /* 设备名留空是**允许**的：交给 net_config_device_id() 按 MAC 自动命名。
+         * 以前这里兜底填 "rw1"，结果 20 块没改过名的板子在服务端是同一台设备、
+         * 姿态球互相覆盖（PROPOSAL §4.1）。 */
+        {"ssid=A&pass=12345678&url=http://h:1&device=", "", true, "A", NULL, ""},
+        /* 配网页填了名字就用它 */
+        {"ssid=A&pass=12345678&url=http://h:1&device=rw1-07", "", true, "A", NULL, "rw1-07"},
     };
 
     int pass = 0;
@@ -435,6 +472,9 @@ void prov_form_selftest(void)
         if (good && ok && c->want_ssid != NULL) {
             good = (strcmp(out.ssid, c->want_ssid) == 0);
         }
+        if (good && ok && c->want_device != NULL) {
+            good = (strcmp(out.device, c->want_device) == 0);
+        }
         if (good && !ok && c->want_err_kw != NULL) {
             good = (strstr(err, c->want_err_kw) != NULL);
         }
@@ -442,8 +482,8 @@ void prov_form_selftest(void)
         if (good) {
             pass++;
         } else {
-            ESP_LOGE(TAG, "selftest[%d] FAIL: body='%s' got ok=%d ssid='%s' err='%s'",
-                     i, c->body, (int)ok, out.ssid, err);
+            ESP_LOGE(TAG, "selftest[%d] FAIL: body='%s' got ok=%d ssid='%s' device='%s' err='%s'",
+                     i, c->body, (int)ok, out.ssid, out.device, err);
         }
     }
     ESP_LOGI(TAG, "prov_form selftest: %d/%d %s", pass, total,

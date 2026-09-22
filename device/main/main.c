@@ -53,7 +53,9 @@ static void on_prov_double_click(void *btn, void *arg)
     led_feedback_play(LED_FB_ACK);
     ESP_LOGW(TAG, "双击 BOOT -> 进入配网模式");
     /* provisioning_start() 内部会切成 WIFI_MODE_AP，STA 连接自然断开 */
-    provisioning_start();
+    if (provisioning_start() != ESP_OK) {
+        ESP_LOGE(TAG, "配网模式启动失败（原因见上面的 prov 日志）");
+    }
 }
 
 /* 看护：5 分钟没人动配网页就自动关热点回 STA（PROPOSAL §1.4）。
@@ -152,7 +154,11 @@ void app_main(void)
         wifi_link_start();
     } else {
         ESP_LOGW(TAG, "NVS 里没有 WiFi 配置，进入配网模式（双击 BOOT 可再次进入）");
-        provisioning_start();
+        /* 配网失败**不能**让板子变砖：provisioning_start() 内部已经把 abort
+         * 换成"记原因 + 返回失败"，这里只负责把话说明白。 */
+        if (provisioning_start() != ESP_OK) {
+            ESP_LOGE(TAG, "配网模式启动失败（原因见上面的 prov 日志），双击 BOOT 可重试");
+        }
     }
     xTaskCreatePinnedToCore(prov_watchdog_task, "prov_wd", 2560, NULL, 3, NULL, 0);
 
