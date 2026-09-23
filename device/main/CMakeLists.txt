@@ -14,6 +14,7 @@ idf_component_register(
         "net_config.c"
         "prov_form.c"
         "provisioning.c"
+        "sd_card.c"
         "transport.c"
         "led_feedback.c"
         "ui.c"
