@@ -17,6 +17,7 @@
  *   - accel_input_init():    SC7A20/LIS3DH/MPU6050/QMA7981 auto-detect
  *   - led_feedback_init():   板载 LED（GPIO3）图案反馈
  *   - camera_selftest():     可选：OV2640 拍一张并打进串口日志，然后关闭
+ *   - sd_card_init():        可选：挂载板载 microSD 到 /sdcard 并读写自检
  *   - ui_init():             status/activity/AI-reply screen
  *   - wifi_link_start():     WiFi STA (+ Aliyun SNTP for log timestamps)
  *   - transport_start():     IMU sampling + batched telemetry to the PC server
@@ -33,6 +34,8 @@
 #include "led_feedback.h"
 #include "net_config.h"
 #include "provisioning.h"
+#include "sd_card.h"
+#include "sd_log.h"
 #include "transport.h"
 #include "ui.h"
 #include "wifi_link.h"
@@ -140,6 +143,14 @@ void app_main(void)
 #if CONFIG_RW1_CAMERA_SELFTEST
     ESP_ERROR_CHECK_WITHOUT_ABORT(camera_selftest());
 #endif
+
+    /* SD 卡同样是可选外设：有卡且是 FAT32 就挂上 /sdcard，没卡/格式不对也只是
+     * 少个存储，绝不能拦住开机。挂上后顺手做一次读写自检（串口看 "自检 PASS"）。 */
+    if (sd_card_init() == ESP_OK) {
+        ESP_ERROR_CHECK_WITHOUT_ABORT(sd_card_selftest());
+        /* 本地留档：网络断了也能在卡上查到轨迹。没卡/没空间都只是少个功能。 */
+        ESP_ERROR_CHECK_WITHOUT_ABORT(sd_log_init());
+    }
 
     ESP_ERROR_CHECK(ui_init());
 
