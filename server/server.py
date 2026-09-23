@@ -71,7 +71,8 @@ FREEFALL_MIN_S = 0.05     # 失重判定：至少持续这么久才算疑似跌�
 # 第 3 周在此基础上加了两个「物理反馈」指令：led_blink / led_set —— 板载 LED 在 GPIO3。
 CMD_TIMEOUT_S = 10.0      # 命令下发后多久没收到结果就判超时
 CMD_MAX_HISTORY = 20      # 保留最近多少条命令供网页显示
-CMD_NAMES = ("capture_once", "led_blink", "led_set", "set_orient")   # 白名单（不认的名字直接 400）
+CMD_NAMES = ("capture_once", "led_blink", "led_set", "set_orient",
+             "set_config")   # 白名单（不认的名字直接 400）
 # set_orient 是"远程改方向档位"，与板端长按 BOOT 等价 —— 网页上点选比盲按 N 次靠谱。
 
 LED_MAX_BLINKS = 12       # 一次 led_blink 最多闪几下（板端也会再夹一道）
@@ -306,6 +307,22 @@ def sanitize_params(name, params):
         if isinstance(v, str):
             v = v.strip().lower() in ("1", "true", "yes", "on")
         return {"on": bool(v)}
+    if name == "set_orient":
+        return {"o": clamp_int(p.get("o"), 0, 15, 0)}
+    if name == "set_config":
+        # 网页"板子设置"卡片：只放行这四项，长度按板端 NVS 的字段上限夹
+        # （ssid 32 / pass 64 / url 127），空串一律丢掉 —— 板端把"没传"
+        # 当作"不改这一项"，传空串反而会被当成"清空"。
+        out = {}
+        for key, lim in (("ssid", 32), ("pass", 64), ("url", 127)):
+            v = p.get(key)
+            if isinstance(v, str):
+                v = v.strip()
+                if v:
+                    out[key] = v[:lim]
+        if "period_ms" in p:
+            out["period_ms"] = clamp_int(p.get("period_ms"), 100, 2000, 500)
+        return out
     return {}
 
 
@@ -813,6 +830,27 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     # ---- helpers ---------------------------------------------------------
+    def _send_vendor_js(self, relpath):
+        """只服务仓库里那几个 vendor 文件；路径写死在调用点，不接受外部输入。"""
+        full = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            relpath.replace("/", os.sep))
+        try:
+            with open(full, "rb") as fh:
+                data = fh.read()
+        except OSError as exc:
+            self._send(404, json.dumps({"ok": False, "error": str(exc)}))
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "text/javascript; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        # 内容不会变，缓存久一点；不然每次打开页面都要重下 600KB
+        self.send_header("Cache-Control", "public, max-age=86400")
+        self.end_headers()
+        try:
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            pass
+
     def _send(self, code, body, ctype="application/json; charset=utf-8", extra=None):
         data = body if isinstance(body, bytes) else body.encode("utf-8")
         self.send_response(code)
@@ -848,6 +886,12 @@ class Handler(BaseHTTPRequestHandler):
         path, _, query = self.path.partition("?")
         if path == "/":
             self._send(200, DASHBOARD_HTML, "text/html; charset=utf-8")
+        elif path == "/vendor/three.min.js":
+            # **白名单**，不做通用静态目录：通用目录会把 server/data/ 里的遥测
+            # jsonl（含设备名、事件文本）也一并暴露出去。
+            # 用仓库里 vendor 的那份，不引 CDN —— 教室/局域网常常没有外网，
+            # 引 CDN 必然白屏（配网页当初就是踩过这个才改成内联的）。
+            self._send_vendor_js("docs/vendor/three/build/three.min.js")
         elif path == "/api/devices":
             with LOCK:
                 devs = devices_snapshot()
@@ -1097,6 +1141,10 @@ DASHBOARD_HTML = """<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Ego Link · 实时仪表盘</title>
+<!-- 空 favicon：不写这行浏览器会去请求 /favicon.ico，服务端没有这条路由，
+     于是每次打开页面都留一条 404 在控制台（2026-09-23 E2E 抓到的）。 -->
+<link rel="icon" href="data:,">
+<script src="/vendor/three.min.js"></script>
 <style>
 /* ==========================================================================
    设计语言与开发板屏幕（device/main/ui.c）刻意保持一致：
@@ -1234,7 +1282,10 @@ h2{font-size:13px;color:var(--text)}
 .ball .dot{
   position:absolute;left:50%;top:50%;width:20px;height:20px;margin:-10px 0 0 -10px;border-radius:50%;
   background:var(--green);box-shadow:0 0 18px -2px var(--green);
-  transition:transform .3s cubic-bezier(.22,1,.36,1),background .4s,box-shadow .4s;
+  /* 小球：**短且线性**。原来 .3s 的 ease-out 配 500ms 一次的数据更新，
+     观感是「猛冲一下、然后停住」的顿感（用户反馈「不灵敏」）。
+     0.15s linear 让它贴着数据走，没有加速-减速的假动作。 */
+  transition:transform .15s linear,background .4s,box-shadow .4s;
 }
 .bars{display:flex;flex-direction:column;gap:9px}
 .bar{display:grid;grid-template-columns:14px 1fr 52px;gap:9px;align-items:center;font-size:12px}
@@ -1337,6 +1388,44 @@ footer{max-width:1400px;margin:18px auto 0;color:var(--faint);font-size:11px;lin
 </section>
 
 <main class="grid">
+  <section class="card wide" id="card3d" hidden>
+    <div class="card-head"><h2>板子姿态 · 3D</h2><span class="src" id="d3src">—</span></div>
+    <canvas id="board3d" style="width:100%;height:280px;display:block"></canvas>
+    <div class="hint" style="margin-top:6px">橙色小条 = 板子顶边；地面网格固定不动，板子跟着实时姿态转。
+      数据 2Hz 到、画面 60Hz 走（中间做 slerp 平滑），所以看着是连续的。</div>
+  </section>
+
+  <section class="card wide" id="cardcfg">
+    <div class="card-head"><h2>板子设置</h2>
+      <span class="src">改完通过「下一帧遥测的响应」下发到板子并写入 NVS；空着 = 不改那一项</span></div>
+    <div class="row" style="flex-wrap:wrap;gap:8px;align-items:center;margin-top:6px">
+      <span class="src">WiFi 名称</span>
+      <input id="cfgssid" placeholder="不改就留空" autocomplete="off"
+             style="background:var(--card-hi);color:var(--text);border:1px solid var(--line);
+                    border-radius:8px;padding:5px 9px;min-width:150px">
+      <span class="src">密码</span>
+      <input id="cfgpass" type="password" placeholder="不改就留空" autocomplete="new-password"
+             style="background:var(--card-hi);color:var(--text);border:1px solid var(--line);
+                    border-radius:8px;padding:5px 9px;min-width:150px">
+    </div>
+    <div class="row" style="flex-wrap:wrap;gap:8px;align-items:center;margin-top:8px">
+      <span class="src">服务器地址</span>
+      <input id="cfgurl" placeholder="http://192.168.x.x:8000" autocomplete="off"
+             style="background:var(--card-hi);color:var(--text);border:1px solid var(--line);
+                    border-radius:8px;padding:5px 9px;min-width:210px">
+      <span class="src">上报周期 ms</span>
+      <input id="cfgper" type="number" min="100" max="2000" step="50" placeholder="100~2000"
+             style="background:var(--card-hi);color:var(--text);border:1px solid var(--line);
+                    border-radius:8px;padding:5px 9px;width:110px">
+      <button id="cfgapply">下发到板子</button>
+      <span id="cfghint" class="hint"></span>
+    </div>
+    <div class="hint" style="margin-top:6px">
+      <b>改 WiFi 会先试连、连上了才保存</b>（最多 8 秒）—— 密码填错不会把板子弄失联。
+      <b>上报周期就是「灵敏度」</b>：越小界面越跟手，但 WiFi 压力越大；默认 500ms。
+    </div>
+  </section>
+
   <section class="card hero">
     <div class="card-head"><h2>当前活动</h2><span class="src" id="src">—</span></div>
     <div class="gauge">
@@ -1576,6 +1665,93 @@ addEventListener("resize", fitCanvas);
 
 /* ---------------- 姿态球与三轴条 ---------------- */
 var BUBBLE_MAX = 62;                     /* 1g 对应的像素偏移（相对球半径 50%） */
+/* ---------------- 板子姿态 3D ----------------
+ * 把板子做成一块小牌子，按加速度计实时转动 —— "板子现在什么姿态"一眼就懂，
+ * 比数字和圆点直观得多（用户 2026-09-23 提的需求）。
+ *
+ * three.js 用仓库里 vendor 的那份（`/vendor/three.min.js`，服务端白名单放行），
+ * **不引 CDN**：教室/局域网常常没有外网，引 CDN 必然白屏。
+ *
+ * 坐标约定与板端屏幕、姿态球**完全一致**：+x 右、+y 下、+z 出屏。 */
+var d3 = null;
+function init3d(){
+  if (typeof THREE === "undefined") return;
+  var cv = $("board3d");
+  if (!cv) return;
+  var renderer;
+  try {
+    renderer = new THREE.WebGLRenderer({canvas: cv, antialias: true, alpha: true});
+  } catch (e) {
+    return;                    /* 没有 WebGL 就不显示这张卡，别留个空白框 */
+  }
+  var W = Math.max(200, cv.clientWidth || 320), H = 280;
+  renderer.setPixelRatio(Math.min(2, window.devicePixelRatio || 1));
+  renderer.setSize(W, H, false);
+
+  var scene = new THREE.Scene();
+  var camera = new THREE.PerspectiveCamera(38, W / H, 0.1, 100);
+  camera.position.set(0, 2.4, 4.8);
+  camera.lookAt(0, 0, 0);
+
+  scene.add(new THREE.AmbientLight(0xffffff, 0.8));
+  var dl = new THREE.DirectionalLight(0xffffff, 1.05);
+  dl.position.set(3, 6, 5);
+  scene.add(dl);
+
+  /* 板子本体：按**屏幕系**建模，于是"把测到的重力方向转到世界正上方"
+     就等于"板子的真实姿态"（见 update3d）。 */
+  var g = new THREE.Group();
+  g.add(new THREE.Mesh(
+    new THREE.BoxGeometry(2.0, 2.0, 0.16),
+    new THREE.MeshStandardMaterial({color: 0x2b3444, roughness: 0.62, metalness: 0.18})));
+  /* 屏幕面（+z 那面）用活动色的绿，一眼分出正反面 */
+  var scr = new THREE.Mesh(new THREE.PlaneGeometry(1.62, 1.62),
+                           new THREE.MeshBasicMaterial({color: 0x1d9e75}));
+  scr.position.z = 0.085;
+  g.add(scr);
+  /* 顶边标记：和板端屏幕的橙色小条同一个约定（+y 是"下"，所以顶边在 -y） */
+  var top = new THREE.Mesh(new THREE.BoxGeometry(0.5, 0.1, 0.05),
+                           new THREE.MeshBasicMaterial({color: 0xef9f27}));
+  top.position.set(0, -1.0, 0.09);
+  g.add(top);
+  scene.add(g);
+
+  /* 地面网格固定在世界里：板子转、网格不动，倾斜才有参照物 */
+  var grid = new THREE.GridHelper(9, 18, 0x3d4757, 0x252d3a);
+  grid.position.y = -2.0;
+  scene.add(grid);
+
+  d3 = {renderer: renderer, scene: scene, camera: camera, group: g,
+        target: new THREE.Quaternion(), cur: new THREE.Quaternion()};
+  $("card3d").hidden = false;
+
+  /* 数据 2Hz 到、画面 60Hz 走：每帧朝目标姿态 slerp 一点点，
+     所以即使数据是跳着来的，画面也是连续转的。 */
+  (function loop(){
+    requestAnimationFrame(loop);
+    d3.cur.slerp(d3.target, 0.18);
+    d3.group.quaternion.copy(d3.cur);
+    d3.renderer.render(d3.scene, d3.camera);
+  })();
+
+  window.addEventListener("resize", function(){
+    var w = Math.max(200, cv.clientWidth || 320);
+    renderer.setSize(w, H, false);
+    camera.aspect = w / H;
+    camera.updateProjectionMatrix();
+  });
+}
+
+/* 把板子转到"真实姿态"：测到的是**世界正上方在板子坐标系里的方向**，
+   所以把它转到世界 +Y 的那个旋转，就是板子当前的姿态。 */
+function update3d(x, y, z){
+  if (!d3) return;
+  var v = new THREE.Vector3(x, y, z);
+  if (v.lengthSq() < 1e-6) return;
+  v.normalize();
+  d3.target.setFromUnitVectors(v, new THREE.Vector3(0, 1, 0));
+}
+
 function setBall(x, y, mag){
   var bx = Math.max(-1, Math.min(1, x)) * BUBBLE_MAX;
   var by = Math.max(-1, Math.min(1, y)) * BUBBLE_MAX;
@@ -1826,6 +2002,10 @@ function renderDevices(list, current){
     };
   });
   syncDevAll();
+  /* 档位显示也要在这里刷：它读的是 `devOrient`，而那个表是**本函数**填的。
+   * 只在初始化时调一次 syncOrient() 的话，设备列表后到就永远显示"还没收到档位"
+   * （2026-09-23 浏览器 E2E 抓到的时序 bug）。 */
+  syncOrient();
 }
 
 /* 「全选」按钮：全都勾上 / 全都取消。文案随状态变，避免用户看不出当前是哪种。 */
@@ -1910,7 +2090,7 @@ function render(s){
   if (s.latest){
     var x = s.latest[1], y = s.latest[2], z = s.latest[3];
     var mag = Math.sqrt(x*x + y*y + z*z);
-    setRing(mag); setBall(x, y, mag); setTilt(z, mag);
+    setRing(mag); setBall(x, y, mag); setTilt(z, mag); update3d(x, y, z);
     setBar(0, x); setBar(1, y); setBar(2, z);
   }
   renderCmds(s.commands);
@@ -1954,6 +2134,27 @@ fetch("/api/logs").then(function(r){ return r.json(); }).then(function(l){
 fetch("/api/commands" + devQuery()).then(function(r){ return r.json(); }).then(function(d){
   cmdNames = d.names || ["capture_once"];
   if ($("devall")) $("devall").onclick = toggleDevAll;
+  init3d();
+  /* 板子设置：只把**填了**的项发过去（空着 = 不改那一项）。 */
+  if ($("cfgurl")) $("cfgurl").placeholder = location.origin;   /* 提示当前地址 */
+  if ($("cfgapply")) $("cfgapply").onclick = function(){
+    var p = {};
+    var ssid = ($("cfgssid").value || "").trim();
+    var pass = $("cfgpass").value || "";
+    var url = ($("cfgurl").value || "").trim();
+    var per = parseInt($("cfgper").value, 10);
+    if (ssid) p.ssid = ssid;
+    if (pass) p.pass = pass;
+    if (url) p.url = url;
+    if (!isNaN(per)) p.period_ms = per;
+    if (!Object.keys(p).length){
+      $("cfghint").textContent = "什么都没填，不改。";
+      return;
+    }
+    $("cfghint").textContent = (p.ssid ? "下发中…（改 WiFi 会先试连，最多 8 秒）" : "下发中…");
+    sendCmd("set_config", null, p);
+    $("cfgpass").value = "";     /* 密码不留在这 */
+  };
   if ($("orientapply")) $("orientapply").onclick = function(){
     var v = parseInt($("orientsel").value, 10);
     if (isNaN(v)) return;

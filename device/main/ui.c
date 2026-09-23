@@ -1244,7 +1244,16 @@ esp_err_t ui_init(void)
     build_reply_card(scr);
     build_prov_panel(scr);      /* 最后建：盖在所有面板之上 */
 
-    lv_timer_create(ui_timer_cb, 500, NULL);
+    /* **30Hz**，不是 500ms。
+     *
+     * 原来这里写 500ms（2Hz）：姿态球 2Hz 一跳，看着就是"迟钝、不跟手"。
+     * 用户 2026-09-23 明确反馈"小球状态/位置不灵敏，主观上很容易理解为产品不行"。
+     * （我上一版把 transport 的状态刷到 20Hz，但界面每 500ms 才去读一次 —— 白改。）
+     *
+     * 为什么敢用 30Hz：回调里每个标签/进度条都有 `s_last_*` 守卫，值没变就不碰 LVGL，
+     * 所以实际重绘次数只跟**数据变化**有关，不是每次定时器都全量刷。
+     * 33ms ≈ 30Hz，与 LVGL 的默认刷新节奏匹配，球就是连续动的。 */
+    lv_timer_create(ui_timer_cb, 33, NULL);
 
     bsp_display_unlock();
     ESP_LOGI(TAG, "ui ready (graphical dashboard, %dx%d)", UI_SCR_W, UI_SCR_H);
