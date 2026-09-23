@@ -1765,19 +1765,26 @@ function init3d(){
    * 所以这里要 > 0.1。之前是 0.085（板厚还是 0.16 时勉强露在外面），
    * 我把板厚加到 0.2 之后它就被埋进板子里了 —— 屏幕面整块看不见。 */
   var scr = new THREE.Mesh(new THREE.PlaneGeometry(1.62, 1.62),
-                           new THREE.MeshBasicMaterial({color: 0x1d9e75}));
-  scr.position.z = 0.106;
+                           new THREE.MeshBasicMaterial({color: 0x1d9e75,
+                                                        side: THREE.DoubleSide}));
+  /* ⚠️ 屏幕面在 **-z** 侧。板子的坐标系是「+x 右、+y 下、**+z 朝屏幕里**」——
+   * 这样才是右手系（x×y = z：右×下 = 朝里）。我第一版把 +z 当成「朝屏幕外」，
+   * 于是整个模型是**镜像**的 —— 这才是立起来看到背面的真正根因。 */
+  scr.position.z = -0.106;
   g.add(scr);
   /* 顶边标记：和板端屏幕的橙色小条同一个约定（+y 是"下"，所以顶边在 -y） */
   /* 顶边标记：做成**跨在板子顶边上、两面都露出来的一条棱**，
    * 而不是贴在某一面上的薄片 —— 原来贴在 +z 面（z=0.09），从背面看被板子挡住。
    * 现在 z 方向做到 ±0.14（板厚 ±0.1），正反面都看得到；
    * +y 是"下"（屏幕系），所以顶边在 -y。 */
-  /* 位置在 +y：平放时 +y 映射到世界的**远端**，也就是"离你远的那条边"。
-   * （-y 会落在靠近你的那条边上 —— 用户要的是远的这条。） */
+  /* 位置在 **-y**：屏幕系里 +y 是"下"，所以 -y 才是板子的**顶边**。
+   * 这样两种摆法都对：
+   *   平放（屏幕朝上）→ 顶边在**离你远的那条边**
+   *   立起来          → 顶边在**上面**
+   * （曾经为了"平放时在远边"改成 +y，结果立起来就跑到下面去了 —— 用 -y 才对。） */
   var top = new THREE.Mesh(new THREE.BoxGeometry(0.7, 0.14, 0.28),
                            new THREE.MeshBasicMaterial({color: 0xef9f27}));
-  top.position.set(0, 1.0, 0);
+  top.position.set(0, -1.0, 0);
   g.add(top);
   scene.add(g);
 
@@ -1786,8 +1793,10 @@ function init3d(){
   grid.position.y = -2.0;
   scene.add(grid);
 
+  var flat = makeFlatPose();
   d3 = {renderer: renderer, scene: scene, camera: camera, group: g,
-        target: new THREE.Quaternion(), cur: new THREE.Quaternion()};
+        target: flat.clone(), cur: flat.clone()};
+  g.quaternion.copy(flat);
   $("card3d").hidden = false;
 
   /* 画面 60Hz 走、数据按「刷新」选择器的频率到：每帧朝目标姿态 slerp 一点点，
@@ -1807,28 +1816,72 @@ function init3d(){
   });
 }
 
-/* 把板子转到"真实姿态"。
+/* 把板子转到「真实姿态」。
  *
- * ⚠️ 上报的 x/y/z **不是**物理"上方向"，而是板端姿态球用的"下坡方向"
- * （x/y 被镜像过，z 没有）。两个物理校准点（2026-09-24 实测）：
+ * 板子的坐标系（右手系）：**+x 右、+y 下、+z 朝屏幕里**（右×下 = 朝里 ✓）。
+ * 上报的 x/y/z 就是**重力（下坡）方向**在这个坐标系里的分量 ——
+ * 三个物理校准点（2026-09-24 实测）都吻合：
  *
- *     平放水平        → (0.00,  0.02, +0.99)   屏幕朝上 → +z 是"上"
- *     把右边压低      → (+0.70, -0.03, +0.72)  板端叫「向右倾斜」→ 右边是低的
+ *     平放（屏幕朝上）  → (0.00,  0.02, +0.99)   下坡 = 朝屏幕里 = 朝下 ✓
+ *     立起来（屏幕朝我）→ (0.00, +1.00,  0.00)   下坡 = 屏幕的「下」方向 ✓
+ *     右边压低          → (+0.70, -0.03, +0.72)  下坡偏向右边 ✓
  *
- * 第二行说明 **x 为正 ⟺ 右边低**（球往右滚），和屏幕上的姿态球一致；
- * 而真正的物理"上"方向在右边低时应该**偏向左边**。所以物理上是：
+ * 所以只要把**下坡方向对到世界的下方 (0,-1,0)**，板子姿态就对了 ——
+ * 不需要任何镜像。（我前几版在这里又是翻 z 又是镜像 x/y，都是在补
+ * 「模型镜像」这个更底层的错，两个错互相抵消了一部分，越补越乱。）
  *
- *     物理上方向 = (-x, -y, +z)      ← 只镜像 x/y，z 不动
- *
- * 再把它对齐到世界 +Y，就是板子的真实姿态。
- * （第一版直接拿 (x,y,z) 当"上"、还对到 -Y，两次都错 —— 平放时看到的是背面。） */
+ * ⚠️ 剩下的自由度：绕竖直轴转了多少，加速度计**测不出来**。
+ * 板子立着时它能告诉你「下在哪」，却分不清屏幕朝你还是朝墙。
+ * 用「最短弧」补这个自由度会挑到把板子翻过去的解 ——
+ * 所以绕世界竖直轴扫一圈，取**离当前姿态最近**的解（靠连续性消歧，不猜）。
+ * 初始姿态设成「平放、屏幕朝上、顶边朝远处」（板子开机通常就这么放）。
+ */
+function makeFlatPose(){
+  /* 平放自然姿态：板子 +z（朝屏幕里）→ 世界下方；+y（屏幕的「下」）→ 朝观察者；
+     于是 -z（屏幕面）→ 世界上方，-y（顶边）→ 世界远处。
+     第三列必须是 (0,-1,0) —— 取 (0,1,0) 的话行列式 = -1，是镜像不是旋转。 */
+  var m = new THREE.Matrix4();
+  m.makeBasis(new THREE.Vector3(1, 0, 0),    /* 板子 +x → 世界 +x */
+              new THREE.Vector3(0, 0, 1),    /* 板子 +y → 世界 +z（朝观察者） */
+              new THREE.Vector3(0, -1, 0));  /* 板子 +z → 世界 -y（朝下） */
+  return new THREE.Quaternion().setFromRotationMatrix(m);
+}
 function update3d(x, y, z){
   if (!d3) return;
-  var v = new THREE.Vector3(-x, -y, z);
-  if (v.lengthSq() < 1e-6) return;
-  v.normalize();
-  d3.target.setFromUnitVectors(v, new THREE.Vector3(0, 1, 0));
+  var down = new THREE.Vector3(x, y, z);
+  if (down.lengthSq() < 1e-6) return;
+  down.normalize();
+  var base = new THREE.Quaternion().setFromUnitVectors(down, new THREE.Vector3(0, -1, 0));
+
+  /* 绕世界竖直轴扫一圈，按**两级约定**挑唯一解 —— 加速度计测不出绕竖直轴的朝向，
+   * 这一段是"约定"而不是"测量"，所以要定得**可预测**，不能靠"取最近"抛硬币：
+   *
+   *   ① 屏幕面尽量朝观察者（板子立起来时，正面朝我 —— 这是最自然的拿法）
+   *   ② 打平时①退化（屏幕只能朝上），改用"顶边朝远处"（板子平放的通常摆法）
+   *
+   * 两条都是"尽量"：受重力约束限制时自动退让，不会和测量冲突。 */
+  var axis = new THREE.Vector3(0, 1, 0);
+  var q = new THREE.Quaternion();
+  var vFace = new THREE.Vector3(), vTop = new THREE.Vector3();
+  var best = null, bestFace = -9, bestTop = -9;
+  for (var i = 0; i < 72; i++) {
+    q.setFromAxisAngle(axis, i * Math.PI / 36).multiply(base);
+    /* 板子 -z 是屏幕面（+z 朝屏幕里），-y 是顶边 */
+    vFace.set(0, 0, -1).applyQuaternion(q);
+    vTop.set(0, -1, 0).applyQuaternion(q);
+    var sFace = vFace.z;          /* 屏幕面朝观察者（世界 +z）的程度 */
+    var sTop = -vTop.z;           /* 顶边朝远处（世界 -z）的程度 */
+    /* ① 优先；① 打平时（差值在容差内）用 ② 决胜 */
+    if (sFace > bestFace + 1e-3 || (Math.abs(sFace - bestFace) <= 1e-3 && sTop > bestTop)) {
+      bestFace = Math.max(bestFace, sFace);
+      bestTop = sTop;
+      best = q.clone();
+    }
+  }
+  d3.target.copy(best || base);
 }
+
+
 
 function setBall(x, y, mag){
   var bx = Math.max(-1, Math.min(1, x)) * BUBBLE_MAX;
