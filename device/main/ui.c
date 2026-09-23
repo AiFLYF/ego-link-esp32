@@ -124,19 +124,19 @@ static const char *TAG = "ui";
 
 /* 三轴对称条 */
 #define UI_AXIS_Y       124
-#define UI_AXIS_ROW_H   11
+#define UI_AXIS_ROW_H   13
 #define UI_AXIS_GAP     3
-#define UI_AXIS_LBL_X   10
-#define UI_AXIS_LBL_W   12
+#define UI_AXIS_LBL_X   8
+#define UI_AXIS_LBL_W   14
 #define UI_AXIS_BAR_X   26
-#define UI_AXIS_BAR_W   158
+#define UI_AXIS_BAR_W   152
 #define UI_AXIS_BAR_H   7
-#define UI_AXIS_VAL_X   190
-#define UI_AXIS_VAL_W   42
+#define UI_AXIS_VAL_X   184
+#define UI_AXIS_VAL_W   48
 
 /* AI 回复卡片 */
-#define UI_CARD_Y       168
-#define UI_CARD_H       66
+#define UI_CARD_Y       174
+#define UI_CARD_H       60
 #define UI_CARD_X       UI_MARGIN
 #define UI_CARD_W       (UI_SCR_W - 2 * UI_MARGIN)
 #define UI_TAG_X        14
@@ -159,7 +159,7 @@ static const char *TAG = "ui";
 #define UI_REPLY_X      14
 #define UI_REPLY_Y      22                      /* 相对卡片 */
 #define UI_REPLY_W      200
-#define UI_REPLY_H      40
+#define UI_REPLY_H      34
 
 /* ==========================================================================
  * 配色（深色玻璃拟态：深底 + 低对比描边 + 高饱和语义色）
@@ -1106,8 +1106,11 @@ static void build_axis_rows(lv_obj_t *scr)
     for (int i = 0; i < 3; i++) {
         int y = UI_AXIS_Y + i * (UI_AXIS_ROW_H + UI_AXIS_GAP);
 
+        /* 字号必须**小于行高**：原来是 montserrat_14 塞进 UI_AXIS_ROW_H = 11 的行里，
+         * 字被上下切掉 —— 用户反馈"X/Y/Z 的字母和数字都显示不完整"就是这个。
+         * 现在 12px 字 + 13px 行，纵向留 1px 余量。 */
         lv_obj_t *lbl = make_label(scr, UI_AXIS_LBL_X, y, UI_AXIS_LBL_W, UI_AXIS_ROW_H,
-                                   &lv_font_montserrat_14, axis_color[i], LV_TEXT_ALIGN_LEFT);
+                                   &lv_font_montserrat_12, axis_color[i], LV_TEXT_ALIGN_LEFT);
         lv_label_set_long_mode(lbl, LV_LABEL_LONG_CLIP);
         lv_label_set_text(lbl, axis_name[i]);
 
@@ -1136,8 +1139,10 @@ static void build_axis_rows(lv_obj_t *scr)
                  1, UI_AXIS_BAR_H + 2, UI_C_MARK, 0, 0);
 
         /* 数值与 X/Y/Z 标签同色，左右呼应，不再是一串灰蒙蒙的数字 */
+        /* 同上：12px 字，并且数值框从 42 加宽到 48 —— `+1.03` 这种
+         * （带符号 5 个字符）在 14px 下约 42~45px，贴着框边会被裁掉。 */
         s_axis_val[i] = make_label(scr, UI_AXIS_VAL_X, y, UI_AXIS_VAL_W, UI_AXIS_ROW_H,
-                                   &lv_font_montserrat_14, axis_color[i], LV_TEXT_ALIGN_RIGHT);
+                                   &lv_font_montserrat_12, axis_color[i], LV_TEXT_ALIGN_RIGHT);
         lv_label_set_long_mode(s_axis_val[i], LV_LABEL_LONG_CLIP);
         lv_label_set_text(s_axis_val[i], "0.00");
     }
