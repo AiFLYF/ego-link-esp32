@@ -107,7 +107,7 @@ static const char *TAG = "ui";
 #define UI_ABS_H        14
 #define UI_ABS_Y        43                      /* 环心第二行（|a| 读数） */
 #define UI_PANEL_CAP_Y  72                      /* 面板底部小字 */
-#define UI_PANEL_CAP_W  100
+#define UI_PANEL_CAP_W  108
 #define UI_PANEL_CAP_H  14
 #define UI_CAP_DOT_D    5                       /* 细节行左侧语义色圆点 */
 #define UI_CAP_DOT_X    10
@@ -708,32 +708,16 @@ static void ui_timer_cb(lv_timer_t *timer)
     transport_status_t st;
     transport_get_status(&st);
 
-    /* ---------- 显示用的低通滤波 ----------
+    /* 姿态球/数值条**直接用原始值，不做低通** —— 要跟手。
      *
-     * 为什么必须滤：`transport` 每周期只把**最后一个样本**写进状态，
-     * 于是界面拿到的是瞬时值。而"倾角"是 `acos(|z|/|a|)` ——
-     * **在 |z| ≈ |a|（接近平放）附近这个函数对噪声极度敏感**：0.03g 的噪声
-     * 就能算出 14°，平放着的板子一会 0° 一会 13°，现场非常困惑。
-     *
-     * 同一个噪声对姿态球几乎没影响（`bx = x * 26px`，0.03g 只让球动不到 1px），
-     * 所以会出现"球稳稳居中、倾角数字乱跳"这种自相矛盾的画面 ——
-     * 2026-09-23 用户拍到并反馈的就是这个。
-     *
-     * 对**显示值**做一阶低通（只影响界面，上报和判定仍用原始值）。 */
-    static float s_disp[3] = {0.0f, 0.0f, 0.0f};
-    static bool s_disp_primed = false;
-    if (!s_disp_primed) {
-        s_disp[0] = st.x_g;
-        s_disp[1] = st.y_g;
-        s_disp[2] = st.z_g;
-        s_disp_primed = true;
-    } else {
-        const float a = 0.25f;
-        s_disp[0] += a * (st.x_g - s_disp[0]);
-        s_disp[1] += a * (st.y_g - s_disp[1]);
-        s_disp[2] += a * (st.z_g - s_disp[2]);
-    }
-    const float dx = s_disp[0], dy = s_disp[1], dz = s_disp[2];
+     * 上一版在这里加了 α=0.25 的一阶低通去压"倾角乱跳"，结果把球也拖慢了
+     * （用户 2026-09-23 反馈"球移动速度太慢"）。低通加错了地方：
+     *  - 姿态球对噪声本来就不敏感（`bx = x * 26px`，0.03g 只动不到 1px），
+     *    它需要的是**快**；
+     *  - 真正对噪声敏感的是 `acos(|z|/|a|)` —— 在接近平放时 0.03g 就能算出 14°。
+     *    所以**只对角度那一个数**做低通（见下面 s_deg 那段），别碰 x/y/z。
+     * 另外 `transport` 现在以 20Hz 刷新状态（原来只有 500ms 一次），球本身就顺了。 */
+    const float dx = st.x_g, dy = st.y_g, dz = st.z_g;
 
     char buf[80];
     bool wifi_up = wifi_link_is_up();
@@ -895,17 +879,33 @@ static void ui_timer_cb(lv_timer_t *timer)
     }
     const bool show_ori = (lv_tick_get() - s_ori_at) < 5000;
 
+    /* 只对**角度**做低通：`acos(|z|/|a|)` 在接近平放时对噪声极敏感
+     * （0.03g → 14°），不滤的话数字乱跳；但滤 x/y/z 会把姿态球拖慢（上一版的错）。
+     * 滤角度本身只影响这一个数字，姿态球完全不受影响。 */
+    static float s_deg = 0.0f;
+    static bool s_deg_primed = false;
     if (mag < 0.05f) {
         snprintf(buf, sizeof(buf), show_ori ? "无读数 o%d" : "无读数", ori);
     } else if (mag < 0.35f) {
+        s_deg_primed = false;          /* 失重后重新起滤，别拿旧值 */
         snprintf(buf, sizeof(buf), show_ori ? "失重 o%d" : "失重", ori);
     } else {
         float c = fabsf(dz) / mag;
         if (c > 1.0f) {
             c = 1.0f;
         }
-        int deg = (int)(acosf(c) * 57.29578f + 0.5f);
-        snprintf(buf, sizeof(buf), show_ori ? "倾角 %d° o%d" : "倾角 %d°", deg, ori);
+        const float raw_deg = acosf(c) * 57.29578f;
+        if (!s_deg_primed) {
+            s_deg = raw_deg;
+            s_deg_primed = true;
+        } else {
+            s_deg += 0.4f * (raw_deg - s_deg);
+        }
+        int deg = (int)(s_deg + 0.5f);
+        /* 去掉「倾角」和数字之间的空格：这个 CJK 字体里 ASCII 是**全角**的，
+         * 一个空格就是 12px —— 带上它会顶破 100px 的标签宽度而**换行**，
+         * 第二行又被 14px 的行高裁掉（用户拍到的"显示不全"就是这个）。 */
+        snprintf(buf, sizeof(buf), show_ori ? "倾角%d° o%d" : "倾角%d°", deg, ori);
     }
     lv_label_set_text(s_lbl_tilt, buf);
 
@@ -1091,7 +1091,11 @@ static void build_tilt_panel(lv_obj_t *scr)
     s_lbl_tilt = make_label(p, (UI_PANEL_W - UI_PANEL_CAP_W) / 2, UI_PANEL_CAP_Y,
                             UI_PANEL_CAP_W, UI_PANEL_CAP_H, cjk_font(12), UI_C_DIM,
                             LV_TEXT_ALIGN_CENTER);
-    lv_label_set_text(s_lbl_tilt, "倾角 —");
+    /* **必须禁止换行**：标签默认是 LV_LABEL_LONG_WRAP，而这里的行高只有 14px ——
+     * 文字一超宽就换到第二行，而第二行被高度裁掉，看起来就是"显示不全"。
+     * 宁可裁（CLIP）也不要换行。 */
+    lv_label_set_long_mode(s_lbl_tilt, LV_LABEL_LONG_CLIP);
+    lv_label_set_text(s_lbl_tilt, "倾角—");
 }
 
 static void build_axis_rows(lv_obj_t *scr)

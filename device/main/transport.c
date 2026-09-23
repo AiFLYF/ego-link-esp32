@@ -141,6 +141,7 @@ typedef enum {
     CMD_CAPTURE,        /* capture_once —— 累积样本做一次测量 */
     CMD_LED_BLINK,      /* led_blink    —— 闪 n 次（远端物理反馈） */
     CMD_LED_SET,        /* led_set      —— 常亮/熄灭 */
+    CMD_SET_ORIENT,     /* set_orient   —— 远程设置方向档位（与长按 BOOT 等价） */
 } cmd_kind_t;
 
 /* led_blink 的可选 pattern 参数：让服务端能表达"这是告警/确认/错误"的语义，
@@ -295,6 +296,32 @@ static void run_command(cmd_kind_t kind, const char *id,
         finish_command(true, false, NULL);
         break;
 
+    case CMD_SET_ORIENT: {
+        /* 与长按 BOOT 完全等价：改方向档位并写 NVS。
+         * 网页上直接点选档位，比"长按盲按 N 次"靠谱得多 ——
+         * 2026-09-23 真机标定时用户就是靠长按一次次试出来的。 */
+        int o = n;
+        if (o < 0) {
+            o = 0;
+        }
+        if (o > 15) {
+            o = 15;
+        }
+        accel_input_set_orientation(o);
+        utf8_strlcpy(s_cmd.id, id, sizeof(s_cmd.id));
+        s_cmd.running = true;
+        s_cmd.state = TRANSPORT_CMD_RUNNING;
+        s_cmd.started = xTaskGetTickCount();
+        s_cmd.n = 0;
+        led_feedback_play(LED_FB_ACK);
+        status_lock();
+        s_st.cmd_count++;
+        status_unlock();
+        ESP_LOGI(TAG, "cmd %s: set_orient -> %d", s_cmd.id, o);
+        finish_command(true, false, NULL);
+        break;
+    }
+
     case CMD_LED_SET:
         utf8_strlcpy(s_cmd.id, id, sizeof(s_cmd.id));
         s_cmd.running = true;
@@ -420,7 +447,9 @@ static char *build_body(int n, bool ask, const char *source)
         free(buf);
         return NULL;
     }
-    off += snprintf(buf + off, cap - (size_t)off, "\",\"batch\":[");
+    /* 带上方向档位：网页要靠它显示"板子现在是哪一档"，并让"改档位"有反馈闭环。 */
+    off += snprintf(buf + off, cap - (size_t)off, "\",\"o\":%d,\"batch\":[",
+                    accel_input_get_orientation());
     for (int i = 0; i < n; ++i) {
         if ((size_t)off + 48 > cap) {
             free(buf);
@@ -554,6 +583,10 @@ static void apply_response(const char *body, size_t len)
                     } else if (strcmp(jname->valuestring, "led_set") == 0) {
                         kind = CMD_LED_SET;
                         p_onf = json_bool(jparams, "on", true);
+                    } else if (strcmp(jname->valuestring, "set_orient") == 0) {
+                        /* 方向档位远程设置。参数复用 p_n —— 这条指令不需要样本数。 */
+                        kind = CMD_SET_ORIENT;
+                        p_n = json_int(jparams, "o", 0);
                     }
                     if (kind != CMD_NONE) {
                         utf8_strlcpy(cmd_id, jid->valuestring, sizeof(cmd_id));
@@ -745,6 +778,20 @@ static void transport_task(void *arg)
                     s_batch[n][1] = xyz[1];
                     s_batch[n][2] = xyz[2];
                     n++;
+                }
+
+                /* 界面要"跟手"：`s_st` 原来**只在 500ms 的上报周期**才更新一次
+                 * （2Hz），姿态球 2Hz 一跳，看着就是"迟钝"。
+                 * 这里每 5 个样本（20Hz）把**给屏幕看的那几个值**刷一遍 ——
+                 * 上报本身仍是 500ms 一批，判定/落盘也不受影响，纯粹是显示。
+                 * 取 20Hz 而不是 100Hz：锁的临界区很短，但没必要每样本都抢一次。 */
+                if ((n % 5) == 0) {
+                    status_lock();
+                    s_st.x_g = xyz[0];
+                    s_st.y_g = xyz[1];
+                    s_st.z_g = xyz[2];
+                    strlcpy(s_st.source, last_source, sizeof(s_st.source));
+                    status_unlock();
                 }
                 /* 正在执行远程指令就用同一个采样节拍累积，不额外阻塞 */
                 feed_capture(xyz);

@@ -407,7 +407,7 @@ class Renderer:
             tilt = "失重 o%d" % ori
         else:
             import math
-            tilt = "倾角 %d° o%d" % (
+            tilt = "倾角%d° o%d" % (
                 round(math.degrees(math.acos(min(1.0, abs(st["z"]) / st["mag"])))), ori)
         # 倾角文字跟随球的语义色（与板端 s_lbl_tilt 同步）
         tilt_c = (C["FAINT"] if ball_c == C["FAINT"] else
