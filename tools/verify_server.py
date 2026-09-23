@@ -119,7 +119,8 @@ def _c_json_escape(s):
     return "".join(out)
 
 
-def firmware_body(samples, source="SC7A20", ask=False, question=None, device="rw1-AB12"):
+def firmware_body(samples, source="SC7A20", ask=False, question=None, device="rw1-AB12",
+                  orient=None):
     """逐字节复刻 device/main/transport.c build_body() 的输出。
 
     固件是**手写** JSON（刻意不用 cJSON，因为 cJSON 用 %1.15g 打印 double，
@@ -130,9 +131,12 @@ def firmware_body(samples, source="SC7A20", ask=False, question=None, device="rw
     字段顺序也照抄：device 在最前（服务端拿到第一件事就是按它分片）。
     """
     pts = ",".join("[%.3f,%.3f,%.3f]" % s for s in samples)
-    body = ('{"device":"%s","batch":[%s],"x":%.3f,"y":%.3f,"z":%.3f,"source":"%s","ask":%s'
-            % (_c_json_escape(device), pts, samples[-1][0], samples[-1][1], samples[-1][2],
-               source, "true" if ask else "false"))
+    # 方向档位字段：板端每帧都带（`"o":N`）。orient=None 时**故意不发**，
+    # 用来模拟不带这个字段的老固件。
+    o_part = "" if orient is None else (',"o":%d' % orient)
+    body = ('{"device":"%s"%s,"batch":[%s],"x":%.3f,"y":%.3f,"z":%.3f,"source":"%s","ask":%s'
+            % (_c_json_escape(device), o_part, pts, samples[-1][0], samples[-1][1],
+               samples[-1][2], source, "true" if ask else "false"))
     if ask:
         body += ',"q":"%s"' % question
     return body + "}"
@@ -640,6 +644,97 @@ def main():
         check("去掉 device 字段的旧固件仍被接受（归到默认设备）",
               api("/api/latest").get("device") == "-",
               "实际: %s" % api("/api/latest").get("device"))
+
+        # ---- 19. 方向档位 oN：板端上报 + 网页点选改档 ----------------------
+        # 真机标定方向时用户得靠长按 BOOT 盲按 N 次，就是因为网页看不到档位。
+        # 现在板端每帧上报 o，网页显示并可直接点选改。
+        print("\n[18] 方向档位 oN 上报与远程设置")
+        for _ in range(3):
+            post_raw("http://127.0.0.1:%d/api/telemetry" % port,
+                     firmware_body([(0.0, 0.0, 1.0)] * 50, device=dev_a,
+                                   orient=7))
+            time.sleep(0.03)
+        got = [d for d in api("/api/devices")["devices"] if d["id"] == dev_a]
+        check("设备列表里带上了板端上报的 oN",
+              bool(got) and got[0].get("orient") == 7,
+              "实际: %s" % (got[0].get("orient") if got else None))
+
+        # 用**从没报过 o 的全新设备**验"老固件"这条路 —— 注意不能拿已经报过 7 的
+        # dev_a 来验：后面不带 o 的帧**不该清掉已知值**（板子最后报的档位仍然有效），
+        # 那是正确行为，一开始我按"会变 None"写，反而测错了。
+        old_dev = "老固件-01"
+        post_raw("http://127.0.0.1:%d/api/telemetry" % port,
+                 firmware_body([(0.0, 0.0, 1.0)] * 20, device=old_dev))
+        got = [d for d in api("/api/devices")["devices"] if d["id"] == old_dev]
+        check("老固件（从没报过 o）→ orient 为 None，且不报错",
+              bool(got) and got[0].get("orient") is None,
+              "实际: %s" % (got[0].get("orient") if got else None))
+
+        # 越界的 o 不该被采纳（畸形载荷别把网页搞乱）
+        bad_dev = "越界-01"
+        post_raw("http://127.0.0.1:%d/api/telemetry" % port,
+                 firmware_body([(0.0, 0.0, 1.0)] * 20, device=bad_dev, orient=99))
+        got = [d for d in api("/api/devices")["devices"] if d["id"] == bad_dev]
+        check("越界的 o 被忽略（不采纳、也不报错）",
+              bool(got) and got[0].get("orient") is None,
+              "实际: %s" % (got[0].get("orient") if got else None))
+
+        # 缺字段**不该清掉**已知值：板子最后报的档位仍然有效
+        post_raw("http://127.0.0.1:%d/api/telemetry" % port,
+                 firmware_body([(0.0, 0.0, 1.0)] * 20, device=dev_a))
+        got = [d for d in api("/api/devices")["devices"] if d["id"] == dev_a]
+        check("后续帧不带 o 时保留上一次的档位",
+              bool(got) and got[0].get("orient") == 7,
+              "实际: %s" % (got[0].get("orient") if got else None))
+
+        r = post_json("http://127.0.0.1:%d/api/command" % port,
+                      {"name": "set_orient", "params": {"o": 3}, "device": dev_a})
+        check("set_orient 在指令白名单里（不再 400）",
+              r.get("ok") is True and r.get("device") == dev_a,
+              "实际: %s" % r)
+
+        # ---- 20. 多选批量下发 ---------------------------------------------
+        print("\n[19] 多选/全选批量下发")
+        for _ in range(4):
+            post_raw("http://127.0.0.1:%d/api/telemetry" % port,
+                     firmware_body([(0.0, 0.0, 1.0)] * 50, device=dev_a))
+            post_raw("http://127.0.0.1:%d/api/telemetry" % port,
+                     firmware_body([(0.0, 0.0, 1.0)] * 50, device=dev_b))
+            time.sleep(0.03)
+
+        rb = post_json("http://127.0.0.1:%d/api/command" % port,
+                       {"name": "led_blink", "params": {"n": 2},
+                        "devices": [dev_a, dev_b]})
+        check("批量下发返回 batch 与每台的结果",
+              rb.get("ok") is True and rb.get("batch") is True
+              and rb.get("count") == 2 and len(rb.get("results", [])) == 2,
+              "实际: %s" % rb)
+        targets = sorted(x["device"] for x in rb.get("results", []))
+        check("两台各收到一条命令", targets == sorted([dev_a, dev_b]),
+              "实际: %s" % targets)
+        ca = api("/api/commands", dev_a).get("commands", [])
+        cb = api("/api/commands", dev_b).get("commands", [])
+        ids_b = [x["id"] for x in rb.get("results", [])]
+        check("命令确实分别进了两台各自的队列",
+              all(any(c["id"] == i for c in ca) for i in ids_b[:1])
+              and all(any(c["id"] == i for c in cb) for i in ids_b[1:]),
+              "A=%s B=%s" % ([c["id"] for c in ca][:2], [c["id"] for c in cb][:2]))
+
+        # 列表里有重复项时要去重：同一台收到两条一模一样的命令是纯噪音
+        rd = post_json("http://127.0.0.1:%d/api/command" % port,
+                       {"name": "led_set", "params": {"on": True},
+                        "devices": [dev_a, dev_a, dev_a]})
+        check("重复的设备名被去重（只下发一次）",
+              rd.get("batch") is not True and rd.get("device") == dev_a,
+              "实际: %s" % rd)
+
+        # 单台时的响应格式必须**一字未改**，否则老页面会坏
+        rs = post_json("http://127.0.0.1:%d/api/command" % port,
+                       {"name": "led_blink", "device": dev_a})
+        check("单台的响应格式与以前一致（ok/id/device/device_online）",
+              set(rs.keys()) >= {"ok", "id", "device", "device_online"}
+              and "batch" not in rs,
+              "实际 keys: %s" % sorted(rs.keys()))
 
 
     finally:

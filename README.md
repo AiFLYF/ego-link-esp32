@@ -130,8 +130,8 @@ python server\server.py
 | 方法/路径 | 说明 |
 |---|---|
 | `POST /api/telemetry` | 请求 `{device, batch:[[x,y,z],…], x, y, z, source, ask, q[, result][, btn]}` → 响应 `{ok, activity, reply, pending[, cmd]}` |
-| `POST /api/command` | 下发远程指令 `{"name":"capture_once"[, "device":"rw1-07"]}` → 响应 `{ok, id, device, device_online}` |
-| `GET /api/devices` | 所有上报过的设备列表（在线/离线、最后上报距今秒数、当前活动、上报帧数） |
+| `POST /api/command` | 下发远程指令。单台 `{"name":"capture_once","device":"rw1-07"}` → `{ok, id, device, device_online}`；**多台** `{"name":"led_blink","devices":["a","b"]}` → `{ok, batch, count, results:[…]}` |
+| `GET /api/devices` | 所有上报过的设备列表（在线/离线、最后上报距今秒数、当前活动、上报帧数、**方向档位 `orient`**） |
 | `GET /api/commands` | 最近 20 条指令及其状态、执行结果。可加 `?device=` 看指定设备 |
 | `GET /api/latest` | 快照（状态 + 8s 曲线降采样 + 事件流 + 指令列表），JSON。可加 `?device=` |
 | `GET /api/stream` | SSE 实时推送（仪表盘用）。可加 `?device=`；首帧同时带 `devices` 列表 |
@@ -152,6 +152,16 @@ python server\server.py
 - `cmd` / `result` 是第 2 周的远程指令字段，见下。
 
 ### 远程指令通道（第 2 周）
+
+**多选/全选批量下发**：设备卡片里每台前面有复选框，勾几台，下面的指令就同时发给这几台
+（服务端一次请求给每台各建一条命令，会自动去重、保持顺序）。不勾任何一台 =
+只发给「当前查看的那台」—— 单板场景和以前完全一样。
+典型用法：一个班 20 块板同时闪灯确认在线（全选 → `led_blink`）。
+
+**方向档位 `oN` 可以远程校准**：「远程指令」卡片里有一个档位选择器 + 「应用档位」按钮，
+选中目标板后直接点选 `o0`–`o15` 即可（等价于板端长按 BOOT，但不用盲按 N 次）。
+板端每帧上报自己的档位，所以网页能看到「板子现在是哪一档」——
+2026-09-23 真机标定时就是靠长按一次次试出来的，有了这个就不用猜了。
 
 板子是**纯客户端**：它只会周期性地 POST，没有监听端口、收不到服务端主动推送。
 所以指令用「搭车」的方式走：
@@ -329,6 +339,8 @@ AP 存活 **5 分钟无操作自动关闭**回 STA（避免忘记关热点长期
   所有不带 `?device=` 的接口也照旧回退到"最近上报过的那台"。**单板场景行为不变。**
 - **指令定向下发**：网页上选中哪台，指令就只进哪台的队列；跌落告警也只发给摔的那台
   （20 块板同时闪灯是噪音）。
+- **也可以批量下发**：设备卡片里勾多台（或点「全选」），指令就同时发给这几台 ——
+  一次请求服务端给每台各建一条命令，去重、保持顺序。
 - **上限**：同时在册 32 台，超出时淘汰最久没上报的那台。
 - **落盘**：`telemetry-*.jsonl` / `events-*.jsonl` 每行都带 `dev` 字段，事后能按板分析。
 
@@ -440,7 +452,7 @@ python tools\verify_server.py
 ```
 
 它会自己拉起一个临时服务器、灌入各场景、检查分类/计步/跌落/落盘/超时解耦/畸形载荷/
-**指令往返与超时**/**物理反馈指令**/**跌落自动告警**/**多设备分片与定向下发**，共 72 项断言，
+**指令往返与超时**/**物理反馈指令**/**跌落自动告警**/**多设备分片与定向下发**/**方向档位上报与远程设置**/**多选批量下发**，共 82 项断言，
 全程不需要硬件，也不需要真实大模型（用一个故意慢 6 秒的假大模型验证不阻塞）。
 
 ### 可选：接入真实大模型
@@ -469,7 +481,7 @@ python server\server.py
 | 首次编译卡在拉取组件 | 离线场景拷入 `managed_components/`；在线场景检查能否访问 components.espressif.com |
 | 改了 `idf_component.yml` 后编译报 `[safe-delete]` 或重新下载组件 | 删掉 `device/managed_components/` 让它按 `dependencies.lock` 重建即可 |
 | **在 Git Bash 里跑 `idf.py` 只打印一句 "MSys/Mingw is no longer supported" 就退出** | ESP-IDF 5.4 的 `idf.py` 只要环境里存在 `MSYSTEM` 变量（Git for Windows 会强制注入，`unset` 也删不掉）就**直接跳过 `main()`**。用 `build_device.bat`，或 `python tools/idf_build.py -D SDKCONFIG_DEFAULTS=sdkconfig.bsp.esp32_s3_eye build` |
-| 倾斜方向左右/上下反了 | **长按 BOOT 键**循环切换档位（屏幕倾角小字里的 `oN`，0–15），
+| 倾斜方向左右/上下反了 | 两种办法：① **网页仪表盘「远程指令」里的档位选择器**直接点选 `o0`–`o15`（推荐，不用盲按）；② **长按 BOOT 键**循环切换（屏幕倾角小字里的 `oN`，0–15）。
 判据：**平放屏幕朝上、把右边压低 → 屏幕和仪表盘都应写「向右倾斜」**。
 选中的值存 NVS，不用重编译。⚠️ 只看「平放」的读数是**分不出**平面内 4 种旋转的
 （平放时不同档位读数可能完全一样），**必须倾斜着试** |
