@@ -83,12 +83,18 @@ def _expect_400(url, payload):
         return False
 
 
-def _wait_cmd(port, cid, timeout):
-    """等一条指令走到终态，返回它的记录（超时则返回最后看到的样子）。"""
+def _wait_cmd(port, cid, timeout, device=None):
+    """等一条指令走到终态，返回它的记录（超时则返回最后看到的样子）。
+
+    `device` 建议显式给：不给就走"最近上报的那台"，而多节测试里前几节的假板子
+    可能刚好在那一刻掉线，"最近上报"会切到别人 —— 于是查不到自己的命令。
+    （2026-09-23 真踩到：手工复现完全正常、套件里稳定失败，就是这条竞态。）
+    """
     deadline = time.time() + timeout
     rec = None
+    q = ("?device=" + urllib.parse.quote(device, safe="")) if device else ""
     while time.time() < deadline:
-        cmds = get_json("http://127.0.0.1:%d/api/commands" % port).get("commands", [])
+        cmds = get_json("http://127.0.0.1:%d/api/commands%s" % (port, q)).get("commands", [])
         rec = next((c for c in cmds if c["id"] == cid), None)
         if rec and rec["state"] in ("done", "failed", "timeout"):
             return rec
@@ -402,20 +408,22 @@ def main():
         check("非法指令名被拒绝", _expect_400(
             "http://127.0.0.1:%d/api/command" % port, {"name": "rm -rf /"}))
 
+        r12_dev = "往返-01"        # 固定设备名：不再依赖"最近上报的那台"（见 _wait_cmd 注释）
         board = subprocess.Popen(
             [PY, os.path.join(HERE, "fake_board.py"),
-             "--url", "http://127.0.0.1:%d" % port,
+             "--url", "http://127.0.0.1:%d" % port, "--device", r12_dev,
              "--scenario", "tilt", "--seconds", "14", "--quiet"],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         time.sleep(2.0)                    # 先让它报一帧，服务器才知道设备在线
 
-        r = post_json("http://127.0.0.1:%d/api/command" % port, {"name": "capture_once"})
+        r = post_json("http://127.0.0.1:%d/api/command" % port,
+                      {"name": "capture_once", "device": r12_dev})
         cid = r.get("id")
         check("下发指令返回 request_id", bool(cid), "实际: %s" % cid)
         check("下发响应带设备在线状态", r.get("device_online") is True,
               "实际: %s" % r.get("device_online"))
 
-        rec = _wait_cmd(port, cid, 14)
+        rec = _wait_cmd(port, cid, 14, device=r12_dev)
         board.wait(timeout=25)
 
         # 用服务端记录的状态迁移历史断言，**不再靠轮询捕捉中间态**：
@@ -692,6 +700,31 @@ def main():
         check("set_orient 在指令白名单里（不再 400）",
               r.get("ok") is True and r.get("device") == dev_a,
               "实际: %s" % r)
+        # ⚠️ 这条是"漏测"补的：sanitize_params 原来对 set_orient 返回 {}，
+        # 于是网页选好档位、请求体里也带着 o，**服务端却把它丢了**，
+        # 板子只会收到"改成 o0"。只验请求体是发现不了的，必须验队列里存的。
+        cmds_o = api("/api/commands", dev_a).get("commands", [])
+        rec_o = next((c for c in cmds_o if c["id"] == r.get("id")), None)
+        check("set_orient 的档位参数真的进了队列（不被 sanitize 丢掉）",
+              bool(rec_o) and rec_o.get("params", {}).get("o") == 3,
+              "实际: %s" % (rec_o.get("params") if rec_o else None))
+
+        # set_config：网页"板子设置"卡片走的就是它（WiFi / 服务器地址 / 上报周期）
+        rc = post_json("http://127.0.0.1:%d/api/command" % port,
+                       {"name": "set_config",
+                        "params": {"ssid": "新WiFi", "pass": "pw123456",
+                                   "url": "http://10.0.0.5:8000", "period_ms": 200},
+                        "device": dev_a})
+        check("set_config 在指令白名单里",
+              rc.get("ok") is True and rc.get("device") == dev_a,
+              "实际: %s" % rc)
+        cmds_c = api("/api/commands", dev_a).get("commands", [])
+        rec_c = next((c for c in cmds_c if c["id"] == rc.get("id")), None)
+        check("set_config 的参数原样进队列（ssid/url/period_ms 都在）",
+              bool(rec_c) and rec_c.get("params", {}).get("ssid") == "新WiFi"
+              and rec_c.get("params", {}).get("period_ms") == 200
+              and rec_c.get("params", {}).get("url") == "http://10.0.0.5:8000",
+              "实际: %s" % (rec_c.get("params") if rec_c else None))
 
         # ---- 20. 多选批量下发 ---------------------------------------------
         print("\n[19] 多选/全选批量下发")

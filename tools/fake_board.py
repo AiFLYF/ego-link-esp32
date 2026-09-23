@@ -121,6 +121,9 @@ def main():
     ap.add_argument("--sample-hz", type=float, default=SAMPLE_HZ,
                     help="本地采样率（Hz），对应固件的 RW1_SAMPLE_PERIOD_MS")
     ap.add_argument("--source", default="SC7A20")
+    ap.add_argument("--orient", type=int, default=None,
+                    help="模拟上报方向档位 oN（0..15）。不带则**不发该字段**，"
+                         "等价于不支持 oN 的老固件")
     ap.add_argument("--device", default=None,
                     help="设备名（对应固件的 device 字段）。不带则**省略该字段**，"
                          "模拟不带 device 的老固件；多板场景下每块板给一个不同的名字")
@@ -180,6 +183,8 @@ def main():
         }
         if args.device:
             payload["device"] = args.device
+        if args.orient is not None:
+            payload["o"] = args.orient
         if b in ask_marks:
             payload["q"] = "我现在的运动状态怎么样？"
 
