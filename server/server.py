@@ -71,7 +71,8 @@ FREEFALL_MIN_S = 0.05     # 失重判定：至少持续这么久才算疑似跌�
 # 第 3 周在此基础上加了两个「物理反馈」指令：led_blink / led_set —— 板载 LED 在 GPIO3。
 CMD_TIMEOUT_S = 10.0      # 命令下发后多久没收到结果就判超时
 CMD_MAX_HISTORY = 20      # 保留最近多少条命令供网页显示
-CMD_NAMES = ("capture_once", "led_blink", "led_set")   # 白名单（不认的名字直接 400）
+CMD_NAMES = ("capture_once", "led_blink", "led_set", "set_orient")   # 白名单（不认的名字直接 400）
+# set_orient 是"远程改方向档位"，与板端长按 BOOT 等价 —— 网页上点选比盲按 N 次靠谱。
 
 LED_MAX_BLINKS = 12       # 一次 led_blink 最多闪几下（板端也会再夹一道）
 LED_PATTERNS = ("alert", "ack", "error")   # led_blink 的语义图案（板端映射到预置图案）
@@ -121,6 +122,7 @@ class Device:
             "last_post": 0.0,
             "posts_ok": 0,                        # 成功上报帧数（网页顶栏「↑N 帧」）
             "source": "-",
+            "orient": None,                       # 板端上报的方向档位 oN（老固件没有 → None）
             "latest": None,                       # 最近一帧原始数据
             "activity": ACTIVITY_IDLE,
             "step_count": 0,
@@ -218,6 +220,7 @@ def devices_snapshot(now=None):
             "online": bool(st["device_online"]),
             "age": round(max(0.0, now - st["last_post"]), 1),
             "source": st["source"],
+            "orient": st.get("orient"),
             "activity": st["activity"],
             "sample_hz": st["sample_hz"],
             "step_count": st["step_count"],
@@ -890,22 +893,54 @@ class Handler(BaseHTTPRequestHandler):
             self._send(400, json.dumps(
                 {"ok": False, "error": "unknown command: %s" % name}, ensure_ascii=False))
             return
-        # 定向下发：带上 device 就发给那一台，不带就发给"最近上报过的"那台
-        # （单板场景下网页不带这个字段，行为和以前完全一样）。
-        want = msg.get("device")
-        did = clean_device_id(want) if want else None
-        with LOCK:
-            dev = pick_device(did)
-            online = dev.st["device_online"]
-            target = dev.id
-        cid = new_command(dev, name, msg.get("params"))
-        with LOCK:
-            rec = dev.commands.get(cid)
-            pdesc = (" %s" % json.dumps(rec["params"], ensure_ascii=False)) if rec and rec["params"] else ""
-        push_event(dev, "cmd", "下发命令 %s%s（%s → %s）" % (name, pdesc, cid, target))
-        self._send(200, json.dumps(
-            {"ok": True, "id": cid, "device": target, "device_online": online},
-            ensure_ascii=False))
+        # 目标设备 —— 三种写法都支持（**单台的响应格式一字未改**，老页面照旧）：
+        #   device: "a"          单台
+        #   device: ["a","b"]    多台
+        #   devices: ["a","b"]   多台（显式；网页"多选/全选"走这个）
+        #   都不带                → 最近上报过的那台（单板场景，与以前一致）
+        want = msg.get("devices")
+        if want is None:
+            want = msg.get("device")
+        if isinstance(want, (list, tuple)):
+            raw = [clean_device_id(x) for x in want]
+        elif want:
+            raw = [clean_device_id(want)]
+        else:
+            raw = [None]
+
+        # 去重但保持顺序：全选时列表里可能有重复项，重复下发会让同一台收到两条一样的命令
+        seen, targets = set(), []
+        for t in raw:
+            k = t if t else "-"
+            if k in seen:
+                continue
+            seen.add(k)
+            targets.append(t)
+        if not targets:
+            targets = [None]
+
+        results = []
+        for t in targets:
+            with LOCK:
+                dev = pick_device(t)
+                online = dev.st["device_online"]
+                target = dev.id
+            cid = new_command(dev, name, msg.get("params"))
+            with LOCK:
+                rec = dev.commands.get(cid)
+                pdesc = (" %s" % json.dumps(rec["params"], ensure_ascii=False)) if rec and rec["params"] else ""
+            push_event(dev, "cmd", "下发命令 %s%s（%s → %s）" % (name, pdesc, cid, target))
+            results.append({"device": target, "id": cid, "device_online": online})
+
+        if len(results) == 1:
+            r = results[0]
+            self._send(200, json.dumps(
+                {"ok": True, "id": r["id"], "device": r["device"],
+                 "device_online": r["device_online"]}, ensure_ascii=False))
+        else:
+            self._send(200, json.dumps(
+                {"ok": True, "batch": True, "count": len(results), "results": results},
+                ensure_ascii=False))
 
     # ---- telemetry (板 → 服务器 → 板) --------------------------------------
     def _telemetry(self):
@@ -947,6 +982,12 @@ class Handler(BaseHTTPRequestHandler):
             st["last_post"] = now
             st["posts_ok"] += 1
             st["source"] = str(msg.get("source", "-"))[:24]
+            # 方向档位：板端每帧都带（老固件不带 → None，网页就不显示这一项）
+            o_raw = msg.get("o")
+            if isinstance(o_raw, bool):
+                o_raw = None
+            if isinstance(o_raw, (int, float)) and 0 <= int(o_raw) <= 15:
+                st["orient"] = int(o_raw)
             st["latest"] = (now, pts[-1][0], pts[-1][1], pts[-1][2])
             if not was_online:
                 push_event(dev, "info", "设备 %s 已连接" % dev.id)
@@ -1288,8 +1329,11 @@ footer{max-width:1400px;margin:18px auto 0;color:var(--faint);font-size:11px;lin
   <div class="card-head">
     <h2>设备</h2>
     <span class="src" id="devcount"></span>
+    <button id="devall" style="margin-left:auto">全选</button>
   </div>
   <div class="devlist" id="devs"></div>
+  <div class="hint" style="margin-top:6px">勾选多台后，下面的远程指令会**同时**下发给它们
+    （不勾 = 只发给当前查看的那台）</div>
 </section>
 
 <main class="grid">
@@ -1350,6 +1394,13 @@ footer{max-width:1400px;margin:18px auto 0;color:var(--faint);font-size:11px;lin
   <div class="row">
     <span id="cmdbts"></span>
     <span id="cmdhint" class="hint"></span>
+  </div>
+  <div class="row" style="margin-top:10px;align-items:center;gap:8px">
+    <span class="src">方向档位 oN</span>
+    <select id="orientsel" style="background:var(--card-hi);color:var(--text);
+      border:1px solid var(--line);border-radius:8px;padding:4px 8px"></select>
+    <button id="orientapply">应用档位</button>
+    <span id="orientnow" class="hint"></span>
   </div>
   <div class="list" id="cmds" style="margin-top:10px"></div>
 </section>
@@ -1544,13 +1595,18 @@ function setBall(x, y, mag){
     d.style.boxShadow = "0 0 18px -2px " + color;
   }
 }
+var lastDeg = null;
 function setTilt(z, mag){
   var t, color;
-  if (mag < 0.05){ t = "无读数"; color = C.faint; }
-  else if (mag < 0.35){ t = "失重"; color = C.red; }
+  if (mag < 0.05){ t = "无读数"; color = C.faint; lastDeg = null; }
+  else if (mag < 0.35){ t = "失重"; color = C.red; lastDeg = null; }
   else {
     var c = Math.min(1, Math.abs(z)/mag);
-    var deg = Math.round(Math.acos(c)*180/Math.PI);
+    var raw = Math.acos(c)*180/Math.PI;
+    /* 只对**角度**做低通：acos 在接近平放时对噪声极敏感（0.03g → 14°），
+       板端踩过同一个坑。姿态球不动它 —— 球要跟手。 */
+    lastDeg = (lastDeg === null) ? raw : (lastDeg + 0.4*(raw - lastDeg));
+    var deg = Math.round(lastDeg);
     t = "倾角 " + deg + "°";
     color = deg === 0 ? C.green : (deg < 40 ? C.amber : C.red);
   }
@@ -1574,6 +1630,11 @@ function setBar(i, v){
 
 /* ---------------- 指令面板 ---------------- */
 var busy = false, devOnline = false, ledSteady = false, cmdNames = [], cmdsSeen = [];
+/* 多选下发：勾中的设备名集合（空 = 不指定，交给服务端用"最近上报的那台"，
+   单板场景与以前完全一样）。**只在"下发指令"时生效**，"查看"仍然是单选。 */
+var selDevices = {};
+/* 板端上报的方向档位（每台一份），用来显示"板子现在是哪一档" */
+var devOrient = {};
 var STNAME = { queued:"排队中", sent:"已下发", done:"已完成", failed:"失败", timeout:"超时" };
 
 function renderButtons(){
@@ -1604,26 +1665,63 @@ function syncButtons(){
     }
   });
 }
-function sendCmd(name, btn){
+function sendCmd(name, btn, overrideParams){
   var ui = CMD_UI[name] || {};
-  var params = ui.toggle && name === "led_set" ? {on: !ledSteady} : (ui.params || {});
+  var params = overrideParams !== undefined ? overrideParams
+             : (ui.toggle && name === "led_set" ? {on: !ledSteady} : (ui.params || {}));
   if (btn) btn.disabled = true;
   $("cmdhint").textContent = "";
-  /* 带上当前选中的设备名 —— 不选就交给服务端用"最近上报的那台"（单板场景） */
   var body = {name:name, params:params};
-  if (selDevice) body.device = selDevice;
+  var picked = Object.keys(selDevices);
+  if (picked.length > 1){
+    /* 多选 → 一次请求让服务端给每台各建一条命令（比前端循环 N 次更省事，
+       而且服务端会去重、保持顺序） */
+    body.devices = picked;
+  } else if (picked.length === 1){
+    body.device = picked[0];
+  } else if (selDevice){
+    /* 没勾任何一台 → 就发给"当前查看的那台"（单板场景与以前完全一样） */
+    body.device = selDevice;
+  }
   fetch("/api/command", {
     method:"POST", headers:{"Content-Type":"application/json"},
     body: JSON.stringify(body)
   }).then(function(r){ return r.json(); }).then(function(d){
     if (!d.ok){ $("cmdhint").textContent = "下发失败：" + (d.error || "未知错误"); return; }
-    $("cmdhint").textContent = "已下发 " + d.id
-      + (d.device ? " → " + d.device : "")
-      + (d.device_online ? "" : "（注意：这块板子当前不在线）");
+    if (d.batch){
+      var off = (d.results || []).filter(function(x){ return !x.device_online; }).length;
+      $("cmdhint").textContent = "已下发给 " + d.count + " 台"
+        + (off ? ("（其中 " + off + " 台当前不在线，等它们回来才会执行）") : "");
+    } else {
+      $("cmdhint").textContent = "已下发 " + d.id
+        + (d.device ? " → " + d.device : "")
+        + (d.device_online ? "" : "（注意：这块板子当前不在线）");
+    }
     pull();
   }).catch(function(e){
     $("cmdhint").textContent = "下发失败：" + e;
   }).then(function(){ syncButtons(); });
+}
+
+/* ---- 方向档位 oN：显示 + 点选修改 ----
+ * 板端长按 BOOT 也能换档，但那是"盲按 N 次"；网页上直接选第几档、还能看到
+ * 板子当前在哪一档，标定方向就不用再靠猜了（2026-09-23 用户真机标定时踩过）。 */
+function syncOrient(){
+  var sel = $("orientsel");
+  if (sel && !sel.dataset.built){
+    var opts = "";
+    for (var i = 0; i < 16; i++) opts += '<option value="' + i + '">o' + i + '</option>';
+    sel.innerHTML = opts;
+    sel.dataset.built = "1";
+  }
+  var now = $("orientnow");
+  if (!now) return;
+  var who = Object.keys(selDevices);
+  var ids = who.length ? who : (selDevice ? [selDevice] : Object.keys(devOrient));
+  var parts = ids.filter(function(id){ return devOrient[id] !== undefined; })
+                 .map(function(id){ return esc(id) + " = o" + devOrient[id]; });
+  now.textContent = parts.length ? ("当前 " + parts.join(" / "))
+                                 : "（还没收到板端上报的档位）";
 }
 
 function renderCmds(cmds){
@@ -1692,11 +1790,17 @@ function renderDevices(list, current){
     if (d.online) online++;
     var color = d.online ? C.green : C.red;
     var title = d.activity || "";
+    /* 记住每台的档位，供"方向档位"控件显示 */
+    if (d.orient !== null && d.orient !== undefined) devOrient[d.id] = d.orient;
+    var oTxt = (d.orient === null || d.orient === undefined) ? "" : (" · o" + d.orient);
+    var checked = selDevices[d.id] ? " checked" : "";
     return '<div class="dev' + (d.id === current ? " sel" : "") + '" data-dev="' + esc(d.id) + '">'
-      + '<div class="row1"><span class="dot' + (d.online ? "" : " off") + '" style="background:' + color + '"></span>'
+      + '<div class="row1">'
+      + '<input type="checkbox" class="devchk" data-chk="' + esc(d.id) + '"' + checked + '>'
+      + '<span class="dot' + (d.online ? "" : " off") + '" style="background:' + color + '"></span>'
       + '<span class="did">' + esc(d.id) + '</span></div>'
       + '<div class="meta">' + (d.online ? "在线" : "离线") + ' · ' + ago(d.age)
-      + (d.source && d.source !== "-" ? " · " + esc(d.source) : "") + '</div>'
+      + (d.source && d.source !== "-" ? " · " + esc(d.source) : "") + esc(oTxt) + '</div>'
       + '<div class="meta">' + esc(title) + '</div>'
       + '</div>';
   }).join("");
@@ -1707,8 +1811,42 @@ function renderDevices(list, current){
   var host = $("devs");
   host.innerHTML = h;
   Array.prototype.forEach.call(host.querySelectorAll(".dev"), function(el){
-    el.onclick = function(){ selectDevice(el.getAttribute("data-dev")); };
+    el.onclick = function(ev){
+      /* 点复选框是"勾选下发目标"，不该顺带切换查看的设备 */
+      if (ev.target && ev.target.classList && ev.target.classList.contains("devchk")) return;
+      selectDevice(el.getAttribute("data-dev"));
+    };
   });
+  Array.prototype.forEach.call(host.querySelectorAll(".devchk"), function(cb){
+    cb.onclick = function(ev){
+      ev.stopPropagation();
+      var id = cb.getAttribute("data-chk");
+      if (cb.checked) selDevices[id] = 1; else delete selDevices[id];
+      syncDevAll();
+    };
+  });
+  syncDevAll();
+}
+
+/* 「全选」按钮：全都勾上 / 全都取消。文案随状态变，避免用户看不出当前是哪种。 */
+function syncDevAll(){
+  var n = Object.keys(selDevices).length;
+  var btn = $("devall");
+  if (btn) btn.textContent = n ? ("取消全选（已选 " + n + "）") : "全选";
+  var host = $("devs");
+  if (host) Array.prototype.forEach.call(host.querySelectorAll(".devchk"), function(cb){
+    var id = cb.getAttribute("data-chk");
+    cb.checked = !!selDevices[id];
+  });
+}
+function toggleDevAll(){
+  var boxes = $("devs") ? $("devs").querySelectorAll(".devchk") : [];
+  if (Object.keys(selDevices).length){
+    selDevices = {};
+  } else {
+    Array.prototype.forEach.call(boxes, function(cb){ selDevices[cb.getAttribute("data-chk")] = 1; });
+  }
+  syncDevAll();
 }
 
 function selectDevice(id){
@@ -1815,6 +1953,13 @@ fetch("/api/logs").then(function(r){ return r.json(); }).then(function(l){
 }).catch(function(){});
 fetch("/api/commands" + devQuery()).then(function(r){ return r.json(); }).then(function(d){
   cmdNames = d.names || ["capture_once"];
+  if ($("devall")) $("devall").onclick = toggleDevAll;
+  if ($("orientapply")) $("orientapply").onclick = function(){
+    var v = parseInt($("orientsel").value, 10);
+    if (isNaN(v)) return;
+    sendCmd("set_orient", this, {o: v});
+  };
+  syncOrient();
   $("names").textContent = cmdNames.join(" / ");
   renderButtons();
   renderCmds(d.commands);
