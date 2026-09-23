@@ -77,7 +77,7 @@ void accel_input_map_to_screen(float x_g, float y_g, float z_g,
  *     （那是镜像），说明这颗芯片相对板面是镜像的。所以档位表要同时覆盖两族。
  *
  * 现在 16 档 = {法线 = ±传感器 y} × {平面内 4 种 90° 旋转} × {右手/镜像}：
- *   o0..o7  法线 = −传感器 y（本机实测族，**o0 就是实测正确的那个**）
+ *   o0..o7  法线 = −传感器 y（本机实测族，**o4 是实测正确的那个**）
  *   o8..o15 法线 = +传感器 y
  *
  * Lets the tilt direction be corrected on-device without a rebuild. The value
