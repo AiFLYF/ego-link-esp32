@@ -424,7 +424,10 @@ static void run_set_config(const char *id)
     if (s_cfg_url[0] != '\0') {
         utf8_strlcpy(cfg.url, s_cfg_url, sizeof(cfg.url));
     }
-    if (s_cfg_period >= 100 && s_cfg_period <= 2000) {
+    /* 下限从 100ms 放宽到 50ms —— 50ms = 20Hz。用户要 20Hz 的实时感，
+     * 100ms 只能到 10Hz。注意 50ms 已接近 WiFi 单次往返的量级，
+     * 实际能跑多快取决于现场网络，跑不到也别指望更低了。 */
+    if (s_cfg_period >= 50 && s_cfg_period <= 2000) {
         cfg.period_ms = (uint16_t)s_cfg_period;
     }
     if (!net_config_save(&cfg)) {
@@ -1254,7 +1257,7 @@ void transport_reload_config(void)
     /* 上报周期也在这里刷新：`set_config` 改完周期后调本函数即可生效，
      * 不用重启。夹到 100..2000ms —— 太短会把 WiFi 压满，太长界面就不跟手了。 */
     int per = (int)cfg.period_ms;
-    if (per < 100 || per > 2000) {
+    if (per < 50 || per > 2000) {
         per = CONFIG_RW1_TELEMETRY_PERIOD_MS;
     }
     s_post_ticks = pdMS_TO_TICKS(per);
