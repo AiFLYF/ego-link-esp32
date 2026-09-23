@@ -414,10 +414,24 @@ def main():
              "--url", "http://127.0.0.1:%d" % port, "--device", r12_dev,
              "--scenario", "tilt", "--seconds", "14", "--quiet"],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        time.sleep(2.0)                    # 先让它报一帧，服务器才知道设备在线
+        # **等它真的在册**再下发，别用固定 sleep：板子还没报上第一帧时，
+        # 服务端的 pick_device 会回退到"最近上报的那台"，命令就发给了别人 ——
+        # 响应里 device_online 还是 True（那是别人的），断言却全在等自己的命令，
+        # 表现为"稳定失败但手工复现完全正常"（2026-09-23 踩过）。
+        for _ in range(40):
+            live = [d["id"] for d in get_json(
+                "http://127.0.0.1:%d/api/devices" % port).get("devices", [])]
+            if r12_dev in live:
+                break
+            time.sleep(0.25)
+        else:
+            check("测试用的板子已上报（%s 在册）" % r12_dev, False,
+                  "实际在册: %s" % live)
 
         r = post_json("http://127.0.0.1:%d/api/command" % port,
                       {"name": "capture_once", "device": r12_dev})
+        check("命令确实发给了指定设备（没被回退给别人）",
+              r.get("device") == r12_dev, "实际: %s" % r.get("device"))
         cid = r.get("id")
         check("下发指令返回 request_id", bool(cid), "实际: %s" % cid)
         check("下发响应带设备在线状态", r.get("device_online") is True,
