@@ -463,23 +463,38 @@ def main():
 
         # ---- 13. 指令超时看护 ---------------------------------------------
         print("\n[13] 指令超时（板子故意不执行）")
+        r13_dev = "聋板-01"        # 同第 12 节：固定设备名，别依赖"最近上报的那台"
         deaf = subprocess.Popen(
             [PY, os.path.join(HERE, "fake_board.py"),
-             "--url", "http://127.0.0.1:%d" % port,
-             "--scenario", "idle", "--seconds", "12", "--no-cmd", "--quiet"],
+             "--url", "http://127.0.0.1:%d" % port, "--device", r13_dev,
+             "--scenario", "idle", "--seconds", "14", "--no-cmd", "--quiet"],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        time.sleep(2.0)
-        r2 = post_json("http://127.0.0.1:%d/api/command" % port, {"name": "capture_once"})
+        for _ in range(40):
+            live = [d["id"] for d in get_json(
+                "http://127.0.0.1:%d/api/devices" % port).get("devices", [])]
+            if r13_dev in live:
+                break
+            time.sleep(0.25)
+        r2 = post_json("http://127.0.0.1:%d/api/command" % port,
+                       {"name": "capture_once", "device": r13_dev})
         cid2 = r2.get("id")
         rec2, st2 = None, None
-        deadline = time.time() + 12
+        q13 = "?device=" + urllib.parse.quote(r13_dev, safe="")
+        deadline = time.time() + 14
         while time.time() < deadline:
-            cmds = get_json("http://127.0.0.1:%d/api/commands" % port).get("commands", [])
+            cmds = get_json("http://127.0.0.1:%d/api/commands%s" % (port, q13)).get("commands", [])
             rec2 = next((c for c in cmds if c["id"] == cid2), None)
             st2 = rec2 and rec2["state"]
             if st2 == "timeout":
                 break
             time.sleep(0.4)
+        # **测完立刻停掉它**：这块板子故意不执行命令，而它还在上报 ——
+        # 下一节如果不带设备名，命令就会被发给它，然后永远等不到 done
+        # （2026-09-23 就是这么把下一节测挂的）。
+        try:
+            deaf.kill()
+        except OSError:
+            pass
         deaf.wait(timeout=25)
         check("板子不执行时被判超时", st2 == "timeout", "实际: %s" % st2)
         check("超时事件进了事件流",
@@ -487,16 +502,23 @@ def main():
 
         # ---- 15. 远端物理反馈指令（第 3 周）--------------------------------
         print("\n[14] 物理反馈指令 led_blink / led_set")
+        r14_dev = "灯板-01"        # 同上：固定设备名，别依赖"最近上报的那台"
         board2 = subprocess.Popen(
             [PY, os.path.join(HERE, "fake_board.py"),
-             "--url", "http://127.0.0.1:%d" % port,
-             "--scenario", "idle", "--seconds", "18", "--quiet"],
+             "--url", "http://127.0.0.1:%d" % port, "--device", r14_dev,
+             "--scenario", "idle", "--seconds", "20", "--quiet"],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        time.sleep(2.0)
+        for _ in range(40):
+            live = [d["id"] for d in get_json(
+                "http://127.0.0.1:%d/api/devices" % port).get("devices", [])]
+            if r14_dev in live:
+                break
+            time.sleep(0.25)
 
         r3 = post_json("http://127.0.0.1:%d/api/command" % port,
-                       {"name": "led_blink", "params": {"n": 3, "on_ms": 80, "off_ms": 80}})
-        rec3 = _wait_cmd(port, r3.get("id"), 14)
+                       {"name": "led_blink", "params": {"n": 3, "on_ms": 80, "off_ms": 80},
+                        "device": r14_dev})
+        rec3 = _wait_cmd(port, r3.get("id"), 14, device=r14_dev)
         check("led_blink 走到 done", rec3 is not None and rec3["state"] == "done",
               "实际: %s" % (rec3 and rec3["state"]))
         check("led_blink 参数被保留", (rec3 or {}).get("params", {}).get("n") == 3,
