@@ -41,6 +41,17 @@ bool sd_card_mounted(void);
 /** @brief 卸载并释放资源（正常业务用不到，留给"换卡"场景）。 */
 esp_err_t sd_card_deinit(void);
 
+/**
+ * @brief **格式化**成 FAT32（卡里原来的东西全部消失）。
+ *
+ * 用途：卡里若是长文件名/中文名的旧文件，在 LFN 关闭的配置下**板子既看不见也删不掉**
+ * （VFS 访问不到），只能整卡格式化才拿得回空间。
+ *
+ * 调用方必须先 `sd_log_close()` —— 否则日志的文件句柄会指向失效的 FAT 表。
+ * @return ESP_OK 成功；未挂载返回 ESP_ERR_INVALID_STATE。
+ */
+esp_err_t sd_card_format(void);
+
 /** @brief 把卡的容量/剩余空间打进日志。未挂载时静默返回。 */
 void sd_card_log_info(void);
 

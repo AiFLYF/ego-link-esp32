@@ -15,6 +15,7 @@ idf_component_register(
         "prov_form.c"
         "provisioning.c"
         "sd_card.c"
+        "sd_log.c"
         "transport.c"
         "led_feedback.c"
         "ui.c"

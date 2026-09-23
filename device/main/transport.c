@@ -27,6 +27,8 @@
 
 #include "accel_input.h"
 #include "led_feedback.h"
+#include "sd_card.h"
+#include "sd_log.h"
 #include "net_config.h"
 #include "wifi_link.h"
 
@@ -47,6 +49,9 @@ static const char *TAG = "transport";
 /* Samples held for one upload. 128 @ 10 ms = 1.28 s, comfortably more than the
  * default 500 ms period; the batch is flushed early if it fills up. */
 #define TX_BATCH_MAX 128
+/* SD 留档的节奏：每多少个样本记一行（100 Hz 采样 → 50 个 ≈ 500 ms 一行）。
+ * 单独一个常量，不复用 TX_BATCH_MAX —— 那是「一批最多多少」，不是节奏。 */
+#define SD_LOG_EVERY_SAMPLES 50
 
 /* Response buffer. 1200 was too small: a long AI reply overran it, the JSON got
  * truncated, cJSON failed to parse it, and a perfectly successful POST was
@@ -143,6 +148,7 @@ typedef enum {
     CMD_LED_SET,        /* led_set      —— 常亮/熄灭 */
     CMD_SET_ORIENT,     /* set_orient   —— 远程设置方向档位（与长按 BOOT 等价） */
     CMD_SET_CONFIG,     /* set_config   —— 远程改 WiFi / 服务器地址 / 上报周期 */
+    CMD_SD_FORMAT,      /* sd_format    —— 格式化 SD 卡（卡里长文件名的旧文件板子删不掉，只能整卡格式化） */
 } cmd_kind_t;
 
 /* set_config 的参数（含**字符串**）。用文件级静态而不是扩 run_command 的参数列表：
@@ -358,6 +364,33 @@ static void run_command(cmd_kind_t kind, const char *id,
     case CMD_SET_CONFIG:
         run_set_config(id);
         break;
+
+    case CMD_SD_FORMAT: {
+        /* 顺序很重要：
+         *   1) 先关日志句柄 —— 格式化后它指向的 FAT 表就失效了，不关会写出乱码
+         *   2) 再格式化（IDF 的 esp_vfs_fat_sdcard_format 支持挂载状态下直接调）
+         *   3) 成功后立刻重开日志，不丢后续数据
+         * 格式化要几秒，这期间 transport 被占住（遥测会停几秒），返回里会说明。 */
+        utf8_strlcpy(s_cmd.id, id, sizeof(s_cmd.id));
+        s_cmd.running = true;
+        s_cmd.state = TRANSPORT_CMD_RUNNING;
+        s_cmd.started = xTaskGetTickCount();
+        s_cmd.n = 0;
+
+        sd_log_close();
+        if (sd_card_format() == ESP_OK) {
+            sd_log_init();
+            status_lock();
+            s_st.cmd_count++;
+            status_unlock();
+            ESP_LOGI(TAG, "cmd %s: sd_format ok", s_cmd.id);
+            finish_command(true, false, NULL);
+        } else {
+            sd_log_init();          /* 失败也把日志开回来，别因为一次格式化失败就不记了 */
+            finish_command(false, false, "格式化失败（没插卡 / 卡写保护 / 卡已损坏？）");
+        }
+        break;
+    }
 
     case CMD_SET_ORIENT: {
         /* 与长按 BOOT 完全等价：改方向档位并写 NVS。
@@ -646,6 +679,8 @@ static void apply_response(const char *body, size_t len)
                     } else if (strcmp(jname->valuestring, "led_set") == 0) {
                         kind = CMD_LED_SET;
                         p_onf = json_bool(jparams, "on", true);
+                    } else if (strcmp(jname->valuestring, "sd_format") == 0) {
+                        kind = CMD_SD_FORMAT;
                     } else if (strcmp(jname->valuestring, "set_config") == 0) {
                         /* 字符串参数在这里取好存进文件级静态 —— cJSON 树马上就会被
                          * Delete 掉，不能留着指针到执行点再用。 */
@@ -695,7 +730,23 @@ static void apply_response(const char *body, size_t len)
     if (reply[0] != '\0') {
         strlcpy(s_st.reply, reply, sizeof(s_st.reply));
     }
+    /* 活动词在锁内取一份，给下面的"活动变化"事件用（采样循环那边的留档另有取值） */
+    char log_act[sizeof(s_st.activity)];
+    strlcpy(log_act, s_st.activity, sizeof(log_act));
     status_unlock();
+
+    /* SD 留档**不在这里**：本函数只在"上报成功"时才会被调到，
+     * 而离线时整段上报是被跳过的 —— 挂在这儿等于"断网就不记"，
+     * 正好把"断网也能查"这个核心承诺做反了（2026-09-23 真机上抓到）。
+     * 现在挂在采样循环里（见 transport_task），与网络无关。
+     * 这里只记**活动词变化**这种事件（活动词是服务端给的，只有联网时才知道）。 */
+    {
+        static char s_log_act[32];
+        if (log_act[0] != '\0' && strcmp(log_act, s_log_act) != 0) {
+            strlcpy(s_log_act, log_act, sizeof(s_log_act));
+            sd_log_event("ACT", log_act);
+        }
+    }
 
     /* 在锁外执行指令：run_command 只碰 s_cmd 和 LED，不能拖住状态锁 */
     if (cmd_id[0] != '\0') {
@@ -876,6 +927,22 @@ static void transport_task(void *arg)
                     s_st.z_g = xyz[2];
                     strlcpy(s_st.source, last_source, sizeof(s_st.source));
                     status_unlock();
+                }
+
+                /* ---------- SD 卡本地留档 ----------
+                 * **挂在采样循环里，不是挂在上报流程里** —— 离线时上报整段跳过，
+                 * 挂那儿就变成"断网不记"，与"断网也能查"的初衷正好相反。
+                 * 节奏：每 SD_LOG_EVERY_SAMPLES 个样本一行（100 Hz 下 ≈ 500 ms）。
+                 * 注意这里在 `n++` **之后**，n 从 1 开始 —— 拿 TX_BATCH_MAX(128)
+                 * 当模数就永远等不到：每批才 ~50 个样本就重置了（第一版就是这么错的）。 */
+                if ((n % SD_LOG_EVERY_SAMPLES) == 0) {
+                    char act[32];
+                    status_lock();
+                    strlcpy(act, s_st.activity, sizeof(act));
+                    status_unlock();
+                    sd_log_sample((uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS),
+                                  act, xyz[0], xyz[1], xyz[2],
+                                  sqrtf(xyz[0] * xyz[0] + xyz[1] * xyz[1] + xyz[2] * xyz[2]));
                 }
                 /* 正在执行远程指令就用同一个采样节拍累积，不额外阻塞 */
                 feed_capture(xyz);

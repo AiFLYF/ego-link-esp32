@@ -33,6 +33,7 @@
 #include "net_config.h"
 #include "provisioning.h"
 #include "sd_card.h"
+#include "sd_log.h"
 #include "transport.h"
 #include "ui.h"
 #include "wifi_link.h"
@@ -138,6 +139,8 @@ void app_main(void)
      * 少个存储，绝不能拦住开机。挂上后顺手做一次读写自检（串口看 "自检 PASS"）。 */
     if (sd_card_init() == ESP_OK) {
         ESP_ERROR_CHECK_WITHOUT_ABORT(sd_card_selftest());
+        /* 本地留档：网络断了也能在卡上查到轨迹。没卡/没空间都只是少个功能。 */
+        ESP_ERROR_CHECK_WITHOUT_ABORT(sd_log_init());
     }
 
     ESP_ERROR_CHECK(ui_init());

@@ -90,6 +90,30 @@ void sd_card_log_info(void)
     }
 }
 
+esp_err_t sd_card_format(void)
+{
+    if (!s_mounted) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    /* 句柄必须在**卸载之前**取：bsp_sdcard_unmount() 会把内部的 bsp_sdcard 置 NULL。
+     * 而 IDF 自己的测试（fatfs/test_apps/sdcard）就是在**挂载状态下**调
+     * esp_vfs_fat_sdcard_format() 的，所以不需要先卸载。 */
+    sdmmc_card_t *card = bsp_sdcard_get_handle();
+    if (card == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    ESP_LOGW(TAG, "开始格式化 %s —— 卡里原有内容会全部丢失", SD_MOUNT_POINT);
+    esp_err_t ret = esp_vfs_fat_sdcard_format(SD_MOUNT_POINT, card);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "格式化失败: %s", esp_err_to_name(ret));
+        return ret;
+    }
+    ESP_LOGI(TAG, "格式化完成");
+    sd_card_log_info();          /* 打完立刻把新容量报出来，方便核对 */
+    return ESP_OK;
+}
+
 esp_err_t sd_card_selftest(void)
 {
     if (!s_mounted) {

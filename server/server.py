@@ -72,7 +72,7 @@ FREEFALL_MIN_S = 0.05     # 失重判定：至少持续这么久才算疑似跌�
 CMD_TIMEOUT_S = 10.0      # 命令下发后多久没收到结果就判超时
 CMD_MAX_HISTORY = 20      # 保留最近多少条命令供网页显示
 CMD_NAMES = ("capture_once", "led_blink", "led_set", "set_orient",
-             "set_config")   # 白名单（不认的名字直接 400）
+             "set_config", "sd_format")   # 白名单（不认的名字直接 400）
 # set_orient 是"远程改方向档位"，与板端长按 BOOT 等价 —— 网页上点选比盲按 N 次靠谱。
 
 LED_MAX_BLINKS = 12       # 一次 led_blink 最多闪几下（板端也会再夹一道）
@@ -1554,7 +1554,10 @@ function classify(s){
 var CMD_UI = {
   capture_once:{ label:"采集一次", params:{}, primary:true },
   led_blink:   { label:"闪灯 ×3",  params:{n:3,on_ms:80,off_ms:80} },
-  led_set:     { label:"LED 常亮", params:{on:true}, toggle:true }
+  led_set:     { label:"LED 常亮", params:{on:true}, toggle:true },
+  set_orient:  { label:"设置方向档位" },
+  set_config:  { label:"下发板子设置" },
+  sd_format:   { label:"格式化 SD 卡", danger:true }
 };
 
 /* ---------------- 环形仪表（270°，与板端同款） ---------------- */
@@ -1842,6 +1845,14 @@ function syncButtons(){
   });
 }
 function sendCmd(name, btn, overrideParams){
+  /* 破坏性指令（目前只有 sd_format）必须先确认 —— 一键清掉整张卡，
+     点错了没有撤销。 */
+  var ui0 = CMD_UI[name] || {};
+  if (ui0.danger){
+    /* 单行文案：**刻意不写 \n** —— 这段 JS 住在 Python 的三引号字符串里，
+       写一个反斜杠会被 Python 先吃成真换行，JS 就语法错误了。 */
+    if (!window.confirm("确定要格式化板子上的 SD 卡吗？卡里原有内容会全部丢失，无法恢复。")) return;
+  }
   var ui = CMD_UI[name] || {};
   var params = overrideParams !== undefined ? overrideParams
              : (ui.toggle && name === "led_set" ? {on: !ledSteady} : (ui.params || {}));
