@@ -1853,33 +1853,38 @@ function update3d(x, y, z){
   down.normalize();
   var base = new THREE.Quaternion().setFromUnitVectors(down, new THREE.Vector3(0, -1, 0));
 
-  /* 绕世界竖直轴扫一圈，按**两级约定**挑唯一解 —— 加速度计测不出绕竖直轴的朝向，
-   * 这一段是"约定"而不是"测量"，所以要定得**可预测**，不能靠"取最近"抛硬币：
+  /* 绕世界竖直轴扫一圈，挑唯一解。加速度计**测不出**绕竖直轴的朝向，
+   * 这一段是「约定」不是「测量」，所以两条约定要按板子的姿态**平滑加权**：
    *
-   *   ① 屏幕面尽量朝观察者（板子立起来时，正面朝我 —— 这是最自然的拿法）
-   *   ② 打平时①退化（屏幕只能朝上），改用"顶边朝远处"（板子平放的通常摆法）
+   *   ① 屏幕面尽量朝观察者 —— 板子**立着**时才有意义（正面朝我是最自然的拿法）
+   *   ② 顶边尽量朝远处     —— 板子**平放**时才有意义（通常就是这么摆在桌上）
    *
-   * 两条都是"尽量"：受重力约束限制时自动退让，不会和测量冲突。 */
+   * ⚠️ 这里踩过一个坑：一开始给①设了 1e-3 的固定容差，以为"平放时①会退化"。
+   * 实际上平放时①不是**零**、而是**很小**（屏幕面朝上，其 z 分量只有零点几的
+   * 噪声量级）—— 于是①照样压过②，**旋转角由噪声决定**：
+   * 用户板子明明平放（0,-0.03,1.02），3D 却转了 30°。
+   * 现在按"有多平"加权：w=1 完全用②，w=0 完全用①，中间平滑过渡。 */
+  var flatness = Math.min(1, Math.abs(down.z));   /* 重力越沿屏幕法线 → 越平 */
+  var w = flatness;
+
   var axis = new THREE.Vector3(0, 1, 0);
   var q = new THREE.Quaternion();
   var vFace = new THREE.Vector3(), vTop = new THREE.Vector3();
-  var best = null, bestFace = -9, bestTop = -9;
+  var best = null, bestScore = -9;
   for (var i = 0; i < 72; i++) {
     q.setFromAxisAngle(axis, i * Math.PI / 36).multiply(base);
     /* 板子 -z 是屏幕面（+z 朝屏幕里），-y 是顶边 */
     vFace.set(0, 0, -1).applyQuaternion(q);
     vTop.set(0, -1, 0).applyQuaternion(q);
-    var sFace = vFace.z;          /* 屏幕面朝观察者（世界 +z）的程度 */
-    var sTop = -vTop.z;           /* 顶边朝远处（世界 -z）的程度 */
-    /* ① 优先；① 打平时（差值在容差内）用 ② 决胜 */
-    if (sFace > bestFace + 1e-3 || (Math.abs(sFace - bestFace) <= 1e-3 && sTop > bestTop)) {
-      bestFace = Math.max(bestFace, sFace);
-      bestTop = sTop;
+    var score = (1 - w) * vFace.z + w * (-vTop.z);
+    if (score > bestScore + 1e-6) {
+      bestScore = score;
       best = q.clone();
     }
   }
   d3.target.copy(best || base);
 }
+
 
 
 
