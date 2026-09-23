@@ -33,6 +33,7 @@
 #include "bsp/esp-bsp.h"      /* BSP_SD_MOUNT_POINT */
 #include "esp_vfs_fat.h"     /* esp_vfs_fat_info */
 
+#include "camera.h"
 #include "sd_card.h"
 #include "sd_log.h"
 #include "net_config.h"
@@ -162,6 +163,8 @@ typedef enum {
     CMD_SD_FORMAT,      /* sd_format    —— 格式化 SD 卡（卡里长文件名的旧文件板子删不掉，只能整卡格式化） */
     CMD_SD_LS,          /* sd_ls        —— 列出 SD 卡文件 + 容量（网页存储管理用） */
     CMD_SD_RM,          /* sd_rm        —— 删除 SD 卡上的一个文件（参数 name） */
+    CMD_CAM_CAPTURE,    /* cam_capture  —— 拍一张存进 SD 卡，并给网页留一份 */
+    CMD_CAM_STREAM,     /* cam_stream   —— 开关实时画面（参数 on: true/false） */
 } cmd_kind_t;
 
 /* set_config 的参数（含**字符串**）。用文件级静态而不是扩 run_command 的参数列表：
@@ -169,6 +172,14 @@ typedef enum {
  * 只有 transport 任务会碰它们，不存在竞态。 */
 /* sd_rm 要删的文件名（字符串参数，和 set_config 一样先用静态存下来） */
 static char s_rm_name[64];
+
+/* 实时画面开关。开了之后采样循环会按 CAM_STREAM_EVERY_TICKS 推帧给服务器。
+ * **默认关**：推一帧要占 WiFi 约 10~20 KB，而且 camera_post_frame() 是阻塞的
+ * （一次约 100 ms），会占住采样循环 —— 所以做成按需开启，不用时零开销。 */
+#define CAM_STREAM_EVERY_TICKS 50      /* 10ms/拍 → 50 拍 = 500ms ≈ 2 帧/秒 */
+static volatile bool s_cam_stream = false;
+static bool s_cam_on = false;
+static TickType_t s_cam_last;
 
 static char s_cfg_ssid[NET_SSID_MAX];
 static char s_cfg_pass[NET_PASS_MAX];
@@ -493,6 +504,50 @@ static void run_command(cmd_kind_t kind, const char *id,
     case CMD_SET_CONFIG:
         run_set_config(id);
         break;
+
+    case CMD_CAM_CAPTURE: {
+        utf8_strlcpy(s_cmd.id, id, sizeof(s_cmd.id));
+        s_cmd.running = true;
+        s_cmd.state = TRANSPORT_CMD_RUNNING;
+        s_cmd.started = xTaskGetTickCount();
+        s_cmd.n = 0;
+
+        /* 两件事都要做，但**主次分明**：
+         *   ① 存进板子的 SD 卡 —— 这是用户要的（照片跟着板子走，拔卡就能取）
+         *   ② 顺手给服务器留一份 —— 网页的照片列表要用（板子离线时也能看历史）
+         * ① 失败就算命令失败；② 失败只记日志，不影响命令结果。 */
+        char name[16] = {0};
+        esp_err_t r = camera_save_to_sd(name, sizeof(name));
+        if (r != ESP_OK) {
+            finish_command(false, false, "拍照失败（没插卡 / 摄像头不可用？）");
+            break;
+        }
+        camera_post_frame(s_url, s_device, true);   /* 留档用，失败不影响结果 */
+        snprintf(s_cmd.note, sizeof(s_cmd.note), "已存 %s", name);
+        status_lock();
+        s_st.cmd_count++;
+        status_unlock();
+        ESP_LOGI(TAG, "cmd %s: cam_capture -> %s", s_cmd.id, name);
+        finish_command(true, false, NULL);
+        break;
+    }
+
+    case CMD_CAM_STREAM: {
+        utf8_strlcpy(s_cmd.id, id, sizeof(s_cmd.id));
+        s_cmd.running = true;
+        s_cmd.state = TRANSPORT_CMD_RUNNING;
+        s_cmd.started = xTaskGetTickCount();
+        s_cmd.n = 0;
+        s_cam_stream = s_cam_on;
+        snprintf(s_cmd.note, sizeof(s_cmd.note), "实时画面已%s",
+                 s_cam_stream ? "开启（约 2 帧/秒）" : "关闭");
+        status_lock();
+        s_st.cmd_count++;
+        status_unlock();
+        ESP_LOGI(TAG, "cmd %s: cam_stream=%d", s_cmd.id, (int)s_cam_stream);
+        finish_command(true, false, NULL);
+        break;
+    }
 
     case CMD_SD_LS:
         run_sd_ls(id);
@@ -830,6 +885,13 @@ static void apply_response(const char *body, size_t len)
                     } else if (strcmp(jname->valuestring, "led_set") == 0) {
                         kind = CMD_LED_SET;
                         p_onf = json_bool(jparams, "on", true);
+                    } else if (strcmp(jname->valuestring, "cam_capture") == 0) {
+                        kind = CMD_CAM_CAPTURE;
+                    } else if (strcmp(jname->valuestring, "cam_stream") == 0) {
+                        kind = CMD_CAM_STREAM;
+                        const cJSON *v = cJSON_IsObject(jparams)
+                            ? cJSON_GetObjectItemCaseSensitive(jparams, "on") : NULL;
+                        s_cam_on = cJSON_IsTrue(v);
                     } else if (strcmp(jname->valuestring, "sd_ls") == 0) {
                         kind = CMD_SD_LS;
                     } else if (strcmp(jname->valuestring, "sd_rm") == 0) {
@@ -1095,6 +1157,14 @@ static void transport_task(void *arg)
                  * 节奏：每 SD_LOG_EVERY_SAMPLES 个样本一行（100 Hz 下 ≈ 500 ms）。
                  * 注意这里在 `n++` **之后**，n 从 1 开始 —— 拿 TX_BATCH_MAX(128)
                  * 当模数就永远等不到：每批才 ~50 个样本就重置了（第一版就是这么错的）。 */
+                /* 实时画面：**按需**推帧。camera_post_frame() 是阻塞的（约 100ms），
+                 * 所以只在用户开了"实时画面"时才走，不用时零开销。
+                 * 节拍按 tick 数而不是样本数 —— 推帧慢下来时样本数会少，tick 不会。 */
+                if (s_cam_stream && (xTaskGetTickCount() - s_cam_last) >= CAM_STREAM_EVERY_TICKS) {
+                    s_cam_last = xTaskGetTickCount();
+                    camera_post_frame(s_url, s_device, false);
+                }
+
                 if ((n % SD_LOG_EVERY_SAMPLES) == 0) {
                     char act[32];
                     status_lock();

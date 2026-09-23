@@ -69,6 +69,24 @@ void camera_deinit(void);
  */
 esp_err_t camera_selftest(void);
 
+/**
+ * @brief 拍一帧 JPEG 并**推给服务器**（板子是 HTTP 客户端，网页连不到板子本身，
+ *        所以实时画面只能由板子 POST 上来、服务器转给网页）。
+ *
+ * @param base_url  服务器根地址，如 "http://192.168.1.20:8000"
+ * @param device    设备名（服务器按它区分多台的画面）
+ * @param save      true 表示这一帧要留档（服务端会另存一份给网页的照片列表）
+ * @return ESP_OK 成功。失败只记日志，调用方不必处理（画面丢一帧没关系）。
+ */
+esp_err_t camera_post_frame(const char *base_url, const char *device, bool save);
+
+/**
+ * @brief 拍一帧并写到 SD 卡根目录（8.3 文件名，如 CAM0007.JPG）。
+ * @param name_out 成功时写入文件名（可传 NULL）
+ * @return ESP_OK 成功；没插卡/没开摄像头/写失败都返回错误。
+ */
+esp_err_t camera_save_to_sd(char *name_out, size_t name_len);
+
 #ifdef __cplusplus
 }
 #endif

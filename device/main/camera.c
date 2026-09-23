@@ -11,6 +11,7 @@
 
 #include <fcntl.h>
 #include <inttypes.h>
+#include <stdio.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
@@ -21,7 +22,9 @@
 /* BSP 把 BSP_CAMERA_DEVICE 定义成 ESP_VIDEO_DVP_DEVICE_NAME，但 bsp/esp32_s3_eye.h
  * **只用了这个宏、没有 include 定义它的头文件**（BSP 自己的 bsp_camera.c 里包含了，
  * 头文件里漏了）。不补这一行，编译会报 'ESP_VIDEO_DVP_DEVICE_NAME' undeclared。 */
+#include "esp_http_client.h"
 #include "esp_video_device.h"
+#include "sd_card.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_video_ioctl.h"
@@ -264,6 +267,106 @@ void camera_deinit(void)
 {
     close_all();
     s_seq = 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * 推流 / 存卡
+ *
+ * 板子没有自己的 HTTP 服务端，所以"网页看实时画面"只能这么走：
+ *     板子 --POST /api/frame--> 服务器 --GET /api/frame--> 网页 <img>
+ * 这里只负责第一段。帧率由调用方（transport 的采样循环）控制。
+ * ------------------------------------------------------------------------- */
+esp_err_t camera_post_frame(const char *base_url, const char *device, bool save)
+{
+    if (base_url == NULL || base_url[0] == '\0') {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!camera_ready() && camera_init(NULL, NULL) != ESP_OK) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    camera_frame_t fr = {0};
+    esp_err_t ret = camera_capture(&fr);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    /* 拼 URL：`<base>/api/frame?device=<dev>[&save=1]`。
+     * device 由网页/服务器校验，这里只做长度限制，不做 URL 转义
+     * （设备名来自 NVS，是我们自己写进去的，不含特殊字符）。 */
+    char url[192];
+    snprintf(url, sizeof(url), "%s/api/frame?device=%s%s",
+             base_url, (device && device[0]) ? device : "-", save ? "&save=1" : "");
+
+    esp_http_client_config_t cfg = {
+        .url = url,
+        .method = HTTP_METHOD_POST,
+        .timeout_ms = 4000,
+        .buffer_size = 1024,
+    };
+    esp_http_client_handle_t cli = esp_http_client_init(&cfg);
+    if (cli == NULL) {
+        camera_release(&fr);
+        return ESP_FAIL;
+    }
+    /* 直接用字节流 POST，不套 JSON —— JPEG 是二进制，套 base64 要多花 33% 带宽 */
+    esp_http_client_set_header(cli, "Content-Type", "image/jpeg");
+    esp_http_client_set_post_field(cli, (const char *)fr.data, (int)fr.len);
+    ret = esp_http_client_perform(cli);
+    int code = esp_http_client_get_status_code(cli);
+    esp_http_client_cleanup(cli);
+    camera_release(&fr);
+
+    if (ret != ESP_OK || code != 200) {
+        /* 推流失败不该刷屏：画面丢一帧而已，5 帧/秒下用户根本看不出来 */
+        return ESP_FAIL;
+    }
+    return ESP_OK;
+}
+
+esp_err_t camera_save_to_sd(char *name_out, size_t name_len)
+{
+    if (!sd_card_mounted()) {
+        ESP_LOGW(TAG, "没挂载 SD 卡，拍的照片没地方放");
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!camera_ready() && camera_init(NULL, NULL) != ESP_OK) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    camera_frame_t fr = {0};
+    esp_err_t ret = camera_capture(&fr);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    /* 8.3 文件名：CAM0007.JPG。序号递增，重启后从 1 开始 ——
+     * 重名就直接覆盖，比"为了不重名去扫描整个目录"省事得多。 */
+    static unsigned s_seq;
+    char path[64], name[16];
+    for (int i = 0; i < 1000; i++) {
+        s_seq++;
+        snprintf(name, sizeof(name), "CAM%04u.JPG", s_seq % 10000);
+        snprintf(path, sizeof(path), "%s/%s", BSP_SD_MOUNT_POINT, name);
+        FILE *f = fopen(path, "wb");
+        if (f == NULL) {
+            continue;               /* 大概率是重名，换个号再试 */
+        }
+        size_t wrote = fwrite(fr.data, 1, fr.len, f);
+        fclose(f);
+        camera_release(&fr);
+        if (wrote != fr.len) {
+            ESP_LOGE(TAG, "写 %s 只成功 %u/%u 字节", path, (unsigned)wrote, (unsigned)fr.len);
+            return ESP_FAIL;
+        }
+        if (name_out && name_len) {
+            strlcpy(name_out, name, name_len);
+        }
+        ESP_LOGI(TAG, "已存 %s（%u 字节）", path, (unsigned)fr.len);
+        return ESP_OK;
+    }
+    camera_release(&fr);
+    ESP_LOGE(TAG, "找不到可用文件名");
+    return ESP_FAIL;
 }
 
 esp_err_t camera_selftest(void)
