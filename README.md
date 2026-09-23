@@ -559,6 +559,7 @@ python server\server.py
 | 屏幕中文显示成方块 | 跑 `gen_font.py`，它会报告"板端文案缺字"；换了显示文案后要重跑再编译 |
 | 串口只有 `camera: 自检失败: 初始化 ESP_FAIL`，上面没有"就绪"那行 | 十有八九是 `CONFIG_CAMERA_OV2640` 没生效（`device/sdkconfig` 里还是 `# CONFIG_CAMERA_OV2640 is not set`）。确认 `sdkconfig.bsp.esp32_s3_eye` 里摄像头那两行在，然后**删掉 `device/sdkconfig` 让它重新生成**并全量重编 —— 已存在的 sdkconfig 会挡住 defaults 里的新项 |
 | 自检过了"就绪"，但报 `自检失败: 取帧 ESP_FAIL` | 格式档位没开：`VIDIOC_S_FMT` 只会接受 Kconfig 里开过的组合。确认 `CONFIG_CAMERA_OV2640_DVP_JPEG_320X240_50FPS=y` 存在 |
+| 串口出现 `ov2640: get sensor ID failed` / `esp_video_init: failed to detect DVP camera with address=30` | **这是硬件问题，不是配置问题**：摄像头在 I2C 上不响应（0x30 地址 NACK）。排查顺序：① 断电后把摄像头 **FPC 排线重新插紧**（插到底、卡扣扣好）—— 这是最常见的原因；② 换一个模组确认不是模组坏。**判据**：如果同一份日志里 `accel_input: Detected accelerometer` 是正常的，说明 **I2C 总线本身没问题**（加速度计和摄像头共用 GPIO4/5），问题只在摄像头这一端，所以不用去查引脚或 Kconfig |
 | 仪表盘「设备」卡片里有两台，但实际只插了一块板 | 两块板的设备名撞了。配网页的「设备名」留空会自动按 MAC 命名；如果手动填了同名（比如都填 `rw1`）就会合并成一台。双击 BOOT 进配网改掉其中一个 |
 | 配网时手机搜不到 `EGO-LINK-XXXX`，或板子一开机就重启循环 | 2026-09-22 前的固件有这个 bug：AP 密码是 4 位，而 WPA2 要求 8–63 位，`esp_wifi_set_config()` 会拒绝；当时那行用的是 `ESP_ERROR_CHECK`，于是直接 `abort()` → 重启循环，连屏幕都看不到。已修（密码改 8 位数字 + 失败不再 abort）。**注意：如果只是个别情况，先确认手机没连在 5GHz-only 的网络**——AP 只跑 2.4GHz channel 1 |
 | 首次编译卡在拉取组件 | 离线场景拷入 `managed_components/`；在线场景检查能否访问 components.espressif.com |

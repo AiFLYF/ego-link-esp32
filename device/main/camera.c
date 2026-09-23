@@ -116,7 +116,14 @@ esp_err_t camera_init(uint32_t *out_w, uint32_t *out_h)
 
     s_fd = open(BSP_CAMERA_DEVICE, O_RDONLY);
     if (s_fd < 0) {
-        ESP_LOGE(TAG, "open %s 失败 —— 传感器驱动开了吗？", BSP_CAMERA_DEVICE);
+        /* 两种原因长得很像，但排查方向完全相反，所以这里要把话分开说清：
+         *   上面有 "failed to detect DVP camera" → 驱动是开着的，是**传感器没响应**
+         *     （硬件：FPC 排线没插紧 / 模组故障）。判据：同一 I2C 总线上加速度计
+         *     正常的话，总线本身没问题，问题在摄像头这一端。
+         *   上面什么都没有 → CONFIG_CAMERA_OV2640 没开，驱动压根没编进来。 */
+        ESP_LOGE(TAG, "open %s 失败：若上面有 'failed to detect DVP camera'，"
+                      "是传感器没响应（检查摄像头 FPC 排线/模组）；"
+                      "否则检查 CONFIG_CAMERA_OV2640 是否开启", BSP_CAMERA_DEVICE);
         return ESP_FAIL;
     }
 
