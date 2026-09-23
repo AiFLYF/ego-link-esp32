@@ -61,17 +61,31 @@ bool accel_input_poll(accel_input_sample_t *sample);
  * The mapping is the NVS-persisted orientation (see below), so it survives
  * reboots and can be corrected in the field without a rebuild.
  *
- * @param[in]  x_g,y_g  Raw sensor values.
- * @param[out] out_x,out_y Screen-frame values. May not be NULL.
+ * @param[in]  x_g,y_g,z_g  Raw sensor values.
+ * @param[out] out_x,out_y,out_z Screen-frame values. May not be NULL.
  */
-void accel_input_map_to_screen(float x_g, float y_g, float *out_x, float *out_y);
+void accel_input_map_to_screen(float x_g, float y_g, float z_g,
+                               float *out_x, float *out_y, float *out_z);
 
 /**
- * @brief Sensor→screen axis orientation, 0..7 (swap-xy / flip-x / flip-y).
+ * @brief Sensor→screen axis orientation, 0..15 —— **完整的三轴置换，含镜像族**。
+ *
+ * 2026-09-23 真机实测订正两次：
+ *  ① 原来是"xy 平面内互换/翻转"，修不了"传感器竖着装"（法线落在传感器 y 轴上）
+ *     的板子 —— 实测这块板子就是，8 个旧档位里没有一个能用。
+ *  ② 补上三轴置换后，用户实测"上下对、左右反" —— 只翻一个轴在右手系里做不到
+ *     （那是镜像），说明这颗芯片相对板面是镜像的。所以档位表要同时覆盖两族。
+ *
+ * 现在 16 档 = {法线 = ±传感器 y} × {平面内 4 种 90° 旋转} × {右手/镜像}：
+ *   o0..o7  法线 = −传感器 y（本机实测族，**o4 是实测正确的那个**）
+ *   o8..o15 法线 = +传感器 y
  *
  * Lets the tilt direction be corrected on-device without a rebuild. The value
- * persists in NVS. ::accel_input_cycle_orientation steps to the next one and is
+ * persists in NVS（键名 `orient3`；语义变过两次所以换了两次键名，旧值自动失效）。
+ * ::accel_input_cycle_orientation steps to the next one and is
  * bound to a long-press of the BOOT key in main.c.
+ *
+ * 判据：**平放屏幕朝上、把右边压低 → 屏幕和仪表盘都应写「向右倾斜」**。
  */
 int  accel_input_get_orientation(void);
 void accel_input_set_orientation(int idx);

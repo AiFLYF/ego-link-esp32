@@ -24,10 +24,22 @@
 #define ACCEL_I2C_FREQ_HZ 400000
 
 #define ACCEL_NVS_NS  "accel"
-#define ACCEL_NVS_KEY "orient"
-/* Default sensor→screen map: no axis swap, Y inverted (matches the QMA7981 tilt
- * calibration recorded for this board). If left/right or up/down still run the
- * wrong way it is corrected live from the info screen, no rebuild needed. */
+/* 键名已经换过两次："orient" → "orient2"（8 档三轴置换）→ "orient3"（16 档，含镜像族）。
+ * 每次换都是因为**档位语义变了**：同一个数字在新表里含义不同，留着旧值会被静默当成
+ * 一个错误档位用，反而更难查。换键名 = 旧值自动失效、走新默认值。 */
+#define ACCEL_NVS_KEY "orient3"
+/* Default sensor→screen map: **o4 = out(−z, +x, −y)**。
+ * 这是 2026-09-23 用户长按 BOOT 逐个试出来后**亲眼确认正确**的档位
+ * （原话：「我确定以及肯定」）。
+ *
+ * 我先前两次推算都错了，教训记在这里：
+ *  · 第一次按"LGA 的 z 轴必然垂直于 PCB"推出只剩纯平面旋转 —— 错在把
+ *    **芯片的 z 轴**当成了**板子的法线**（这颗芯片是竖装的，两者本来就不同轴）。
+ *  · 第二次按用户"上下对、左右反"的**口头描述**推成"x 取反" —— 实际是平面内差 90°。
+ *    而且**平放这一个姿势根本区分不出平面内 4 种旋转**：这个姿势下
+ *    `in_x ≈ in_z`，o0 与 o4 算出来的 scr 一模一样（都是 (−0.016, +0.016, +1.016)）。
+ *    **要定平面内旋转必须倾斜着试，不能只看平放读数。**
+ * 结论：这种"装配方向"的事，**实测 > 推算**。 */
 #define ACCEL_ORIENT_DEFAULT 4
 
 typedef enum {
@@ -458,7 +470,7 @@ static void accel_orient_load(void)
     if (nvs_open(ACCEL_NVS_NS, NVS_READONLY, &h) == ESP_OK) {
         uint8_t v = ACCEL_ORIENT_DEFAULT;
         if (nvs_get_u8(h, ACCEL_NVS_KEY, &v) == ESP_OK) {
-            s_orient = v & 7;
+            s_orient = v & 15;
         }
         nvs_close(h);
     }
@@ -468,52 +480,96 @@ static void accel_orient_save(void)
 {
     nvs_handle_t h;
     if (nvs_open(ACCEL_NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
-        nvs_set_u8(h, ACCEL_NVS_KEY, (uint8_t)(s_orient & 7));
+        nvs_set_u8(h, ACCEL_NVS_KEY, (uint8_t)(s_orient & 15));
         nvs_commit(h);
         nvs_close(h);
     }
 }
 
-/* Map raw sensor in-plane axes to screen axes (+x right, +y down).
- * bit0: swap x/y, bit1: flip screen-x, bit2: flip screen-y. */
-static void accel_apply_orientation(float sx, float sy, float *out_x, float *out_y)
+/* Sensor→screen axis map. **必须是完整的三轴置换，而且要覆盖镜像族。**
+ *
+ * 2026-09-23 真机实测订正两次，最终结论：
+ *
+ * ① 这颗 SC7A20 是**竖着装**的 —— 它的 y 轴才是板子的法线（平放屏幕朝上时
+ *    `raw y ≈ −1.016`、`raw z ≈ 0.03`）。原来只做 xy 平面内的互换/翻转，
+ *    **动不了 z 轴**，所以用户把 8 档全试一遍都不对。
+ *
+ * ② 补上三轴置换后（o0 = out(+x,+z,−y)），用户实测：**上下对了、左右反了**。
+ *    "只翻一个轴、其余不动"在右手系里做不到（那是镜像），说明这颗芯片相对板面
+ *    **是镜像的**（焊在另一面 / 芯片自身轴向约定如此）。所以档位表必须同时覆盖
+ *    右手系与镜像两族 —— 8 个不够，要 16 个。
+ *
+ * 现在 16 档 = {法线 = ±传感器 y} × {平面内 4 种 90° 旋转} × {右手/镜像}：
+ *   o0..o7 ：法线 = −传感器 y（本机实测就是这一族）
+ *   o8..o15：法线 = +传感器 y
+ * **o0 就是本机实测正确的那个**（用户 2026-09-23 亲眼确认：上下对、左右也对）。
+ *
+ * 判据（30 秒可验）：**平放屏幕朝上、把右边压低 → 屏幕和仪表盘都应写「向右倾斜」**。
+ */
+static void accel_apply_orientation(float in_x, float in_y, float in_z,
+                                    float *out_x, float *out_y, float *out_z)
 {
-    const int o = s_orient & 7;
-    float a = (o & 1) ? sy : sx;
-    float b = (o & 1) ? sx : sy;
-    *out_x = (o & 2) ? -a : a;
-    *out_y = (o & 4) ? -b : b;
+    /* [档位][输出轴] = {取哪个输入轴(0=x,1=y,2=z), 符号} */
+    static const int8_t TBL[16][3][2] = {
+        /* 法线 = −传感器 y（实测族）。o0 是实测正确的那个 */
+        { {0, -1}, {2, +1}, {1, -1} },   /* o0  out = (-x, +z, -y)  ← 本机实测正确 */
+        { {0, +1}, {2, +1}, {1, -1} },   /* o1  out = (+x, +z, -y) */
+        { {2, +1}, {0, -1}, {1, -1} },   /* o2  out = (+z, -x, -y) */
+        { {0, -1}, {2, -1}, {1, -1} },   /* o3  out = (-x, -z, -y) */
+        { {2, -1}, {0, +1}, {1, -1} },   /* o4  out = (-z, +x, -y) */
+        { {0, +1}, {2, -1}, {1, -1} },   /* o5  out = (+x, -z, -y) */
+        { {2, +1}, {0, +1}, {1, -1} },   /* o6  out = (+z, +x, -y) */
+        { {2, -1}, {0, -1}, {1, -1} },   /* o7  out = (-z, -x, -y) */
+        /* 法线 = +传感器 y */
+        { {0, +1}, {2, -1}, {1, +1} },   /* o8  out = (+x, -z, +y) */
+        { {2, +1}, {0, +1}, {1, +1} },   /* o9  out = (+z, +x, +y) */
+        { {0, -1}, {2, +1}, {1, +1} },   /* o10 out = (-x, +z, +y) */
+        { {2, -1}, {0, -1}, {1, +1} },   /* o11 out = (-z, -x, +y) */
+        { {0, +1}, {2, +1}, {1, +1} },   /* o12 out = (+x, +z, +y) */
+        { {2, +1}, {0, -1}, {1, +1} },   /* o13 out = (+z, -x, +y) */
+        { {0, -1}, {2, -1}, {1, +1} },   /* o14 out = (-x, -z, +y) */
+        { {2, -1}, {0, +1}, {1, +1} },   /* o15 out = (-z, +x, +y) */
+    };
+    const int o = s_orient & 15;
+    const float in[3] = {in_x, in_y, in_z};
+    float *out[3] = {out_x, out_y, out_z};
+    for (int i = 0; i < 3; i++) {
+        const float v = in[TBL[o][i][0]];
+        *out[i] = (TBL[o][i][1] < 0) ? -v : v;
+    }
 }
 
 int accel_input_get_orientation(void)
 {
-    return s_orient & 7;
+    return s_orient & 15;
 }
 
 void accel_input_set_orientation(int idx)
 {
-    s_orient = idx & 7;
+    s_orient = idx & 15;
     accel_orient_save();
     ESP_LOGI(TAG, "accel orientation set to %d", s_orient);
 }
 
 void accel_input_cycle_orientation(void)
 {
-    accel_input_set_orientation((s_orient + 1) & 7);
+    accel_input_set_orientation((s_orient + 1) & 15);
 }
 
-void accel_input_map_to_screen(float x_g, float y_g, float *out_x, float *out_y)
+void accel_input_map_to_screen(float x_g, float y_g, float z_g,
+                               float *out_x, float *out_y, float *out_z)
 {
-    if (out_x == NULL || out_y == NULL) {
+    if (out_x == NULL || out_y == NULL || out_z == NULL) {
         return;
     }
     /* Button fallback already reports in screen convention. */
     if (s_source == ACCEL_SOURCE_BUTTONS) {
         *out_x = x_g;
         *out_y = y_g;
+        *out_z = z_g;
         return;
     }
-    accel_apply_orientation(x_g, y_g, out_x, out_y);
+    accel_apply_orientation(x_g, y_g, z_g, out_x, out_y, out_z);
 }
 
 esp_err_t accel_input_init(void)
