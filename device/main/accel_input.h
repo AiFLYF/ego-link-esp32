@@ -1,7 +1,7 @@
 /*
- * SPDX-License-Identifier: CC0-1.0
+ * SPDX-License-Identifier: MIT
  *
- * Accelerometer input abstraction for the ESP32-S3-EYE watch face project.
+ * Accelerometer input abstraction for the Ego Link board app (ESP32-S3-EYE).
  *
  * The ESP32-S3-EYE BSP reports BSP_CAPS_IMU == 0, so the IMU is not exposed
  * through the sensor hub. This module talks to the on-board accelerometer
@@ -10,8 +10,8 @@
  *   - LIS3DH  (WHO_AM_I 0x0F == 0x33)
  *   - MPU6050 (WHO_AM_I 0x75 == 0x68/0x70/0x71)
  *   - QMA7981 (reg00 == 0xE7)
- * If no accelerometer is found it falls back to the five on-board buttons,
- * so the fluid simulation always has a usable "gravity" input.
+ * If no accelerometer is found it falls back to the five on-board buttons, so
+ * the app always has a usable "tilt" input.
  */
 #pragma once
 
@@ -32,25 +32,6 @@ typedef struct {
 } accel_input_sample_t;
 
 /**
- * @brief High-level motion for the fluid, derived from the raw sensor.
- *
- * The raw accelerometer is split with a complementary filter into a slowly
- * varying *gravity* component (steady tilt → which way is downhill) and a fast
- * *motion* residual (a flick or shake of the board). Both are already mapped
- * into screen coordinates (+x right, +y down) and smoothed, so the UI can use
- * them directly without knowing anything about the chip or its mounting.
- */
-typedef struct {
-    float grav_x;            /*!< smoothed in-plane gravity, screen frame, ~[-1,1] g */
-    float grav_y;
-    float motion_x;          /*!< fast motion residual, screen frame, g (slosh source) */
-    float motion_y;
-    float tilt;              /*!< |in-plane gravity|: 0 = flat, ~1 = on edge */
-    bool  valid;
-    const char *source_name;
-} accel_motion_t;
-
-/**
  * @brief Detect and initialise the accelerometer (or button fallback).
  *
  * @return ESP_OK on success (sensor or fallback ready), otherwise an error.
@@ -60,24 +41,51 @@ esp_err_t accel_input_init(void);
 /**
  * @brief Read one acceleration sample.
  *
+ * The returned x/y are the *raw sensor* axes. Call ::accel_input_map_to_screen
+ * before sending them anywhere a human will read them.
+ *
  * @param[out] sample Filled with the latest reading. Never NULL.
  * @return true when @p sample contains a valid reading.
  */
 bool accel_input_poll(accel_input_sample_t *sample);
 
 /**
- * @brief Read one frame of high-level motion (gravity + slosh), screen-mapped
- *        and smoothed. Call once per render frame; it advances the filter.
+ * @brief Map raw sensor in-plane axes onto screen axes (+x right, +y down).
  *
- * @param[out] out Filled with the latest motion. Never NULL.
+ * The board calls this before every upload, so the PC server always receives
+ * screen-frame numbers and its "up/down/left/right" labels agree with what is
+ * on the LCD. Before this existed the server interpreted raw sensor axes while
+ * the UI used the flipped ones, so the two ends reported opposite tilt
+ * directions for the same physical pose.
+ *
+ * The mapping is the NVS-persisted orientation (see below), so it survives
+ * reboots and can be corrected in the field without a rebuild.
+ *
+ * @param[in]  x_g,y_g,z_g  Raw sensor values.
+ * @param[out] out_x,out_y,out_z Screen-frame values. May not be NULL.
  */
-void accel_input_read_motion(accel_motion_t *out);
+void accel_input_map_to_screen(float x_g, float y_g, float z_g,
+                               float *out_x, float *out_y, float *out_z);
 
 /**
- * @brief Sensor→screen axis orientation, 0..7 (swap-xy / flip-x / flip-y).
+ * @brief Sensor→screen axis orientation, 0..15 —— **完整的三轴置换，含镜像族**。
  *
- * Lets the pour direction be corrected on-device without a rebuild. The value
- * persists in NVS. ::accel_input_cycle_orientation steps to the next one.
+ * 2026-09-23 真机实测订正两次：
+ *  ① 原来是"xy 平面内互换/翻转"，修不了"传感器竖着装"（法线落在传感器 y 轴上）
+ *     的板子 —— 实测这块板子就是，8 个旧档位里没有一个能用。
+ *  ② 补上三轴置换后，用户实测"上下对、左右反" —— 只翻一个轴在右手系里做不到
+ *     （那是镜像），说明这颗芯片相对板面是镜像的。所以档位表要同时覆盖两族。
+ *
+ * 现在 16 档 = {法线 = ±传感器 y} × {平面内 4 种 90° 旋转} × {右手/镜像}：
+ *   o0..o7  法线 = −传感器 y（本机实测族，**o4 是实测正确的那个**）
+ *   o8..o15 法线 = +传感器 y
+ *
+ * Lets the tilt direction be corrected on-device without a rebuild. The value
+ * persists in NVS（键名 `orient3`；语义变过两次所以换了两次键名，旧值自动失效）。
+ * ::accel_input_cycle_orientation steps to the next one and is
+ * bound to a long-press of the BOOT key in main.c.
+ *
+ * 判据：**平放屏幕朝上、把右边压低 → 屏幕和仪表盘都应写「向右倾斜」**。
  */
 int  accel_input_get_orientation(void);
 void accel_input_set_orientation(int idx);
@@ -85,7 +93,7 @@ void accel_input_cycle_orientation(void);
 
 /**
  * @brief Whether the driver fell back to using the on-board buttons as the
- *        "gravity" source (i.e. no real IMU was detected). When true the UI
+ *        "tilt" source (i.e. no real IMU was detected). When true the UI
  *        must NOT create its own button handles, but may register extra
  *        callbacks on the handles returned by accel_input_button().
  */

@@ -10,10 +10,16 @@ This project links against components that carry their own licenses:
 
 CJK font (IMPORTANT)
 --------------------
-`tools/gen_font.py` subsets a font **from your own machine**
-(default: C:\Windows\Fonts\simhei.ttf, Microsoft copyright; the resulting
-`device/main/rw1_font.c` is therefore GIT-IGNORED and must NOT be published).
-Commercial/redistributable use: point FONT_IN at an open-license font you
-download instead, e.g. Source Han Sans SC / Noto Sans SC (SIL OFL 1.1) or
+`tools/gen_font.py` subsets a font **from your own machine**. It auto-detects a
+CJK font (Windows: SimHei/Microsoft YaHei; macOS: PingFang; Linux: Noto Sans CJK
+/ Source Han Sans / WenQuanYi), or you can point it anywhere with
+`--font PATH` / the `RW1_FONT` environment variable
+(`python tools/gen_font.py --list-fonts` shows the candidates it looks for).
+
+Those system fonts are proprietary, so the generated `device/main/rw1_font.c`
+is GIT-IGNORED and must NOT be published as part of a firmware release.
+
+For commercial/redistributable use, point `--font` at an open-license font
+instead, e.g. Source Han Sans SC / Noto Sans SC (SIL OFL 1.1) or
 WenQuanYi (GPL+font-exception), and re-run the script. The firmware only
 requires the generated file to be present at build time.

@@ -1,34 +1,57 @@
 menu "RW1 AI Interaction (board to PC server)"
 
-    config RW1_WIFI_SSID
-        string "WiFi SSID"
-        default "your-ssid"
-        help
-            SSID of the network the board joins. The PC running server.py
-            must be reachable on this network. Set your own value via
-            `idf.py menuconfig` (kept in the local, git-ignored sdkconfig).
-
-    config RW1_WIFI_PASSWORD
-        string "WiFi Password"
-        default "your-password"
-        help
-            WiFi password. Leave empty for an open network.
+    # WiFi 凭据与服务器地址**刻意不在这里**（2026-09-23 决定）。
+    #
+    # 它们原来叫 RW1_WIFI_SSID / RW1_WIFI_PASSWORD / RW1_SERVER_URL，编译期烧进固件。
+    # 两个问题：
+    #   1. 把固件发给别人 = 把自己的 WiFi 密码一起发出去；
+    #   2. "老 sdkconfig 一字不改仍然能跑"这句承诺在实机上不成立 ——
+    #      net_config_present() 只看 NVS，NVS 空就进配网，根本走不到 Kconfig 回退那条路。
+    #
+    # 现在**配网是唯一入口**（双击 BOOT 进 AP → 手机上填表 → 存 NVS）。
+    # 于是固件里永远不可能包含 WiFi 密码。要改网络/服务器地址也不用重编译。
+    # 详见 README「运行期配置：SoftAP 配网」与 PROPOSAL §1.8。
 
     config RW1_WIFI_MAX_RETRY
         int "Maximum connection retries"
         default 8
 
-    config RW1_SERVER_URL
-        string "PC server base URL"
-        default "http://192.168.1.100:8000"
-        help
-            Base URL of the PC server (server.py). Use the PC's LAN IPv4
-            (ipconfig -> WLAN), NOT 127.0.0.1. Set your own via menuconfig.
-
     config RW1_TELEMETRY_PERIOD_MS
         int "Telemetry period (ms)"
         default 500
         help
-            How often the board POSTs an IMU sample to the server.
+            How often the board POSTs one batch of buffered IMU samples to
+            the server. Keep this well above RW1_SAMPLE_PERIOD_MS.
+
+    config RW1_SAMPLE_PERIOD_MS
+        int "IMU sampling period (ms)"
+        default 10
+        help
+            10 ms = 100 Hz. Samples are buffered locally and sent as a single
+            batch every RW1_TELEMETRY_PERIOD_MS, so the HTTP rate stays low
+            while the server still gets a real waveform.
+
+            Do not raise this above ~20 ms: step counting (walking is
+            1.5-2.5 Hz) and free-fall detection (< 0.5 s of weightlessness)
+            are physically impossible below 50 Hz. The original 500 ms
+            (2 Hz) sampling made both features silently fake.
+
+    config RW1_IMU_DEBUG_LOG
+        bool "Periodic IMU diagnostic log (1 Hz)"
+        default y
+        help
+            Once per second the transport task logs one line with the raw
+            sensor sample, the screen-frame values, |a| and the active
+            orientation. Used to validate the sensor->screen axis mapping
+            on a real board: hold the board in a known pose and compare
+            against the expected numbers.
+
+            Expected values (screen frame: +x right, +y down, +z out of
+            the screen): flat on table, screen up -> (0, 0, +1);
+            standing on the top edge -> y = -1; bottom edge -> y = +1;
+            right edge -> x = +1; left edge -> x = -1. |a| should read
+            ~1.00 g whenever the board is at rest.
+
+            Turn it off to reduce log noise once the mapping is confirmed.
 
 endmenu

@@ -40,5 +40,5 @@ if errorlevel 1 (
 )
 
 echo [flash_device] capturing %CAPSECS%s of serial on %PORT%...
-python "%~dp0tools_serial_capture.py" %PORT% %CAPSECS%
+python "%~dp0tools\tools_serial_capture.py" %PORT% %CAPSECS%
 exit /b %errorlevel%

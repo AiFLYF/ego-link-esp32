@@ -1,4 +1,4 @@
-description: ESP32-S3-EYE custom watch face with FLIP fluid simulation
+description: Ego Link teaching board app - batched IMU telemetry to a PC server over HTTP
 
 dependencies:
   espressif/esp32_s3_eye:

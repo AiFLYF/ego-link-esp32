@@ -1,5 +1,5 @@
 /*
- * SPDX-License-Identifier: CC0-1.0
+ * SPDX-License-Identifier: MIT
  *
  * Accelerometer auto-detection driver for the ESP32-S3-EYE.
  * See accel_input.h for the supported parts and detection strategy.
@@ -22,26 +22,24 @@
 
 #define ACCEL_I2C_TIMEOUT_MS 30
 #define ACCEL_I2C_FREQ_HZ 400000
-#define ACCEL_ALT_I2C_PORT I2C_NUM_1
-
-/* Complementary filter / conditioning of the raw sensor.
- *  - GRAV_ALPHA: low-pass weight for the gravity estimate at ~30 fps. Smaller =
- *    smoother + more lag. The on-board SC7A20 measures very cleanly (±0.01 g of
- *    noise at rest), so 0.15 (~190 ms settle) stays smooth while tracking the
- *    hand promptly.
- *  - DEAD_G:     in-plane gravity below this (sensor bias/noise on a flat board)
- *    is squelched to zero so a level pool sits perfectly still.
- *  - DEAD_MOTION: motion residual below this is ignored, so only a deliberate
- *    flick sloshes the water — gentle tilts don't. */
-#define ACCEL_GRAV_ALPHA  0.15f
-#define ACCEL_DEAD_G      0.045f
-#define ACCEL_DEAD_MOTION 0.060f
 
 #define ACCEL_NVS_NS  "accel"
-#define ACCEL_NVS_KEY "orient"
-/* Default sensor→screen map: no axis swap, Y inverted (matches the QMA7981 tilt
- * calibration recorded for this board). If left/right or up/down still run the
- * wrong way it is corrected live from the info screen, no rebuild needed. */
+/* 键名已经换过两次："orient" → "orient2"（8 档三轴置换）→ "orient3"（16 档，含镜像族）。
+ * 每次换都是因为**档位语义变了**：同一个数字在新表里含义不同，留着旧值会被静默当成
+ * 一个错误档位用，反而更难查。换键名 = 旧值自动失效、走新默认值。 */
+#define ACCEL_NVS_KEY "orient3"
+/* Default sensor→screen map: **o4 = out(−z, +x, −y)**。
+ * 这是 2026-09-23 用户长按 BOOT 逐个试出来后**亲眼确认正确**的档位
+ * （原话：「我确定以及肯定」）。
+ *
+ * 我先前两次推算都错了，教训记在这里：
+ *  · 第一次按"LGA 的 z 轴必然垂直于 PCB"推出只剩纯平面旋转 —— 错在把
+ *    **芯片的 z 轴**当成了**板子的法线**（这颗芯片是竖装的，两者本来就不同轴）。
+ *  · 第二次按用户"上下对、左右反"的**口头描述**推成"x 取反" —— 实际是平面内差 90°。
+ *    而且**平放这一个姿势根本区分不出平面内 4 种旋转**：这个姿势下
+ *    `in_x ≈ in_z`，o0 与 o4 算出来的 scr 一模一样（都是 (−0.016, +0.016, +1.016)）。
+ *    **要定平面内旋转必须倾斜着试，不能只看平放读数。**
+ * 结论：这种"装配方向"的事，**实测 > 推算**。 */
 #define ACCEL_ORIENT_DEFAULT 4
 
 typedef enum {
@@ -77,11 +75,8 @@ static qma_format_t s_qma_format = {
     .ready = false,
 };
 
-/* Motion-filter state (screen frame). */
+/* Sensor→screen orientation (persisted in NVS). */
 static int   s_orient = ACCEL_ORIENT_DEFAULT;
-static float s_grav_x = 0.0f;   /* low-pass gravity estimate */
-static float s_grav_y = 0.0f;
-static bool  s_primed = false;  /* seed the filter on the first real sample */
 
 static void accel_input_remove_device(void)
 {
@@ -409,6 +404,34 @@ static bool accel_input_try_probe_lis3dh_family(const uint8_t address)
     /* ODR=100Hz, all axes enabled; high resolution, +-2g */
     ESP_ERROR_CHECK_WITHOUT_ABORT(accel_input_write_reg(0x20, 0x57));
     ESP_ERROR_CHECK_WITHOUT_ABORT(accel_input_write_reg(0x23, 0x88));
+    vTaskDelay(pdMS_TO_TICKS(20));                                    /* wait for first frame */
+
+    /* Same defensive check as the QMA probe: if both config writes failed
+     * silently (ESP_ERROR_CHECK_WITHOUT_ABORT swallows the error) the chip
+     * would never start converting, and its data registers would read 0x00
+     * forever. |a| = 0 is exactly the free-fall signature downstream, so a
+     * dead chip would be reported as an endless fall. At rest a live chip
+     * always shows ~1 g on some axis, i.e. a non-zero data byte. */
+    uint8_t probe[6] = {0};
+    if (accel_input_read_reg(0x28 | 0x80, probe, sizeof(probe)) != ESP_OK) {
+        ESP_LOGW(TAG, "%s @0x%02X: data read failed after init, skipping",
+                 (who_am_i == 0x11) ? "SC7A20" : "LIS3DH", address);
+        accel_input_remove_device();
+        return false;
+    }
+    bool any_nonzero = false;
+    for (size_t i = 0; i < sizeof(probe); ++i) {
+        if (probe[i] != 0) {
+            any_nonzero = true;
+            break;
+        }
+    }
+    if (!any_nonzero) {
+        ESP_LOGW(TAG, "%s @0x%02X: data all zero after init, skipping",
+                 (who_am_i == 0x11) ? "SC7A20" : "LIS3DH", address);
+        accel_input_remove_device();
+        return false;
+    }
 
     s_source = ACCEL_SOURCE_LIS3DH;
     s_source_name = (who_am_i == 0x11) ? "SC7A20" : "LIS3DH";
@@ -447,7 +470,7 @@ static void accel_orient_load(void)
     if (nvs_open(ACCEL_NVS_NS, NVS_READONLY, &h) == ESP_OK) {
         uint8_t v = ACCEL_ORIENT_DEFAULT;
         if (nvs_get_u8(h, ACCEL_NVS_KEY, &v) == ESP_OK) {
-            s_orient = v & 7;
+            s_orient = v & 15;
         }
         nvs_close(h);
     }
@@ -457,39 +480,96 @@ static void accel_orient_save(void)
 {
     nvs_handle_t h;
     if (nvs_open(ACCEL_NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
-        nvs_set_u8(h, ACCEL_NVS_KEY, (uint8_t)(s_orient & 7));
+        nvs_set_u8(h, ACCEL_NVS_KEY, (uint8_t)(s_orient & 15));
         nvs_commit(h);
         nvs_close(h);
     }
 }
 
-/* Map raw sensor in-plane axes to screen axes (+x right, +y down).
- * bit0: swap x/y, bit1: flip screen-x, bit2: flip screen-y. */
-static void accel_apply_orientation(float sx, float sy, float *out_x, float *out_y)
+/* Sensor→screen axis map. **必须是完整的三轴置换，而且要覆盖镜像族。**
+ *
+ * 2026-09-23 真机实测订正两次，最终结论：
+ *
+ * ① 这颗 SC7A20 是**竖着装**的 —— 它的 y 轴才是板子的法线（平放屏幕朝上时
+ *    `raw y ≈ −1.016`、`raw z ≈ 0.03`）。原来只做 xy 平面内的互换/翻转，
+ *    **动不了 z 轴**，所以用户把 8 档全试一遍都不对。
+ *
+ * ② 补上三轴置换后（o0 = out(+x,+z,−y)），用户实测：**上下对了、左右反了**。
+ *    "只翻一个轴、其余不动"在右手系里做不到（那是镜像），说明这颗芯片相对板面
+ *    **是镜像的**（焊在另一面 / 芯片自身轴向约定如此）。所以档位表必须同时覆盖
+ *    右手系与镜像两族 —— 8 个不够，要 16 个。
+ *
+ * 现在 16 档 = {法线 = ±传感器 y} × {平面内 4 种 90° 旋转} × {右手/镜像}：
+ *   o0..o7 ：法线 = −传感器 y（本机实测就是这一族）
+ *   o8..o15：法线 = +传感器 y
+ * **o0 就是本机实测正确的那个**（用户 2026-09-23 亲眼确认：上下对、左右也对）。
+ *
+ * 判据（30 秒可验）：**平放屏幕朝上、把右边压低 → 屏幕和仪表盘都应写「向右倾斜」**。
+ */
+static void accel_apply_orientation(float in_x, float in_y, float in_z,
+                                    float *out_x, float *out_y, float *out_z)
 {
-    const int o = s_orient & 7;
-    float a = (o & 1) ? sy : sx;
-    float b = (o & 1) ? sx : sy;
-    *out_x = (o & 2) ? -a : a;
-    *out_y = (o & 4) ? -b : b;
+    /* [档位][输出轴] = {取哪个输入轴(0=x,1=y,2=z), 符号} */
+    static const int8_t TBL[16][3][2] = {
+        /* 法线 = −传感器 y（实测族）。o0 是实测正确的那个 */
+        { {0, -1}, {2, +1}, {1, -1} },   /* o0  out = (-x, +z, -y)  ← 本机实测正确 */
+        { {0, +1}, {2, +1}, {1, -1} },   /* o1  out = (+x, +z, -y) */
+        { {2, +1}, {0, -1}, {1, -1} },   /* o2  out = (+z, -x, -y) */
+        { {0, -1}, {2, -1}, {1, -1} },   /* o3  out = (-x, -z, -y) */
+        { {2, -1}, {0, +1}, {1, -1} },   /* o4  out = (-z, +x, -y) */
+        { {0, +1}, {2, -1}, {1, -1} },   /* o5  out = (+x, -z, -y) */
+        { {2, +1}, {0, +1}, {1, -1} },   /* o6  out = (+z, +x, -y) */
+        { {2, -1}, {0, -1}, {1, -1} },   /* o7  out = (-z, -x, -y) */
+        /* 法线 = +传感器 y */
+        { {0, +1}, {2, -1}, {1, +1} },   /* o8  out = (+x, -z, +y) */
+        { {2, +1}, {0, +1}, {1, +1} },   /* o9  out = (+z, +x, +y) */
+        { {0, -1}, {2, +1}, {1, +1} },   /* o10 out = (-x, +z, +y) */
+        { {2, -1}, {0, -1}, {1, +1} },   /* o11 out = (-z, -x, +y) */
+        { {0, +1}, {2, +1}, {1, +1} },   /* o12 out = (+x, +z, +y) */
+        { {2, +1}, {0, -1}, {1, +1} },   /* o13 out = (+z, -x, +y) */
+        { {0, -1}, {2, -1}, {1, +1} },   /* o14 out = (-x, -z, +y) */
+        { {2, -1}, {0, +1}, {1, +1} },   /* o15 out = (-z, +x, +y) */
+    };
+    const int o = s_orient & 15;
+    const float in[3] = {in_x, in_y, in_z};
+    float *out[3] = {out_x, out_y, out_z};
+    for (int i = 0; i < 3; i++) {
+        const float v = in[TBL[o][i][0]];
+        *out[i] = (TBL[o][i][1] < 0) ? -v : v;
+    }
 }
 
 int accel_input_get_orientation(void)
 {
-    return s_orient & 7;
+    return s_orient & 15;
 }
 
 void accel_input_set_orientation(int idx)
 {
-    s_orient = idx & 7;
-    s_primed = false; /* re-seed the filter so the flip doesn't cause a slosh */
+    s_orient = idx & 15;
     accel_orient_save();
     ESP_LOGI(TAG, "accel orientation set to %d", s_orient);
 }
 
 void accel_input_cycle_orientation(void)
 {
-    accel_input_set_orientation((s_orient + 1) & 7);
+    accel_input_set_orientation((s_orient + 1) & 15);
+}
+
+void accel_input_map_to_screen(float x_g, float y_g, float z_g,
+                               float *out_x, float *out_y, float *out_z)
+{
+    if (out_x == NULL || out_y == NULL || out_z == NULL) {
+        return;
+    }
+    /* Button fallback already reports in screen convention. */
+    if (s_source == ACCEL_SOURCE_BUTTONS) {
+        *out_x = x_g;
+        *out_y = y_g;
+        *out_z = z_g;
+        return;
+    }
+    accel_apply_orientation(x_g, y_g, z_g, out_x, out_y, out_z);
 }
 
 esp_err_t accel_input_init(void)
@@ -498,6 +578,9 @@ esp_err_t accel_input_init(void)
 
     esp_err_t ret = accel_input_select_bsp_bus();
     if (ret == ESP_OK && accel_input_try_supported_sensors_on_current_bus()) {
+        ESP_LOGI(TAG, "init done: source=%s orient=%d%s (long-press BOOT to cycle)",
+                 s_source_name, s_orient,
+                 (s_orient == ACCEL_ORIENT_DEFAULT) ? " (default)" : " (calibrated)");
         return ESP_OK;
     }
 
@@ -508,6 +591,13 @@ esp_err_t accel_input_init(void)
     return accel_input_init_buttons();
 }
 
+/* A real sensor source must NEVER degrade to demo data on a read failure.
+ * The demo sample is (0, 0, 1) — physically indistinguishable from "lying
+ * flat and still". Injecting it after a transient I2C error would mask a
+ * genuine free-fall / fall event (the exact waveform the server looks for)
+ * and make the UI source name flicker to "Demo". Drop the sample instead;
+ * the caller counts it and the batch simply skips it. Demo data is only
+ * honest when no sensor was ever detected. */
 bool accel_input_poll(accel_input_sample_t *sample)
 {
     if (sample == NULL) {
@@ -518,34 +608,36 @@ bool accel_input_poll(accel_input_sample_t *sample)
 
     if (s_source == ACCEL_SOURCE_MPU6050) {
         uint8_t raw[6] = {0};
-        if (accel_input_read_reg(0x3B, raw, sizeof(raw)) == ESP_OK) {
-            const int16_t raw_x = (int16_t)((raw[0] << 8) | raw[1]);
-            const int16_t raw_y = (int16_t)((raw[2] << 8) | raw[3]);
-            const int16_t raw_z = (int16_t)((raw[4] << 8) | raw[5]);
-            sample->x_g = (float)raw_x / 16384.0f;
-            sample->y_g = (float)raw_y / 16384.0f;
-            sample->z_g = (float)raw_z / 16384.0f;
-            sample->valid = true;
-            sample->source_name = s_source_name;
-            return true;
+        if (accel_input_read_reg(0x3B, raw, sizeof(raw)) != ESP_OK) {
+            return false;
         }
+        const int16_t raw_x = (int16_t)((raw[0] << 8) | raw[1]);
+        const int16_t raw_y = (int16_t)((raw[2] << 8) | raw[3]);
+        const int16_t raw_z = (int16_t)((raw[4] << 8) | raw[5]);
+        sample->x_g = (float)raw_x / 16384.0f;
+        sample->y_g = (float)raw_y / 16384.0f;
+        sample->z_g = (float)raw_z / 16384.0f;
+        sample->valid = true;
+        sample->source_name = s_source_name;
+        return true;
     } else if (s_source == ACCEL_SOURCE_LIS3DH) {
         uint8_t raw[6] = {0};
-        if (accel_input_read_reg(0x28 | 0x80, raw, sizeof(raw)) == ESP_OK) {
-            const int16_t raw_x = (int16_t)(((uint16_t)raw[1] << 8) | raw[0]) >> 4;
-            const int16_t raw_y = (int16_t)(((uint16_t)raw[3] << 8) | raw[2]) >> 4;
-            const int16_t raw_z = (int16_t)(((uint16_t)raw[5] << 8) | raw[4]) >> 4;
-            sample->x_g = (float)raw_x / 1024.0f;
-            sample->y_g = (float)raw_y / 1024.0f;
-            sample->z_g = (float)raw_z / 1024.0f;
-            sample->valid = true;
-            sample->source_name = s_source_name;
-            return true;
+        if (accel_input_read_reg(0x28 | 0x80, raw, sizeof(raw)) != ESP_OK) {
+            return false;
         }
+        const int16_t raw_x = (int16_t)(((uint16_t)raw[1] << 8) | raw[0]) >> 4;
+        const int16_t raw_y = (int16_t)(((uint16_t)raw[3] << 8) | raw[2]) >> 4;
+        const int16_t raw_z = (int16_t)(((uint16_t)raw[5] << 8) | raw[4]) >> 4;
+        sample->x_g = (float)raw_x / 1024.0f;
+        sample->y_g = (float)raw_y / 1024.0f;
+        sample->z_g = (float)raw_z / 1024.0f;
+        sample->valid = true;
+        sample->source_name = s_source_name;
+        return true;
     } else if (s_source == ACCEL_SOURCE_QMA7981) {
-        if (accel_input_fill_qma(sample)) {
-            return true;
-        }
+        /* fill_qma already returns false on a bus error or an all-zero
+         * block; no demo fallback here either. */
+        return accel_input_fill_qma(sample);
     } else if (s_source == ACCEL_SOURCE_BUTTONS) {
         return accel_input_fill_buttons(sample);
     }
@@ -566,61 +658,3 @@ button_handle_t accel_input_button(int idx)
     return s_buttons[idx];
 }
 
-void accel_input_read_motion(accel_motion_t *out)
-{
-    if (out == NULL) {
-        return;
-    }
-    memset(out, 0, sizeof(*out));
-
-    accel_input_sample_t s;
-    accel_input_poll(&s);
-    out->valid = s.valid;
-    out->source_name = s.source_name;
-
-    /* Map the raw reading into screen axes. The button fallback already reports
-     * in screen convention, so it bypasses the (sensor-only) orientation map. */
-    float sx, sy;
-    if (s_source == ACCEL_SOURCE_BUTTONS) {
-        sx = s.x_g;
-        sy = s.y_g;
-    } else {
-        accel_apply_orientation(s.x_g, s.y_g, &sx, &sy);
-    }
-
-    /* Complementary split: slow low-pass = gravity, fast residual = motion. */
-    if (!s_primed) {
-        s_grav_x = sx;
-        s_grav_y = sy;
-        s_primed = true;
-    } else {
-        s_grav_x += ACCEL_GRAV_ALPHA * (sx - s_grav_x);
-        s_grav_y += ACCEL_GRAV_ALPHA * (sy - s_grav_y);
-    }
-
-    /* Gravity with a radial dead zone (a flat board reads ~0 and sits still). */
-    float gx = s_grav_x;
-    float gy = s_grav_y;
-    const float gm = sqrtf(gx * gx + gy * gy);
-    if (gm < ACCEL_DEAD_G) {
-        gx = 0.0f;
-        gy = 0.0f;
-    } else {
-        const float k = (gm - ACCEL_DEAD_G) / gm;
-        gx *= k;
-        gy *= k;
-    }
-    out->grav_x = gx;
-    out->grav_y = gy;
-    out->tilt = gm;
-
-    /* Motion residual (device shake), also dead-zoned so noise doesn't slosh. */
-    float mx = sx - s_grav_x;
-    float my = sy - s_grav_y;
-    if (sqrtf(mx * mx + my * my) < ACCEL_DEAD_MOTION) {
-        mx = 0.0f;
-        my = 0.0f;
-    }
-    out->motion_x = mx;
-    out->motion_y = my;
-}
