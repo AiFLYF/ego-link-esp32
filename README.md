@@ -60,7 +60,7 @@
 | `server/server.py` | 电脑服务器（仅 Python 标准库，无需 pip 安装） |
 | `server/data/` | **运行时生成**的 JSONL 日志（git-ignored，见下文"数据落盘"） |
 | `device/` | 开发板 ESP-IDF 工程（ESP-IDF v5.4.x，目标 esp32s3） |
-| `device/main/` | `main.c` 启动、`accel_input.c` IMU驱动（SC7A20/LIS3DH/MPU6050/QMA7981 自动识别）、`wifi_link.c` WiFi STA、`net_config.c` 运行期配置、`provisioning.c` SoftAP 配网、`transport.c` 采样+HTTP遥测、`led_feedback.c` LED图案播放器、`ui.c` LVGL 图形化仪表盘（见下文"板端界面"） |
+| `device/main/` | `main.c` 启动、`accel_input.c` IMU驱动（SC7A20/LIS3DH/MPU6050/QMA7981 自动识别）、`wifi_link.c` WiFi STA、`net_config.c` 运行期配置、`provisioning.c` SoftAP 配网、`transport.c` 采样+HTTP遥测、`led_feedback.c` LED图案播放器、`camera.c` 板载摄像头取帧（esp_video / V4L2，见下文"摄像头"）、`ui.c` LVGL 图形化仪表盘（见下文"板端界面"） |
 | `device/main/net_config.c` | **运行期配置的唯一入口**：凭据只从配网写进的 NVS 来（不再回退 Kconfig，见下） |
 | `device/main/provisioning.c` | SoftAP + `esp_http_server` 配网页；`provisioning_page.h` 是内联的单页 HTML |
 | `device/main/prov_form.c` | 配网表单的解析与校验。**刻意零 IDF 依赖**，可用 host 侧编译器直接测 |
@@ -431,6 +431,57 @@ python tools\ui_preview.py --scale 3  # 拼接图放大 3 倍
 
 ![板端界面预览（含改造前对比）](docs/ui-preview/contact-sheet.png)
 
+### 摄像头（板载 OV2640）
+
+板子自带一颗 OV2640，但**驱动栈不是老的 `esp_camera`**，而是 `esp_video` ——
+一套 Linux V4L2 风格的接口。网上大部分 ESP32 摄像头教程用的是 `esp_camera`
+（`esp_camera_init()` / `esp_camera_fb_get()`），在这块板上照抄会连头文件都找不到。
+
+| 项 | 值 |
+|---|---|
+| 设备节点 | `/dev/video2`（`BSP_CAMERA_DEVICE`） |
+| 当前格式 | JPEG 320×240，约 10–25 KB/帧 |
+| 取帧方式 | `open()` + `VIDIOC_*` + `mmap()` |
+| 代码 | `device/main/camera.c` |
+
+**两个 Kconfig 必须开**（已写进 `sdkconfig.bsp.esp32_s3_eye`，不必手动改）：
+
+| 配置 | 为什么 |
+|---|---|
+| `CONFIG_CAMERA_OV2640=y` | 传感器驱动默认是 `n`。不开就**根本探测不到摄像头**，而且报错长得很像"硬件坏了"，看不出是型号没选 |
+| `CONFIG_CAMERA_OV2640_DVP_JPEG_320X240_50FPS=y` | 每个格式档位默认**也都是** `n`。只开上面那项的话，唯一可用格式是 **YUYV 640×480（一帧 614 KB）**，走 WiFi 根本传不动 |
+
+调用序列（`camera.c` 末尾也留了一份备忘，下次别再从 example 翻起）：
+
+```
+bsp_camera_start()          I2C + 16MHz XCLK + esp_video_init()
+open("/dev/video2")
+VIDIOC_S_FMT                定 JPEG + 分辨率；驱动可能调整请求值，要读回实际值
+VIDIOC_S_EXT_CTRLS          V4L2_CID_VFLIP —— BSP 定义了 BSP_CAMERA_VFLIP 却没应用，不补就是上下颠倒
+VIDIOC_REQBUFS / QUERYBUF / mmap / QBUF
+VIDIOC_STREAMON
+   ├─ VIDIOC_DQBUF          看 buf.flags & V4L2_BUF_FLAG_DONE，长度取 buf.bytesused
+   └─ VIDIOC_QBUF           ★用完必须还，否则缓冲耗尽后永远取不到帧
+VIDIOC_STREAMOFF
+```
+
+开机自检（`RW1_CAMERA_SELFTEST`，默认开）会拍一张并把结果打进串口日志，
+**拍完立刻关闭** —— 一直出图会跟 LVGL 刷新、IMU 上报抢内存带宽：
+
+```
+I (1234) camera: 就绪: /dev/video2 JPEG 320x240, 2 缓冲 x 153600 B
+I (1456) camera: 自检: JPEG 320x240, 第 1 帧, 18240 B, 耗时 218 ms
+I (1456) camera: 自检: JPEG 头 OK / 尾 OK
+I (1456) camera: 自检 PASS —— 摄像头可用（已关闭，未占用带宽）
+```
+
+自检失败只打一行 `自检失败`，**绝不拦开机**（与 LED、SD 卡一样是可选外设）。
+这一步只做到"证明硬件和 Kconfig 都对"；真正的按需取图（第 7–9 周）复用同一套
+`camera_init()` / `camera_capture()` / `camera_release()`，不用重写。
+
+> 两个不用担心的点：帧缓冲由 DVP 驱动分配在 **PSRAM**（`MALLOC_CAP_SPIRAM`），
+> 不占内部 RAM；引脚也不冲突 —— 摄像头占 GPIO 6–18，LCD SPI 占 21/43/44/47/48。
+
 ### 数据落盘（第 1 周的"存储"）
 
 服务器默认把数据写到 `server/data/`，按天分文件、JSONL 追加：
@@ -506,6 +557,8 @@ python server\server.py
 | 连不上 WiFi（反复 retry） | 路由器侧问题（密码改了/AP重启/信道）；板子会自动无限重试，恢复后自动重连 |
 | 编译报 `rw1_font.c missing` | 先跑 `python tools/gen_font.py`（见首次上手①） |
 | 屏幕中文显示成方块 | 跑 `gen_font.py`，它会报告"板端文案缺字"；换了显示文案后要重跑再编译 |
+| 串口只有 `camera: 自检失败: 初始化 ESP_FAIL`，上面没有"就绪"那行 | 十有八九是 `CONFIG_CAMERA_OV2640` 没生效（`device/sdkconfig` 里还是 `# CONFIG_CAMERA_OV2640 is not set`）。确认 `sdkconfig.bsp.esp32_s3_eye` 里摄像头那两行在，然后**删掉 `device/sdkconfig` 让它重新生成**并全量重编 —— 已存在的 sdkconfig 会挡住 defaults 里的新项 |
+| 自检过了"就绪"，但报 `自检失败: 取帧 ESP_FAIL` | 格式档位没开：`VIDIOC_S_FMT` 只会接受 Kconfig 里开过的组合。确认 `CONFIG_CAMERA_OV2640_DVP_JPEG_320X240_50FPS=y` 存在 |
 | 仪表盘「设备」卡片里有两台，但实际只插了一块板 | 两块板的设备名撞了。配网页的「设备名」留空会自动按 MAC 命名；如果手动填了同名（比如都填 `rw1`）就会合并成一台。双击 BOOT 进配网改掉其中一个 |
 | 配网时手机搜不到 `EGO-LINK-XXXX`，或板子一开机就重启循环 | 2026-09-22 前的固件有这个 bug：AP 密码是 4 位，而 WPA2 要求 8–63 位，`esp_wifi_set_config()` 会拒绝；当时那行用的是 `ESP_ERROR_CHECK`，于是直接 `abort()` → 重启循环，连屏幕都看不到。已修（密码改 8 位数字 + 失败不再 abort）。**注意：如果只是个别情况，先确认手机没连在 5GHz-only 的网络**——AP 只跑 2.4GHz channel 1 |
 | 首次编译卡在拉取组件 | 离线场景拷入 `managed_components/`；在线场景检查能否访问 components.espressif.com |

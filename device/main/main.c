@@ -16,6 +16,7 @@
  *   - bsp_display_start():   LCD + LVGL
  *   - accel_input_init():    SC7A20/LIS3DH/MPU6050/QMA7981 auto-detect
  *   - led_feedback_init():   板载 LED（GPIO3）图案反馈
+ *   - camera_selftest():     可选：OV2640 拍一张并打进串口日志，然后关闭
  *   - ui_init():             status/activity/AI-reply screen
  *   - wifi_link_start():     WiFi STA (+ Aliyun SNTP for log timestamps)
  *   - transport_start():     IMU sampling + batched telemetry to the PC server
@@ -28,6 +29,7 @@
 #include "nvs_flash.h"
 
 #include "accel_input.h"
+#include "camera.h"
 #include "led_feedback.h"
 #include "net_config.h"
 #include "provisioning.h"
@@ -131,6 +133,13 @@ void app_main(void)
     ESP_ERROR_CHECK_WITHOUT_ABORT(accel_input_init());
     /* LED 反馈是锦上添花，没有灯也不该拦住主流程 */
     ESP_ERROR_CHECK_WITHOUT_ABORT(led_feedback_init());
+
+    /* 摄像头自检：拍一张，把分辨率/字节数/JPEG 合法性打进串口日志，然后关闭。
+     * 目的是证明硬件和 Kconfig 都对 —— 摄像头不可用只该少一路数据，不拦开机。
+     * 拍完必须关：一直出图会跟 LVGL 刷新、IMU 上报抢内存带宽。 */
+#if CONFIG_RW1_CAMERA_SELFTEST
+    ESP_ERROR_CHECK_WITHOUT_ABORT(camera_selftest());
+#endif
 
     ESP_ERROR_CHECK(ui_init());
 
