@@ -72,7 +72,8 @@ FREEFALL_MIN_S = 0.05     # 失重判定：至少持续这么久才算疑似跌�
 CMD_TIMEOUT_S = 10.0      # 命令下发后多久没收到结果就判超时
 CMD_MAX_HISTORY = 20      # 保留最近多少条命令供网页显示
 CMD_NAMES = ("capture_once", "led_blink", "led_set", "set_orient",
-             "set_config", "sd_format", "sd_ls", "sd_rm")   # 白名单（不认的名字直接 400）
+             "set_config", "sd_format", "sd_ls", "sd_rm",
+             "cam_capture", "cam_stream")   # 白名单（不认的名字直接 400）
 # set_orient 是"远程改方向档位"，与板端长按 BOOT 等价 —— 网页上点选比盲按 N 次靠谱。
 
 LED_MAX_BLINKS = 12       # 一次 led_blink 最多闪几下（板端也会再夹一道）
@@ -141,6 +142,20 @@ class Device:
 DEVICES = {DEFAULT_DEVICE: Device(DEFAULT_DEVICE)}
 
 LOGGER = None                              # 由 main() 注入的 JsonlLogger
+
+# ---- 摄像头：最近一帧 + 拍照留档 -------------------------------------------
+# 板子是 HTTP **客户端**（它没有自己的服务端），所以"实时画面"的做法是
+# **板子 POST 帧上来、网页再从这里取** —— 不是网页直连板子。
+FRAMES = {}                # device -> {"jpeg": bytes, "ts": float, "n": int}
+FRAME_MAX_BYTES = 400 * 1024   # 单帧上限，超了直接丢（防止有人拿它塞垃圾）
+SHOTS_DIR = None           # 拍照留档目录（main() 里按 --data-dir 设）
+SHOT_MAX = 200             # 每台设备最多留多少张（免得把磁盘塞满）
+
+
+def safe_name(s):
+    """把设备名变成安全的目录/文件名：只留字母数字和 - _ .，其余换成 _。"""
+    keep = "".join(c if (c.isalnum() or c in "-_.") else "_" for c in str(s))
+    return (keep[:48] or "unknown")
 
 
 def clean_device_id(raw):
@@ -309,6 +324,9 @@ def sanitize_params(name, params):
         return {"on": bool(v)}
     if name == "set_orient":
         return {"o": clamp_int(p.get("o"), 0, 15, 0)}
+    if name == "cam_stream":
+        # 只有开/关两种状态，布尔化即可（别把任意值透传下去）
+        return {"on": bool(p.get("on"))}
     if name == "sd_rm":
         # 文件名：只放行"根目录下的文件名"，不接受路径分隔符 —— 板端还会再拦一道，
         # 但服务端不该把明显越界的东西发下去。长度按板端的 s_rm_name[64] 夹。
@@ -935,19 +953,135 @@ class Handler(BaseHTTPRequestHandler):
                                         "names": list(CMD_NAMES)}, ensure_ascii=False))
         elif path == "/api/logs":
             self._send(200, json.dumps(LOGGER.stats() if LOGGER else {}, ensure_ascii=False))
+        elif path == "/api/frame":
+            # 网页的 <img src="/api/frame?device=X&t=..."> 直接取这一帧
+            want = clean_device_id(query_param(query, "device") or "")
+            with LOCK:
+                fr = FRAMES.get(want) or (FRAMES.get(pick_device(want).id) if want else None)
+            if not fr:
+                self._send(404, b"", "image/jpeg")
+            else:
+                self._send(200, fr["jpeg"], "image/jpeg",
+                           extra={"Cache-Control": "no-store"})
+        elif path == "/api/shots":
+            self._send(200, json.dumps({"ok": True, "shots": self._shots_list(query)},
+                                       ensure_ascii=False))
+        elif path.startswith("/api/shots/"):
+            self._send_shot(path[len("/api/shots/"):])
         elif path == "/api/stream":
             self._sse(query)
         else:
             self._send(404, json.dumps({"ok": False, "error": "not found"}))
 
     def do_POST(self):
-        path = self.path.split("?")[0]
+        path, _, query = self.path.partition("?")
         if path == "/api/telemetry":
             self._telemetry()
         elif path == "/api/command":
             self._command()
+        elif path == "/api/frame":
+            self._frame(query)
+        elif path == "/api/shots/delete":
+            self._shot_delete()
         else:
             self._send(404, json.dumps({"ok": False, "error": "not found"}))
+
+    # ---- camera (板 → 服务器 → 网页) ----------------------------------------
+    def _frame(self, query):
+        """板子 POST 上来的一帧 JPEG。`?device=X`；`?save=1` 表示这是"拍照"要留档。"""
+        dev = clean_device_id(query_param(query, "device") or "-")
+        save = query_param(query, "save") == "1"
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            n = 0
+        if n <= 0 or n > FRAME_MAX_BYTES:
+            self._send(400, json.dumps({"ok": False, "error": "bad frame size"},
+                                       ensure_ascii=False))
+            return
+        data = self.rfile.read(n)
+        # JPEG 头魔数校验：防止把随便什么字节当帧存下来
+        if len(data) < 4 or data[:2] != b"\xff\xd8":
+            self._send(400, json.dumps({"ok": False, "error": "not a jpeg"},
+                                       ensure_ascii=False))
+            return
+        with LOCK:
+            old = FRAMES.get(dev)
+            FRAMES[dev] = {"jpeg": data, "ts": time.time(),
+                           "n": (old["n"] + 1) if old else 1}
+        saved = None
+        if save:
+            saved = self._shot_save(dev, data)
+        self._send(200, json.dumps({"ok": True, "bytes": len(data), "saved": saved},
+                                   ensure_ascii=False))
+
+    def _shot_save(self, dev, data):
+        """把一帧存成文件。返回文件名（失败返回 None）。"""
+        if not SHOTS_DIR:
+            return None
+        d = os.path.join(SHOTS_DIR, safe_name(dev))
+        try:
+            os.makedirs(d, exist_ok=True)
+            name = time.strftime("%Y%m%d-%H%M%S") + "-%03d.jpg" % (int(time.time() * 1000) % 1000)
+            with open(os.path.join(d, name), "wb") as fh:
+                fh.write(data)
+            # 超过上限就删最旧的（按文件名排序 = 按时间排序）
+            files = sorted(f for f in os.listdir(d) if f.endswith(".jpg"))
+            for f in files[:-SHOT_MAX]:
+                try:
+                    os.remove(os.path.join(d, f))
+                except OSError:
+                    pass
+            return name
+        except OSError as e:
+            print("  拍照存盘失败: %s" % e)
+            return None
+
+    def _shots_list(self, query):
+        dev = clean_device_id(query_param(query, "device") or "")
+        out = []
+        if SHOTS_DIR and dev:
+            d = os.path.join(SHOTS_DIR, safe_name(dev))
+            if os.path.isdir(d):
+                for f in sorted(os.listdir(d), reverse=True):
+                    if f.endswith(".jpg"):
+                        try:
+                            sz = os.path.getsize(os.path.join(d, f))
+                        except OSError:
+                            sz = 0
+                        out.append({"name": f, "bytes": sz, "device": dev})
+        return out
+
+    def _send_shot(self, name):
+        """按设备+文件名取一张留档照片。**路径必须夹紧**，不能让它读到目录外。"""
+        name = urllib.parse.unquote(name)
+        dev, _, fn = name.rpartition("/")
+        if (not dev or not fn or "/" in fn or "\\" in fn or ".." in fn
+                or ".." in dev or not SHOTS_DIR):
+            self._send(404, b"", "image/jpeg")
+            return
+        full = os.path.join(SHOTS_DIR, safe_name(dev), fn)
+        if not os.path.isfile(full):
+            self._send(404, b"", "image/jpeg")
+            return
+        with open(full, "rb") as fh:
+            self._send(200, fh.read(), "image/jpeg",
+                       extra={"Cache-Control": "max-age=31536000"})
+
+    def _shot_delete(self):
+        msg = self._read_json()
+        dev = clean_device_id(str(msg.get("device", "")))
+        fn = str(msg.get("name", ""))
+        if (not dev or not fn or "/" in fn or "\\" in fn or ".." in fn or not SHOTS_DIR):
+            self._send(400, json.dumps({"ok": False, "error": "bad request"},
+                                       ensure_ascii=False))
+            return
+        full = os.path.join(SHOTS_DIR, safe_name(dev), fn)
+        try:
+            os.remove(full)
+            self._send(200, json.dumps({"ok": True}, ensure_ascii=False))
+        except OSError as e:
+            self._send(404, json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False))
 
     # ---- command (网页 → 服务器 → 板 → 服务器 → 网页) -----------------------
     def _command(self):
@@ -1254,6 +1388,29 @@ h1{font-size:19px;line-height:1.35}
   box-shadow:0 0 0 1px rgba(var(--act-rgb),.10),0 22px 60px -30px rgba(var(--act-rgb),.55);
 }
 .card.wide{max-width:1400px;margin:14px auto 0}
+/* 存储占用圆环：比一条横条直观，而且点一下就能进管理 */
+.ringwrap{display:flex;align-items:center;gap:16px;margin-top:6px}
+.ring{position:relative;width:104px;height:104px;flex:0 0 auto;cursor:pointer;
+  border-radius:50%;transition:transform .15s}
+.ring:hover{transform:scale(1.04)}
+.ring svg{display:block;transform:rotate(-90deg)}
+.ring .ringtxt{position:absolute;inset:0;display:flex;flex-direction:column;
+  align-items:center;justify-content:center;line-height:1.15}
+.ring .ringtxt b{font-size:20px;font-weight:650}
+.ring .ringtxt span{font-size:11px;color:var(--faint,#8892a4)}
+.ringmeta{font-size:12px;line-height:1.7}
+.ringmeta .k{color:var(--faint,#8892a4)}
+/* 摄像头：左画面右按钮，窄屏自动堆叠 */
+.camwrap{display:grid;grid-template-columns:minmax(0,1fr) 240px;gap:14px;margin-top:6px}
+.camview{background:#0b0f16;border-radius:10px;overflow:hidden;aspect-ratio:4/3;
+  display:flex;align-items:center;justify-content:center;position:relative}
+.camview img{width:100%;height:100%;object-fit:contain;display:block}
+.camview .nosig{color:#5b6678;font-size:12px}
+.camside{display:flex;flex-direction:column;gap:8px}
+.shot{display:flex;align-items:center;gap:10px;padding:6px 8px;border-radius:8px}
+.shot img{width:56px;height:42px;object-fit:cover;border-radius:6px;background:#0b0f16}
+.shot .nm{font-size:12px;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+@media (max-width:900px){.camwrap{grid-template-columns:1fr}}
 .card-head{display:flex;align-items:baseline;justify-content:space-between;gap:10px;margin-bottom:12px}
 h2{font-size:13px;color:var(--text)}
 .card-head .src{font-size:11px;color:var(--faint)}
@@ -1413,7 +1570,9 @@ footer{max-width:1400px;margin:18px auto 0;color:var(--faint);font-size:11px;lin
       <span class="src" style="display:flex;align-items:center;gap:8px">
         <span id="d3src">—</span>
         <span>刷新
-          <select id="pollsel" title="页面从服务器取数的频率。想更跟手就选 20Hz —— 但前提是板端上报周期也调到 50ms（板子设置里的「灵敏度」），两个都够快才真跟手">
+          <select id="pollsel" title="页面从服务器取数的频率。想更跟手就选 60Hz —— 但前提是板端上报周期也调到 50ms（板子设置里的「灵敏度」），两个都够快才真跟手">
+            <option value="16">60 Hz</option>
+            <option value="33">30 Hz</option>
             <option value="50">20 Hz</option>
             <option value="100" selected>10 Hz</option>
             <option value="200">5 Hz</option>
@@ -1428,6 +1587,26 @@ footer{max-width:1400px;margin:18px auto 0;color:var(--faint);font-size:11px;lin
       画面仍按 60Hz 平滑（中间做 slerp），所以取数慢一点也不会一跳一跳。</div>
   </section>
 
+  <section class="card wide" id="cardcam" hidden>
+    <div class="card-head"><h2>摄像头</h2>
+      <span class="src" id="camwho">—</span></div>
+    <div class="camwrap">
+      <div class="camview"><img id="camimg" alt="摄像头画面"></div>
+      <div class="camside">
+        <button id="camshot">拍照 → 存进板子 SD 卡</button>
+        <button id="camlive">开启实时画面</button>
+        <div class="hint" style="margin-top:8px">
+          实时画面是板子**推**上来的（板子是 HTTP 客户端，网页连不到板子本身）。
+          开启后约 5 帧/秒，关掉可省 WiFi 带宽。
+        </div>
+        <div class="hint" id="camstat" style="margin-top:6px">—</div>
+      </div>
+    </div>
+    <div class="card-head" style="margin-top:14px"><h3 style="margin:0;font-size:13px">本机照片存档</h3>
+      <span class="src" id="shotwho">—</span></div>
+    <div class="list" id="shotlist" style="margin-top:8px"></div>
+  </section>
+
   <section class="card wide" id="cardsd">
     <div class="card-head"><h2>存储管理</h2>
       <span class="src" id="sdwho">数据来自最近一次「读取存储信息」的回传</span></div>
@@ -1435,7 +1614,7 @@ footer{max-width:1400px;margin:18px auto 0;color:var(--faint);font-size:11px;lin
       <button id="sdrefresh">读取存储信息</button>
       <span class="hint">命令发给「设备」卡片里勾选的那些（勾多台就一起读）</span>
     </div>
-    <div id="sdspace" style="margin-top:10px"></div>
+    <div id="sdring" class="ringwrap"></div>
     <div class="list" id="sdfiles" style="margin-top:8px"></div>
   </section>
 
@@ -1606,7 +1785,11 @@ var CMD_UI = {
   sd_ls:       { label:"读取存储信息" },
   /* sd_rm 需要文件名参数，裸点必然失败 —— 它只该从「存储管理」里每个文件的
      删除按钮触发，所以这里标 hidden，不在指令栏出按钮。 */
-  sd_rm:       { label:"删除文件", danger:true, hidden:true }
+  sd_rm:       { label:"删除文件", danger:true, hidden:true },
+  cam_capture: { label:"拍照" },
+  /* cam_stream 由摄像头卡片里的「开启/关闭实时画面」按钮触发，
+     不在指令栏出按钮（那里会出现"开/关"两种语义，容易点错）。 */
+  cam_stream:  { label:"实时画面", hidden:true }
 };
 
 /* ---------------- 环形仪表（270°，与板端同款） ---------------- */
@@ -2025,6 +2208,146 @@ function sendCmd(name, btn, overrideParams){
   }).then(function(){ syncButtons(); });
 }
 
+/* ---------------- 摄像头 ----------------
+ * 板子是 HTTP 客户端、没有自己的服务端，所以画面是**板子 POST 上来、网页从这里取**。
+ * 网页只拿最近一帧（/api/frame），拍照则由板子写 SD 卡、服务器另存一份给这里展示。 */
+var camDev = "", camOn = false, camTimer = null, camFails = 0;
+
+function camShow(on){
+  var c = $("cardcam");
+  if (c) c.hidden = !on;
+}
+function camFrame(){
+  var im = $("camimg");
+  if (!im) return;
+  var dev = (selDevice || (devices[0] && devices[0].id) || "");
+  camDev = dev;
+  im.src = "/api/frame?device=" + encodeURIComponent(dev) + "&t=" + Date.now();
+  im.onload = function(){
+    camFails = 0;
+    camShow(true);
+    var st = $("camstat");
+    if (st) st.textContent = "画面 " + im.naturalWidth + "×" + im.naturalHeight;
+  };
+  im.onerror = function(){
+    camFails++;
+    /* 连续取不到就别一直重试了，提示一次即可 */
+    if (camFails === 3) {
+      var st = $("camstat");
+      if (st) st.textContent = "还没有画面 —— 摄像头自检没过时不会有帧（先看板子串口）";
+    }
+  };
+}
+function camSetLive(on){
+  camOn = on;
+  if (camTimer) { clearInterval(camTimer); camTimer = null; }
+  var btn = $("camlive");
+  if (on) {
+    camFrame();
+    camTimer = setInterval(camFrame, 200);      /* 5 fps，和板端推送节奏对齐 */
+  }
+  if (btn) btn.textContent = on ? "关闭实时画面" : "开启实时画面";
+}
+function shotRow(dev, name, bytes, local){
+  return '<div class="shot"><img src="' + (local ? local : "/api/shots/" +
+      encodeURIComponent(dev) + "/" + encodeURIComponent(name)) + '" alt="">' +
+    '<span class="nm">' + esc(name) + '<br><span class="hint">' +
+    (bytes ? fmtBytes(bytes) : "") + (local ? " · 本机存档" : " · 板子/服务器") + '</span></span>' +
+    '<button data-shot="' + esc(name) + '" data-local="' + (local ? "1" : "") + '">删除</button></div>';
+}
+function renderShots(){
+  var host = $("shotlist");
+  if (!host) return;
+  var dev = (selDevice || (devices[0] && devices[0].id) || "");
+  var who = $("shotwho");
+  if (who) who.textContent = dev || "—";
+  var server = [];
+  var finish = function(){
+    /* 服务器上的 + 本机 IndexedDB 里的，合起来展示（本机在前，刷新页面也不丢） */
+    idbList(function(local){
+      var html = local.map(function(x){ return shotRow(dev, x.name, x.bytes, x.url); }).join("") +
+                 server.map(function(x){ return shotRow(x.device, x.name, x.bytes, null); }).join("");
+      host.innerHTML = html || '<div class="empty">还没有照片。点上面的「拍照」按钮。</div>';
+      Array.prototype.forEach.call(host.querySelectorAll("[data-shot]"), function(btn){
+        btn.onclick = function(){
+          var nm = btn.getAttribute("data-shot");
+          if (!window.confirm("删除 " + nm + " ？无法恢复。")) return;
+          if (btn.getAttribute("data-local")) {
+            idbDel(nm, renderShots);
+          } else {
+            fetch("/api/shots/delete", {method: "POST",
+              headers: {"Content-Type": "application/json"},
+              body: JSON.stringify({device: dev, name: nm})}).then(renderShots);
+          }
+        };
+      });
+    });
+  };
+  fetch("/api/shots?device=" + encodeURIComponent(dev)).then(function(r){ return r.json(); })
+    .then(function(d){ server = (d && d.shots) || []; finish(); })
+    .catch(function(){ finish(); });
+}
+
+/* ---- 本机存档：IndexedDB（用户要求"存浏览器里、保持持久性"）----
+ * 用 IndexedDB 而不是 localStorage：照片是二进制，localStorage 只能存字符串且只有 5MB。 */
+var IDB_NAME = "rw1-photos", IDB_STORE = "shots";
+function idbOpen(cb){
+  var req = indexedDB.open(IDB_NAME, 1);
+  req.onupgradeneeded = function(){
+    var db = req.result;
+    if (!db.objectStoreNames.contains(IDB_STORE)) {
+      db.createObjectStore(IDB_STORE, {keyPath: "name"});
+    }
+  };
+  req.onsuccess = function(){ cb(req.result); };
+  req.onerror = function(){ cb(null); };
+}
+function idbPut(name, blob, cb){
+  idbOpen(function(db){
+    if (!db) { if (cb) cb(); return; }
+    var tx = db.transaction(IDB_STORE, "readwrite");
+    tx.objectStore(IDB_STORE).put({name: name, bytes: blob.size, blob: blob,
+                                   t: Date.now()});
+    tx.oncomplete = function(){ db.close(); if (cb) cb(); };
+  });
+}
+function idbDel(name, cb){
+  idbOpen(function(db){
+    if (!db) { if (cb) cb(); return; }
+    var tx = db.transaction(IDB_STORE, "readwrite");
+    tx.objectStore(IDB_STORE).delete(name);
+    tx.oncomplete = function(){ db.close(); if (cb) cb(); };
+  });
+}
+function idbList(cb){
+  idbOpen(function(db){
+    if (!db) { cb([]); return; }
+    var out = [];
+    var tx = db.transaction(IDB_STORE, "readonly");
+    var req = tx.objectStore(IDB_STORE).getAll();
+    req.onsuccess = function(){
+      db.close();
+      (req.result || []).sort(function(a, b){ return b.t - a.t; }).forEach(function(x){
+        out.push({name: x.name, bytes: x.bytes, url: URL.createObjectURL(x.blob)});
+      });
+      cb(out);
+    };
+    req.onerror = function(){ db.close(); cb([]); };
+  });
+}
+/* 拍照：让板子写 SD 卡；同时把这一帧存进本机 IndexedDB 做持久备份 */
+function camShot(){
+  var dev = (selDevice || (devices[0] && devices[0].id) || "");
+  sendCmd("cam_capture");
+  fetch("/api/frame?device=" + encodeURIComponent(dev) + "&t=" + Date.now())
+    .then(function(r){ if (!r.ok) throw new Error("no frame"); return r.blob(); })
+    .then(function(bl){
+      var nm = "local-" + new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19) + ".jpg";
+      idbPut(nm, bl, function(){ renderShots(); });
+    })
+    .catch(function(){ renderShots(); });
+}
+
 /* ---------------- 存储管理 ----------------
  * 数据来自最近一条 sd_ls 命令回传的 `note` 字段，格式：
  *     SPACE,<total>,<free>;NAME|<size>;NAME|<size>;...
@@ -2055,7 +2378,7 @@ function parseSdNote(note){
   return out;
 }
 function renderSd(){
-  var host = $("sdspace"), list = $("sdfiles");
+  var host = $("sdring"), list = $("sdfiles");   /* 容器 id 是 sdring（圆环） */
   if (!host || !list) return;
   /* 取最近一条**成功**的 sd_ls 结果 */
   var last = null;
@@ -2075,15 +2398,38 @@ function renderSd(){
     var used = Math.max(0, d.total - d.free);
     var pct = d.total ? (used / d.total * 100) : 0;
     var bar = pct > 90 ? C.red : (pct > 75 ? C.amber : C.green);
-    /* 一条横条把占用画出来 —— "还剩多少"比一串数字直观得多 */
+    /* 圆环：中间写百分比，比一条横条直观；**点它 = 进入文件管理** */
+    var R = 44, CIRC = 2 * Math.PI * R;
+    var off = (CIRC * (1 - Math.min(100, pct) / 100)).toFixed(1);
     host.innerHTML =
-      '<div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:4px">' +
-      '<span>已用 ' + fmtBytes(used) + ' / ' + fmtBytes(d.total) + '</span>' +
-      '<span style="color:' + bar + '">' + pct.toFixed(1) + '%　剩余 ' + fmtBytes(d.free) +
-      '</span></div>' +
-      '<div style="height:10px;border-radius:5px;background:var(--track);overflow:hidden">' +
-      '<div style="height:100%;width:' + Math.min(100, pct).toFixed(1) + '%;background:' + bar +
-      '"></div></div>';
+      '<div class="ring" id="sdringbtn" title="点击进入文件管理">' +
+        '<svg width="104" height="104" viewBox="0 0 104 104">' +
+          '<circle cx="52" cy="52" r="' + R + '" fill="none" stroke="var(--track)" stroke-width="10"/>' +
+          '<circle cx="52" cy="52" r="' + R + '" fill="none" stroke="' + bar + '" stroke-width="10" ' +
+            'stroke-linecap="round" stroke-dasharray="' + CIRC.toFixed(1) + '" ' +
+            'stroke-dashoffset="' + off + '"/>' +
+        '</svg>' +
+        '<div class="ringtxt"><b style="color:' + bar + '">' + pct.toFixed(0) + '%</b>' +
+        '<span>已用</span></div>' +
+      '</div>' +
+      '<div class="ringmeta">' +
+        '<div><span class="k">已用</span> ' + fmtBytes(used) + '</div>' +
+        '<div><span class="k">总共</span> ' + fmtBytes(d.total) + '</div>' +
+        '<div><span class="k">剩余</span> ' + fmtBytes(d.free) + '</div>' +
+        '<div class="hint" style="margin-top:4px">点圆环进入文件管理 ↓</div>' +
+      '</div>';
+    var rb = $("sdringbtn");
+    if (rb) {
+      rb.onclick = function(){
+        var list = $("sdfiles");
+        if (list) {
+          list.scrollIntoView({behavior: "smooth", block: "center"});
+          list.style.transition = "box-shadow .3s";
+          list.style.boxShadow = "0 0 0 2px " + bar;
+          setTimeout(function(){ list.style.boxShadow = "none"; }, 1200);
+        }
+      };
+    }
   }
   if (!d.files.length){
     list.innerHTML = '<div class="empty">卡上没有文件。</div>';
@@ -2365,6 +2711,16 @@ fetch("/api/commands" + devQuery()).then(function(r){ return r.json(); }).then(f
   cmdNames = d.names || ["capture_once"];
   if ($("devall")) $("devall").onclick = toggleDevAll;
   if ($("sdrefresh")) $("sdrefresh").onclick = function(){ sendCmd("sd_ls"); };
+  /* 摄像头接线放最后：它依赖 IndexedDB 等浏览器能力，**万一出错也不能
+     中断上面的初始化**（曾经插在 init3d() 之前，一出错整个回调就断了，
+     #devall / #cmdbts / 3D 全都不执行）。 */
+  try {
+    if ($("camshot")) $("camshot").onclick = camShot;
+    if ($("camlive")) $("camlive").onclick = function(){ camSetLive(!camOn); };
+    renderShots();
+  } catch (e) {
+    if (window.console) console.warn("摄像头初始化失败（不影响其它功能）: " + e);
+  }
   init3d();
   /* 板子设置：只把**填了**的项发过去（空着 = 不改那一项）。 */
   if ($("cfgurl")) $("cfgurl").placeholder = location.origin;   /* 提示当前地址 */
@@ -2444,6 +2800,8 @@ def main():
     args = ap.parse_args()
 
     CMD_TIMEOUT_S = max(1.0, args.cmd_timeout)
+    global SHOTS_DIR
+    SHOTS_DIR = os.path.join(args.data_dir, "shots")
     LOGGER = JsonlLogger(args.data_dir, retain_days=args.retain_days,
                          log_telemetry=not args.no_log_telemetry, log_hz=args.log_hz)
 
