@@ -331,7 +331,8 @@ def sanitize_params(name, params):
                 if v:
                     out[key] = v[:lim]
         if "period_ms" in p:
-            out["period_ms"] = clamp_int(p.get("period_ms"), 100, 2000, 500)
+            # 下限 50ms = 20Hz（板端夹同样的范围，两边保持一致）
+            out["period_ms"] = clamp_int(p.get("period_ms"), 50, 2000, 500)
         return out
     return {}
 
@@ -1408,10 +1409,23 @@ footer{max-width:1400px;margin:18px auto 0;color:var(--faint);font-size:11px;lin
 
 <main class="grid">
   <section class="card wide" id="card3d" hidden>
-    <div class="card-head"><h2>板子姿态 · 3D</h2><span class="src" id="d3src">—</span></div>
+    <div class="card-head"><h2>板子姿态 · 3D</h2>
+      <span class="src" style="display:flex;align-items:center;gap:8px">
+        <span id="d3src">—</span>
+        <span>刷新
+          <select id="pollsel" title="页面从服务器取数的频率。想更跟手就选 20Hz —— 但前提是板端上报周期也调到 50ms（板子设置里的「灵敏度」），两个都够快才真跟手">
+            <option value="50">20 Hz</option>
+            <option value="100" selected>10 Hz</option>
+            <option value="200">5 Hz</option>
+            <option value="500">2 Hz</option>
+            <option value="2000">0.5 Hz</option>
+          </select>
+        </span>
+      </span></div>
     <canvas id="board3d" style="width:100%;height:280px;display:block"></canvas>
-    <div class="hint" style="margin-top:6px">橙色小条 = 板子顶边；地面网格固定不动，板子跟着实时姿态转。
-      数据 2Hz 到、画面 60Hz 走（中间做 slerp 平滑），所以看着是连续的。</div>
+    <div class="hint" style="margin-top:6px">橙色小条 = 板子顶边（远的那条）；地面网格固定不动，板子跟着实时姿态转。
+      数据**多久来一次**由两处共同决定：这里的「刷新」+ 板端「灵敏度」（上报周期）—— 两个都够快才真跟手。
+      画面仍按 60Hz 平滑（中间做 slerp），所以取数慢一点也不会一跳一跳。</div>
   </section>
 
   <section class="card wide" id="cardsd">
@@ -1444,7 +1458,7 @@ footer{max-width:1400px;margin:18px auto 0;color:var(--faint);font-size:11px;lin
              style="background:var(--card-hi);color:var(--text);border:1px solid var(--line);
                     border-radius:8px;padding:5px 9px;min-width:210px">
       <span class="src">上报周期 ms</span>
-      <input id="cfgper" type="number" min="100" max="2000" step="50" placeholder="100~2000"
+      <input id="cfgper" type="number" min="50" max="2000" step="10" placeholder="50~2000"
              style="background:var(--card-hi);color:var(--text);border:1px solid var(--line);
                     border-radius:8px;padding:5px 9px;width:110px">
       <button id="cfgapply">下发到板子</button>
@@ -1452,7 +1466,8 @@ footer{max-width:1400px;margin:18px auto 0;color:var(--faint);font-size:11px;lin
     </div>
     <div class="hint" style="margin-top:6px">
       <b>改 WiFi 会先试连、连上了才保存</b>（最多 8 秒）—— 密码填错不会把板子弄失联。
-      <b>上报周期就是「灵敏度」</b>：越小界面越跟手，但 WiFi 压力越大；默认 500ms。
+      <b>上报周期就是「灵敏度」</b>：50ms=20Hz（最跟手）/ 100ms=10Hz / 500ms=2Hz（默认）。
+      越小越跟手，但 WiFi 压力越大；50ms 已接近单次往返的量级，跑不到也正常。
     </div>
   </section>
 
@@ -1745,19 +1760,24 @@ function init3d(){
   g.add(new THREE.Mesh(
     new THREE.BoxGeometry(2.0, 2.0, 0.2),
     new THREE.MeshStandardMaterial({color: 0x2b3444, roughness: 0.62, metalness: 0.18})));
-  /* 屏幕面（+z 那面）用活动色的绿，一眼分出正反面 */
+  /* 屏幕面（+z 那面）用活动色的绿，一眼分出正反面。
+   * ⚠️ 必须**露在板子表面之外**：板厚 0.2 → 表面在 z=±0.1，
+   * 所以这里要 > 0.1。之前是 0.085（板厚还是 0.16 时勉强露在外面），
+   * 我把板厚加到 0.2 之后它就被埋进板子里了 —— 屏幕面整块看不见。 */
   var scr = new THREE.Mesh(new THREE.PlaneGeometry(1.62, 1.62),
                            new THREE.MeshBasicMaterial({color: 0x1d9e75}));
-  scr.position.z = 0.085;
+  scr.position.z = 0.106;
   g.add(scr);
   /* 顶边标记：和板端屏幕的橙色小条同一个约定（+y 是"下"，所以顶边在 -y） */
   /* 顶边标记：做成**跨在板子顶边上、两面都露出来的一条棱**，
    * 而不是贴在某一面上的薄片 —— 原来贴在 +z 面（z=0.09），从背面看被板子挡住。
    * 现在 z 方向做到 ±0.14（板厚 ±0.1），正反面都看得到；
    * +y 是"下"（屏幕系），所以顶边在 -y。 */
+  /* 位置在 +y：平放时 +y 映射到世界的**远端**，也就是"离你远的那条边"。
+   * （-y 会落在靠近你的那条边上 —— 用户要的是远的这条。） */
   var top = new THREE.Mesh(new THREE.BoxGeometry(0.7, 0.14, 0.28),
                            new THREE.MeshBasicMaterial({color: 0xef9f27}));
-  top.position.set(0, -1.0, 0);
+  top.position.set(0, 1.0, 0);
   g.add(top);
   scene.add(g);
 
@@ -1770,8 +1790,8 @@ function init3d(){
         target: new THREE.Quaternion(), cur: new THREE.Quaternion()};
   $("card3d").hidden = false;
 
-  /* 数据 2Hz 到、画面 60Hz 走：每帧朝目标姿态 slerp 一点点，
-     所以即使数据是跳着来的，画面也是连续转的。 */
+  /* 画面 60Hz 走、数据按「刷新」选择器的频率到：每帧朝目标姿态 slerp 一点点，
+     所以即使数据来得慢，画面也是连续转的（取数越快越跟手）。 */
   (function loop(){
     requestAnimationFrame(loop);
     d3.cur.slerp(d3.target, 0.18);
@@ -1787,11 +1807,24 @@ function init3d(){
   });
 }
 
-/* 把板子转到"真实姿态"：测到的是**世界正上方在板子坐标系里的方向**，
-   所以把它转到世界 +Y 的那个旋转，就是板子当前的姿态。 */
+/* 把板子转到"真实姿态"。
+ *
+ * ⚠️ 上报的 x/y/z **不是**物理"上方向"，而是板端姿态球用的"下坡方向"
+ * （x/y 被镜像过，z 没有）。两个物理校准点（2026-09-24 实测）：
+ *
+ *     平放水平        → (0.00,  0.02, +0.99)   屏幕朝上 → +z 是"上"
+ *     把右边压低      → (+0.70, -0.03, +0.72)  板端叫「向右倾斜」→ 右边是低的
+ *
+ * 第二行说明 **x 为正 ⟺ 右边低**（球往右滚），和屏幕上的姿态球一致；
+ * 而真正的物理"上"方向在右边低时应该**偏向左边**。所以物理上是：
+ *
+ *     物理上方向 = (-x, -y, +z)      ← 只镜像 x/y，z 不动
+ *
+ * 再把它对齐到世界 +Y，就是板子的真实姿态。
+ * （第一版直接拿 (x,y,z) 当"上"、还对到 -Y，两次都错 —— 平放时看到的是背面。） */
 function update3d(x, y, z){
   if (!d3) return;
-  var v = new THREE.Vector3(x, y, z);
+  var v = new THREE.Vector3(-x, -y, z);
   if (v.lengthSq() < 1e-6) return;
   v.normalize();
   d3.target.setFromUnitVectors(v, new THREE.Vector3(0, 1, 0));
@@ -2309,7 +2342,20 @@ fetch("/api/commands" + devQuery()).then(function(r){ return r.json(); }).then(f
   renderButtons();
 });
 pull();
-setInterval(pull, 2000);
+/* 刷新率可调：原来硬编码 2000ms（0.5Hz），3D 看着一顿一顿的。
+ * 注意这是"页面从服务器取数"的频率，真正决定跟手程度的是**板端上报周期**
+ * （板子设置里那个"灵敏度"，默认 500ms = 2Hz）—— 两个都要够快才跟手。
+ * 选 20Hz 时若板端还是 500ms，看到的仍然是 2Hz 的数据，只是取数更勤。 */
+var pollTimer = null;
+function setPoll(ms){
+  if (pollTimer) { clearInterval(pollTimer); }
+  pollTimer = setInterval(pull, ms);
+  pull();
+}
+if ($("pollsel")) {
+  $("pollsel").onchange = function(){ setPoll(parseInt(this.value, 10) || 100); };
+}
+setPoll(parseInt(($("pollsel") || {}).value, 10) || 100);
 stream();
 })();
 </script>
