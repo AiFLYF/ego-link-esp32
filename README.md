@@ -163,6 +163,24 @@ three.js 用仓库里 vendor 的那份（`docs/vendor/three/build/three.min.js`�
 `/vendor/three.min.js` **白名单**放行）—— **不引 CDN**：教室/局域网常常没有外网，
 引 CDN 必然白屏。刻意不做通用静态目录，否则 `server/data/` 里的遥测 jsonl 会被一并暴露。
 
+### 跑真浏览器回归（`tools/e2e_dashboard.js`）
+
+`tools/verify_server.py` 只测 HTTP 接口，测不到"页面能不能点"。真浏览器那套补上了这一层：
+
+```bash
+# 一次装好 playwright-core（用系统 Chrome，不下载 Chromium）
+mkdir -p ~/.workbuddy-ai/binaries/node/workspace && cd ~/.workbuddy-ai/binaries/node/workspace
+npm install playwright-core --no-audit --no-fund
+
+# 跑（它自己起独立端口 + 两块假板子，不碰你正在用的 8000）
+NODE_PATH="<上面那个>/node_modules" node tools/e2e_dashboard.js
+```
+
+它上线当天就抓到 **4 个真 bug**：档位显示不刷新（时序）、每次打开一条 favicon 404、
+**服务端把 `set_orient` 的档位参数丢掉**（只验请求体发现不了）、
+**设备上线后指令按钮一直是灰的**（`disabled` 只在构建时算过一次）。
+教训写在文件头的注释里：**要验"服务端存下的"，不能只验"页面发出的"**。
+
 ### 远程指令通道（第 2 周）
 
 **多选/全选批量下发**：设备卡片里每台前面有复选框，勾几台，下面的指令就同时发给这几台

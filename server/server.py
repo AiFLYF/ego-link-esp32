@@ -2053,6 +2053,11 @@ function render(s){
   dev.className = "pill " + (devOnline ? "on" : "off");
   dev.innerHTML = "<i></i>" + (devOnline ? "在线" : "离线");
   if (selDevice) dev.title = selDevice;
+  /* **必须在这里也刷一次按钮**：`b.disabled = busy || !devOnline` 只在
+   * syncButtons() 里算，而 syncButtons() 原来只在"按钮构建时"和 renderCmds()
+   * 末尾被调用 —— 页面加载时设备还没上报，按钮被设成 disabled 之后就**再也没刷新过**，
+   * 于是设备上线后按钮一直是灰的（2026-09-23 浏览器 E2E 抓到的真 bug）。 */
+  syncButtons();
 
   $("src").textContent = (s.source && s.source !== "-") ? s.source : "—";
   $("hzp").textContent = s.sample_hz ? (s.sample_hz + " Hz") : "— Hz";
