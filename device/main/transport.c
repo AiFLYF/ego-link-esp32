@@ -27,6 +27,12 @@
 
 #include "accel_input.h"
 #include "led_feedback.h"
+#include <dirent.h>
+#include <sys/stat.h>
+
+#include "bsp/esp-bsp.h"      /* BSP_SD_MOUNT_POINT */
+#include "esp_vfs_fat.h"     /* esp_vfs_fat_info */
+
 #include "sd_card.h"
 #include "sd_log.h"
 #include "net_config.h"
@@ -62,6 +68,10 @@ static const char *TAG = "transport";
  * Reuses the ordinary 10 ms sampling tick, so a capture takes 200 ms and never
  * blocks the loop. If the samples cannot be gathered in time we report a failure
  * rather than leaving the web page spinning. */
+/* 指令回传里的**自由文本**字段长度。目前用于 sd_ls 的文件列表 / sd_rm 的结果说明。
+ * 不复用 err —— err 的语义是「失败原因」，拿它传正常数据会让服务端/网页的判断变味。 */
+#define CMD_NOTE_LEN 384
+
 #define CAPTURE_N 20
 #define CAPTURE_TIMEOUT_MS 2000
 
@@ -87,6 +97,7 @@ typedef struct {
     float      xyz[3];
     float      std;
     char       err[48];
+    char       note[CMD_NOTE_LEN];   /* 自由文本：sd_ls 的文件列表、sd_rm 的结果说明 */
 } cmd_ctx_t;
 
 static transport_status_t s_st;
@@ -149,11 +160,16 @@ typedef enum {
     CMD_SET_ORIENT,     /* set_orient   —— 远程设置方向档位（与长按 BOOT 等价） */
     CMD_SET_CONFIG,     /* set_config   —— 远程改 WiFi / 服务器地址 / 上报周期 */
     CMD_SD_FORMAT,      /* sd_format    —— 格式化 SD 卡（卡里长文件名的旧文件板子删不掉，只能整卡格式化） */
+    CMD_SD_LS,          /* sd_ls        —— 列出 SD 卡文件 + 容量（网页存储管理用） */
+    CMD_SD_RM,          /* sd_rm        —— 删除 SD 卡上的一个文件（参数 name） */
 } cmd_kind_t;
 
 /* set_config 的参数（含**字符串**）。用文件级静态而不是扩 run_command 的参数列表：
  * 那个列表已经有 6 个参数了，再塞 3 个字符串和 1 个 int 只会更难读。
  * 只有 transport 任务会碰它们，不存在竞态。 */
+/* sd_rm 要删的文件名（字符串参数，和 set_config 一样先用静态存下来） */
+static char s_rm_name[64];
+
 static char s_cfg_ssid[NET_SSID_MAX];
 static char s_cfg_pass[NET_PASS_MAX];
 static char s_cfg_url[NET_URL_MAX];
@@ -276,6 +292,112 @@ static void start_capture(const char *id)
  * **WiFi 先试连、连上了才保存**（和配网页 `wifi_link_try_sta` 一致）：
  * 凭据填错时板子不会失联 —— 这是刻意选的保守做法，代价是这条指令要等几秒。
  * 试连期间 transport 被占住（遥测会停几秒），所以返回里会带上耗时。 */
+/* 把 SD 卡根目录列成一行紧凑文本给网页：`NAME|SIZE;NAME|SIZE`。
+ * `|` `;` 当分隔符是安全的 —— 8.3 文件名里不可能出现它们。
+ * 文件多了会撑爆 note，所以最多列 CMD_NOTE_MAX_FILES 个，末尾加 `...` 提示还有。 */
+#define CMD_NOTE_MAX_FILES 12
+
+static void run_sd_ls(const char *id)
+{
+    utf8_strlcpy(s_cmd.id, id, sizeof(s_cmd.id));
+    s_cmd.running = true;
+    s_cmd.state = TRANSPORT_CMD_RUNNING;
+    s_cmd.started = xTaskGetTickCount();
+    s_cmd.n = 0;
+    s_cmd.note[0] = '\0';
+
+    if (!sd_card_mounted()) {
+        finish_command(false, false, "没有挂载 SD 卡");
+        return;
+    }
+
+    /* 容量放最前面：网页不用再发一条指令去问 */
+    uint64_t total = 0, free_b = 0;
+    int off = 0;
+    if (esp_vfs_fat_info(BSP_SD_MOUNT_POINT, &total, &free_b) == ESP_OK) {
+        off += snprintf(s_cmd.note + off, sizeof(s_cmd.note) - (size_t)off,
+                        "SPACE,%llu,%llu;", (unsigned long long)total,
+                        (unsigned long long)free_b);
+    }
+
+    DIR *d = opendir(BSP_SD_MOUNT_POINT);
+    if (d == NULL) {
+        finish_command(false, false, "打不开 SD 卡根目录");
+        return;
+    }
+    struct dirent *ent;
+    int shown = 0, more = 0;
+    while ((ent = readdir(d)) != NULL) {
+        if (ent->d_name[0] == '.') {
+            continue;                       /* 跳过 . / .. 和隐藏项 */
+        }
+        if (shown >= CMD_NOTE_MAX_FILES) {
+            more = 1;
+            break;
+        }
+        /* 缓冲要放得下 mount point + '/' + **最长可能的 d_name(255)** ——
+         * 原来写 128，被 -Werror=format-truncation 挡下（T21 同一类：
+         * snprintf 的目标缓冲比"最坏情况"小）。 */
+        char full[320];
+        snprintf(full, sizeof(full), "%s/%s", BSP_SD_MOUNT_POINT, ent->d_name);
+        struct stat st;
+        long sz = (stat(full, &st) == 0) ? (long)st.st_size : -1;
+        int n = snprintf(s_cmd.note + off, sizeof(s_cmd.note) - (size_t)off,
+                         "%s|%ld;", ent->d_name, sz);
+        if (n < 0 || (size_t)(off + n) >= sizeof(s_cmd.note)) {
+            break;                          /* 塞不下就停，已列出来的照样发回去 */
+        }
+        off += n;
+        shown++;
+    }
+    closedir(d);
+    if (more && (size_t)off + 4 < sizeof(s_cmd.note)) {
+        strlcpy(s_cmd.note + off, "...;", sizeof(s_cmd.note) - (size_t)off);
+    }
+
+    status_lock();
+    s_st.cmd_count++;
+    status_unlock();
+    ESP_LOGI(TAG, "cmd %s: sd_ls 列了 %d 个文件", s_cmd.id, shown);
+    finish_command(true, false, NULL);
+}
+
+static void run_sd_rm(const char *id, const char *name)
+{
+    utf8_strlcpy(s_cmd.id, id, sizeof(s_cmd.id));
+    s_cmd.running = true;
+    s_cmd.state = TRANSPORT_CMD_RUNNING;
+    s_cmd.started = xTaskGetTickCount();
+    s_cmd.n = 0;
+    s_cmd.note[0] = '\0';
+
+    if (!sd_card_mounted()) {
+        finish_command(false, false, "没有挂载 SD 卡");
+        return;
+    }
+    /* 只允许删根目录下的普通文件：名字里出现 '/' 或 '..' 一律拒绝，
+     * 免得网页（或伪造的请求）能顺着路径删到别的挂载点上去。 */
+    if (name == NULL || name[0] == '\0' || strchr(name, '/') != NULL ||
+        strchr(name, '\\') != NULL || strstr(name, "..") != NULL) {
+        finish_command(false, false, "文件名不合法（只允许 SD 根目录下的文件名）");
+        return;
+    }
+
+    char full[128];
+    snprintf(full, sizeof(full), "%s/%s", BSP_SD_MOUNT_POINT, name);
+    if (remove(full) != 0) {
+        finish_command(false, false, "删除失败（文件不存在 / 只读卡？）");
+        return;
+    }
+    snprintf(s_cmd.note, sizeof(s_cmd.note), "已删除 %s", name);
+
+    status_lock();
+    s_st.cmd_count++;
+    status_unlock();
+    ESP_LOGI(TAG, "cmd %s: sd_rm 删除 %s", s_cmd.id, name);
+    finish_command(true, false, NULL);
+}
+
 static void run_set_config(const char *id)
 {
     net_config_t cfg;
@@ -318,6 +440,10 @@ static void run_set_config(const char *id)
 static void run_command(cmd_kind_t kind, const char *id,
                         int n, int on_ms, int off_ms, bool on, int pattern)
 {
+    /* 每条指令进来先清 note：新指令（sd_ls/sd_rm）自己会填，
+     * 老指令（led_blink 等）不填 —— 不清的话回传里会带上一条的残留。 */
+    s_cmd.note[0] = '\0';
+
     if (kind == CMD_NONE) {
         return;
     }
@@ -363,6 +489,14 @@ static void run_command(cmd_kind_t kind, const char *id,
 
     case CMD_SET_CONFIG:
         run_set_config(id);
+        break;
+
+    case CMD_SD_LS:
+        run_sd_ls(id);
+        break;
+
+    case CMD_SD_RM:
+        run_sd_rm(id, s_rm_name);
         break;
 
     case CMD_SD_FORMAT: {
@@ -522,7 +656,7 @@ static char *build_body(int n, bool ask, const char *source)
         return NULL;
     }
     size_t cap = 256 + (size_t)n * 28 + strlen(s_ask_text) * 2 + 64
-                 + (s_cmd.ready ? 320 : 0) + 32
+                 + (s_cmd.ready ? (320 + CMD_NOTE_LEN + 24) : 0) + 32
                  + strlen(s_device) * 6 + 24;   /* "dev" 字段：设备名是用户输入，转义后可能翻倍 */
     char *buf = malloc(cap);
     if (buf == NULL) {
@@ -586,7 +720,7 @@ static char *build_body(int n, bool ask, const char *source)
 
     /* 远程指令的执行结果（带同一个 request_id 回传给服务器） */
     if (s_cmd.ready) {
-        if ((size_t)off + 288 > cap) {
+        if ((size_t)off + 288 + CMD_NOTE_LEN + 24 > cap) {
             free(buf);
             return NULL;
         }
@@ -605,6 +739,20 @@ static char *build_body(int n, bool ask, const char *source)
         } else if (!s_cmd.ok) {
             off += snprintf(buf + off, cap - (size_t)off, ",\"err\":\"");
             if (!json_escape_append(buf, cap, &off, s_cmd.err)) {
+                free(buf);
+                return NULL;
+            }
+            off += snprintf(buf + off, cap - (size_t)off, "\"");
+        }
+        /* 自由文本（文件列表等）。文件列表可能带空格和分隔符，
+         * 所以照例走 json_escape_append，不直接拼。 */
+        if (s_cmd.note[0] != '\0') {
+            if ((size_t)off + CMD_NOTE_LEN + 24 > cap) {
+                free(buf);
+                return NULL;
+            }
+            off += snprintf(buf + off, cap - (size_t)off, ",\"note\":\"");
+            if (!json_escape_append(buf, cap, &off, s_cmd.note)) {
                 free(buf);
                 return NULL;
             }
@@ -679,6 +827,15 @@ static void apply_response(const char *body, size_t len)
                     } else if (strcmp(jname->valuestring, "led_set") == 0) {
                         kind = CMD_LED_SET;
                         p_onf = json_bool(jparams, "on", true);
+                    } else if (strcmp(jname->valuestring, "sd_ls") == 0) {
+                        kind = CMD_SD_LS;
+                    } else if (strcmp(jname->valuestring, "sd_rm") == 0) {
+                        kind = CMD_SD_RM;
+                        const cJSON *v = cJSON_IsObject(jparams)
+                            ? cJSON_GetObjectItemCaseSensitive(jparams, "name") : NULL;
+                        if (cJSON_IsString(v)) {
+                            utf8_strlcpy(s_rm_name, v->valuestring, sizeof(s_rm_name));
+                        }
                     } else if (strcmp(jname->valuestring, "sd_format") == 0) {
                         kind = CMD_SD_FORMAT;
                     } else if (strcmp(jname->valuestring, "set_config") == 0) {

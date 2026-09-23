@@ -72,7 +72,7 @@ FREEFALL_MIN_S = 0.05     # 失重判定：至少持续这么久才算疑似跌�
 CMD_TIMEOUT_S = 10.0      # 命令下发后多久没收到结果就判超时
 CMD_MAX_HISTORY = 20      # 保留最近多少条命令供网页显示
 CMD_NAMES = ("capture_once", "led_blink", "led_set", "set_orient",
-             "set_config", "sd_format")   # 白名单（不认的名字直接 400）
+             "set_config", "sd_format", "sd_ls", "sd_rm")   # 白名单（不认的名字直接 400）
 # set_orient 是"远程改方向档位"，与板端长按 BOOT 等价 —— 网页上点选比盲按 N 次靠谱。
 
 LED_MAX_BLINKS = 12       # 一次 led_blink 最多闪几下（板端也会再夹一道）
@@ -309,6 +309,16 @@ def sanitize_params(name, params):
         return {"on": bool(v)}
     if name == "set_orient":
         return {"o": clamp_int(p.get("o"), 0, 15, 0)}
+    if name == "sd_rm":
+        # 文件名：只放行"根目录下的文件名"，不接受路径分隔符 —— 板端还会再拦一道，
+        # 但服务端不该把明显越界的东西发下去。长度按板端的 s_rm_name[64] 夹。
+        fn = p.get("name")
+        if not isinstance(fn, str):
+            return {}
+        fn = fn.strip()
+        if not fn or "/" in fn or "\\" in fn or ".." in fn:
+            return {}
+        return {"name": fn[:63]}
     if name == "set_config":
         # 网页"板子设置"卡片：只放行这四项，长度按板端 NVS 的字段上限夹
         # （ssid 32 / pass 64 / url 127），空串一律丢掉 —— 板端把"没传"
@@ -390,7 +400,7 @@ def apply_command_result(dev, res):
     if not isinstance(res, dict):
         return None
     cid = str(res.get("id", ""))[:32]
-    keep = ("id", "ok", "ms", "n", "x", "y", "z", "std", "err")
+    keep = ("id", "ok", "ms", "n", "x", "y", "z", "std", "err", "note")
     with LOCK:
         rec = dev.commands.get(cid)
         if rec is None:
@@ -406,6 +416,15 @@ def apply_command_result(dev, res):
                 text = ("[%s] 命令 %s 完成（往返 %.0f ms）：x=%+.3f y=%+.3f z=%+.3f，%d 样本，标准差 %.4f g"
                         % (dev.id, name, latency * 1000, r.get("x", 0.0), r.get("y", 0.0), r.get("z", 0.0),
                            r.get("n", 0), r.get("std", 0.0)))
+            elif name == "sd_ls":
+                # 文件列表放 note 里（`SPACE,total,free;NAME|SIZE;...`），
+                # 事件流里只报"列了几个"，免得把一长串文件名刷进事件流
+                n_files = max(0, r.get("note", "").count(";") - 1)
+                text = "[%s] 已读取存储信息（%d 个文件，往返 %.0f ms）" % (
+                    dev.id, n_files, latency * 1000)
+            elif name == "sd_rm":
+                text = "[%s] 命令 %s 完成（往返 %.0f ms）：%s" % (
+                    dev.id, name, latency * 1000, r.get("note", ""))
             else:             # led_blink / led_set 只有执行确认
                 text = "[%s] 命令 %s 完成（往返 %.0f ms）" % (dev.id, name, latency * 1000)
         else:
@@ -1395,6 +1414,17 @@ footer{max-width:1400px;margin:18px auto 0;color:var(--faint);font-size:11px;lin
       数据 2Hz 到、画面 60Hz 走（中间做 slerp 平滑），所以看着是连续的。</div>
   </section>
 
+  <section class="card wide" id="cardsd">
+    <div class="card-head"><h2>存储管理</h2>
+      <span class="src" id="sdwho">数据来自最近一次「读取存储信息」的回传</span></div>
+    <div class="row" style="flex-wrap:wrap;gap:8px;align-items:center">
+      <button id="sdrefresh">读取存储信息</button>
+      <span class="hint">命令发给「设备」卡片里勾选的那些（勾多台就一起读）</span>
+    </div>
+    <div id="sdspace" style="margin-top:10px"></div>
+    <div class="list" id="sdfiles" style="margin-top:8px"></div>
+  </section>
+
   <section class="card wide" id="cardcfg">
     <div class="card-head"><h2>板子设置</h2>
       <span class="src">改完通过「下一帧遥测的响应」下发到板子并写入 NVS；空着 = 不改那一项</span></div>
@@ -1557,7 +1587,11 @@ var CMD_UI = {
   led_set:     { label:"LED 常亮", params:{on:true}, toggle:true },
   set_orient:  { label:"设置方向档位" },
   set_config:  { label:"下发板子设置" },
-  sd_format:   { label:"格式化 SD 卡", danger:true }
+  sd_format:   { label:"格式化 SD 卡", danger:true },
+  sd_ls:       { label:"读取存储信息" },
+  /* sd_rm 需要文件名参数，裸点必然失败 —— 它只该从「存储管理」里每个文件的
+     删除按钮触发，所以这里标 hidden，不在指令栏出按钮。 */
+  sd_rm:       { label:"删除文件", danger:true, hidden:true }
 };
 
 /* ---------------- 环形仪表（270°，与板端同款） ---------------- */
@@ -1820,7 +1854,9 @@ function renderButtons(){
   var host = $("cmdbts");
   if (host.dataset.built === cmdNames.join(",")) { syncButtons(); return; }
   host.dataset.built = cmdNames.join(",");
-  host.innerHTML = cmdNames.map(function(n){
+  host.innerHTML = cmdNames.filter(function(n){
+    return !(CMD_UI[n] || {}).hidden;          /* hidden：只走程序内部触发，不出按钮 */
+  }).map(function(n){
     var ui = CMD_UI[n] || { label:n };
     return '<button data-cmd="' + n + '"' + (ui.primary ? ' class="primary"' : '') + '>'
          + ui.label + '</button>';
@@ -1890,6 +1926,84 @@ function sendCmd(name, btn, overrideParams){
   }).then(function(){ syncButtons(); });
 }
 
+/* ---------------- 存储管理 ----------------
+ * 数据来自最近一条 sd_ls 命令回传的 `note` 字段，格式：
+ *     SPACE,<total>,<free>;NAME|<size>;NAME|<size>;...
+ * 用 `|` `;` 分隔是安全的 —— 8.3 文件名里不可能出现它们（板端也是这么拼的）。 */
+function fmtBytes(n){
+  if (!isFinite(n) || n < 0) return "?";
+  if (n >= 1073741824) return (n / 1073741824).toFixed(2) + " GB";
+  if (n >= 1048576) return (n / 1048576).toFixed(1) + " MB";
+  if (n >= 1024) return (n / 1024).toFixed(1) + " KB";
+  return n + " B";
+}
+function parseSdNote(note){
+  var out = { total:null, free:null, files:[], more:false };
+  if (!note) return out;
+  note.split(";").forEach(function(part){
+    if (!part) return;
+    if (part.indexOf("SPACE,") === 0){
+      var p = part.split(",");
+      out.total = parseInt(p[1], 10);
+      out.free  = parseInt(p[2], 10);
+    } else if (part === "..."){
+      out.more = true;
+    } else {
+      var i = part.lastIndexOf("|");
+      if (i > 0) out.files.push({ name: part.slice(0, i), size: parseInt(part.slice(i + 1), 10) });
+    }
+  });
+  return out;
+}
+function renderSd(){
+  var host = $("sdspace"), list = $("sdfiles");
+  if (!host || !list) return;
+  /* 取最近一条**成功**的 sd_ls 结果 */
+  var last = null;
+  (cmdsSeen || []).forEach(function(c){
+    if (c.name === "sd_ls" && c.state === "done" && c.result && c.result.note) last = c;
+  });
+  if (!last){
+    host.innerHTML = '<div class="hint">还没读过 —— 点上面的「读取存储信息」' +
+      '（板子离线时命令会排队，等它回来再执行）</div>';
+    list.innerHTML = "";
+    return;
+  }
+  var d = parseSdNote(last.result.note);
+  if (d.total === null){
+    host.innerHTML = '<div class="hint">板端没返回容量信息</div>';
+  } else {
+    var used = Math.max(0, d.total - d.free);
+    var pct = d.total ? (used / d.total * 100) : 0;
+    var bar = pct > 90 ? C.red : (pct > 75 ? C.amber : C.green);
+    /* 一条横条把占用画出来 —— "还剩多少"比一串数字直观得多 */
+    host.innerHTML =
+      '<div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:4px">' +
+      '<span>已用 ' + fmtBytes(used) + ' / ' + fmtBytes(d.total) + '</span>' +
+      '<span style="color:' + bar + '">' + pct.toFixed(1) + '%　剩余 ' + fmtBytes(d.free) +
+      '</span></div>' +
+      '<div style="height:10px;border-radius:5px;background:var(--track);overflow:hidden">' +
+      '<div style="height:100%;width:' + Math.min(100, pct).toFixed(1) + '%;background:' + bar +
+      '"></div></div>';
+  }
+  if (!d.files.length){
+    list.innerHTML = '<div class="empty">卡上没有文件。</div>';
+    return;
+  }
+  list.innerHTML = d.files.map(function(f){
+    return '<div class="item"><span class="name">' + esc(f.name) + '</span>' +
+      '<span class="meta mono">' + fmtBytes(f.size) + '</span>' +
+      '<button data-rm="' + esc(f.name) + '" style="margin-left:auto">删除</button></div>';
+  }).join("") + (d.more ? '<div class="hint">（文件较多，只列了前 12 个）</div>' : "");
+  Array.prototype.forEach.call(list.querySelectorAll("[data-rm]"), function(b){
+    b.onclick = function(){
+      var fn = b.getAttribute("data-rm");
+      if (!window.confirm("确定删除板子上的 " + fn + " 吗？无法恢复。")) return;
+      sendCmd("sd_rm", null, {name: fn});
+    };
+  });
+}
+
 /* ---- 方向档位 oN：显示 + 点选修改 ----
  * 板端长按 BOOT 也能换档，但那是"盲按 N 次"；网页上直接选第几档、还能看到
  * 板子当前在哪一档，标定方向就不用再靠猜了（2026-09-23 用户真机标定时踩过）。 */
@@ -1934,6 +2048,7 @@ function renderCmds(cmds){
   }).join("");
 
   busy = cmds.some(function(c){ return c.state === "queued" || c.state === "sent"; });
+  renderSd();          /* 存储面板跟着最近一条 sd_ls 的结果走 */
   var lastSet = cmds.filter(function(c){ return c.name === "led_set" && c.state === "done"; })[0];
   if (lastSet && lastSet.params) ledSteady = !!lastSet.params.on;
   syncButtons();
@@ -2150,6 +2265,7 @@ fetch("/api/logs").then(function(r){ return r.json(); }).then(function(l){
 fetch("/api/commands" + devQuery()).then(function(r){ return r.json(); }).then(function(d){
   cmdNames = d.names || ["capture_once"];
   if ($("devall")) $("devall").onclick = toggleDevAll;
+  if ($("sdrefresh")) $("sdrefresh").onclick = function(){ sendCmd("sd_ls"); };
   init3d();
   /* 板子设置：只把**填了**的项发过去（空着 = 不改那一项）。 */
   if ($("cfgurl")) $("cfgurl").placeholder = location.origin;   /* 提示当前地址 */
@@ -2274,3 +2390,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# PROBE_MARKER_12345
