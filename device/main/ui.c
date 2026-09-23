@@ -232,6 +232,7 @@ static lv_obj_t *s_spinner;
 
 static char     s_last_reply[TRANSPORT_REPLY_LEN];
 static char     s_last_activity[TRANSPORT_ACTIVITY_LEN];
+static char     s_last_detail[32];          /* 细节行上次的文本（含本地算的倾斜方向） */
 static bool     s_last_pending;
 static int      s_last_abs = -1;
 static int      s_last_axis[3] = {UI_NONE, UI_NONE, UI_NONE};
@@ -398,9 +399,29 @@ static act_kind_t classify(const char *activity)
     return ACT_IDLE;
 }
 
+/* 本地倾斜方位 —— **与服务端 tilt_direction() 用同一套约定**（屏幕系 +x 右、+y 下，
+ * atan2(y,x) 定方位），所以板子和网页永远说同一句话。
+ *
+ * 为什么板子要自己算一份：原来的方向词是**从服务器文案里解析**出来的，于是
+ * **没网就永远停在旧值**，"长按 BOOT 标定方向"这件事在离线时根本做不了
+ * （2026-09-23 真机实测就卡在这）。服务器文案还在时优先用它，这里只做兜底。 */
+static const char *local_tilt_word(float x, float y)
+{
+    if (x * x + y * y < 0.0625f) {          /* 0.25²，与服务端阈值一致 */
+        return "水平";
+    }
+    float deg = atan2f(y, x) * 57.29578f;
+    if (deg < 0.0f) {
+        deg += 360.0f;
+    }
+    static const char *const W[8] = {"右", "右下", "下", "左下", "左", "左上", "上", "右上"};
+    return W[((int)((deg + 22.5f) / 45.0f)) & 7];
+}
+
 /* 细节行：静置给方向，运动/步行给峰值与步数，其余给一句短的。
- * 全部是**从服务器文案里解析出来的真实数值**，不是另编的。 */
-static void build_detail(act_kind_t kind, const char *activity, char *out, size_t out_sz)
+ * 有服务器文案时**优先用从文案里解析出来的真实数值**；没有时（离线）用本地算的方位兜底。 */
+static void build_detail(act_kind_t kind, const char *activity,
+                         float x_g, float y_g, char *out, size_t out_sz)
 {
     float peak = 0.0f;
     float steps = 0.0f;
@@ -413,6 +434,7 @@ static void build_detail(act_kind_t kind, const char *activity, char *out, size_
         snprintf(out, out_sz, "剧烈晃动");
         return;
     case ACT_STILL:
+    case ACT_IDLE:      /* 离线：服务器文案是空的，只能本地算 */
         if (strstr(activity, "向左") || strstr(activity, "左")) {
             snprintf(out, out_sz, "向左倾斜");
         } else if (strstr(activity, "向右") || strstr(activity, "右")) {
@@ -422,7 +444,12 @@ static void build_detail(act_kind_t kind, const char *activity, char *out, size_
         } else if (strstr(activity, "向下") || strstr(activity, "下")) {
             snprintf(out, out_sz, "向下倾斜");
         } else {
-            snprintf(out, out_sz, "水平");
+            const char *w = local_tilt_word(x_g, y_g);
+            if (strcmp(w, "水平") == 0) {
+                snprintf(out, out_sz, "水平");
+            } else {
+                snprintf(out, out_sz, "向%s倾斜", w);
+            }
         }
         return;
     case ACT_WALK:
@@ -734,10 +761,10 @@ static void ui_timer_cb(lv_timer_t *timer)
     }
 
     /* ---------- 活动环：活动词 + 语义色 + 细节行 ---------- */
+    const act_kind_t kind = classify(st.activity);
     if (strcmp(st.activity, s_last_activity) != 0) {
         strlcpy(s_last_activity, st.activity, sizeof(s_last_activity));
 
-        act_kind_t kind = classify(st.activity);
         uint32_t act_color = ACT_COLOR[kind];
 
         lv_label_set_text(s_lbl_word, ACT_WORD[kind]);
@@ -749,12 +776,21 @@ static void ui_timer_cb(lv_timer_t *timer)
         lv_obj_set_style_bg_color(s_cap_dot, lv_color_hex(act_color), 0);
         flash_label(s_lbl_word);
 
-        char detail[32];
-        build_detail(kind, st.activity, detail, sizeof(detail));
-        lv_label_set_text(s_lbl_detail, detail);
-        flash_label(s_lbl_detail);
-
         set_fall_alert(kind == ACT_FALL);
+    }
+
+    /* 细节行**每次都算**（不再挂在"服务器文案变了"这个条件上）：
+     * 它现在含**本地算的**倾斜方向，而方向是随姿态实时变的。
+     * 挂在那个条件上的话，离线时（服务器文案一直是空的）方向词永远不更新 ——
+     * 而"长按 BOOT 标定方向"恰恰要看着它。只在文本真的变了时才写 + 闪。 */
+    {
+        char detail[32];
+        build_detail(kind, st.activity, st.x_g, st.y_g, detail, sizeof(detail));
+        if (strcmp(detail, s_last_detail) != 0) {
+            strlcpy(s_last_detail, detail, sizeof(s_last_detail));
+            lv_label_set_text(s_lbl_detail, detail);
+            flash_label(s_lbl_detail);
+        }
     }
 
     /* ---------- 活动环数值：|a| 映射到 0..100 ---------- */

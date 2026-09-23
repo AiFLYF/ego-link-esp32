@@ -683,7 +683,7 @@ static bool post_batch(int n, bool ask)
  * and the per-axis scale live — no debugger, no extra tooling, just the log.
  * See Kconfig.projbuild (RW1_IMU_DEBUG_LOG) for the expected values. */
 #if CONFIG_RW1_IMU_DEBUG_LOG
-static void imu_debug_log(const accel_input_sample_t *s, float sx, float sy)
+static void imu_debug_log(const accel_input_sample_t *s, float sx, float sy, float sz)
 {
     static uint32_t n = 0;
     const uint32_t period = 1000u / (uint32_t)CONFIG_RW1_SAMPLE_PERIOD_MS;
@@ -692,18 +692,25 @@ static void imu_debug_log(const accel_input_sample_t *s, float sx, float sy)
     }
     n = 0;
     const float mag = sqrtf(s->x_g * s->x_g + s->y_g * s->y_g + s->z_g * s->z_g);
-    ESP_LOGI(TAG, "imu: src=%s o=%d raw[%+.3f %+.3f %+.3f] scr[%+.3f %+.3f] |a|=%.3f",
+    ESP_LOGI(TAG, "imu: src=%s o=%d raw[%+.3f %+.3f %+.3f] scr[%+.3f %+.3f %+.3f] |a|=%.3f",
              s->source_name ? s->source_name : "?", accel_input_get_orientation(),
-             s->x_g, s->y_g, s->z_g, sx, sy, mag);
+             s->x_g, s->y_g, s->z_g, sx, sy, sz, mag);
 }
 #endif
 
 static void transport_task(void *arg)
 {
-    ESP_LOGI(TAG, "waiting for WiFi...");
-    while (!wifi_link_is_up()) {
-        vTaskDelay(pdMS_TO_TICKS(500));
-    }
+    /* **不再等 WiFi 才开工**（2026-09-23 改）。
+     *
+     * 原来这里是 `while (!wifi_link_is_up()) vTaskDelay(500ms);`，后果是
+     * **没网时板子连采样都不做** —— 屏幕没数据、方向词不更新、IMU 标定也做不了。
+     * 但"看当前姿态""标定方向""看界面"这些恰恰都只需要本地数据，
+     * 跟服务器没关系。实测就是这么卡住的：板子连不上 WiFi，整个前端像死机。
+     *
+     * 现在改成：**采样、刷新界面照常；只在没网时跳过上报。**
+     * 代价是离线期间那几批样本不补发（缓冲区每周期照常清空）——
+     * 换来的是一条硬得多的性质：**没网也能看、也能标定**。 */
+    ESP_LOGI(TAG, "transport: 采样立即开始（没网时只跳过上报）");
 
     const TickType_t sample_ticks = pdMS_TO_TICKS(CONFIG_RW1_SAMPLE_PERIOD_MS);
     const TickType_t post_ticks = pdMS_TO_TICKS(CONFIG_RW1_TELEMETRY_PERIOD_MS);
@@ -724,14 +731,15 @@ static void transport_task(void *arg)
             s_poll_fail = 0;
             last_source = sample.source_name ? sample.source_name : "?";
             /* Upload screen-frame axes so the server's tilt labels match what
-             * the LCD shows (see accel_input_map_to_screen). */
-            float sx, sy;
-            accel_input_map_to_screen(sample.x_g, sample.y_g, &sx, &sy);
+             * the LCD shows (see accel_input_map_to_screen). z 也要映射 ——
+             * 传感器可能是"竖着装"的（法线落在它的 y 轴上），只换 x/y 修不了。 */
+            float sx, sy, sz;
+            accel_input_map_to_screen(sample.x_g, sample.y_g, sample.z_g, &sx, &sy, &sz);
 #if CONFIG_RW1_IMU_DEBUG_LOG
-            imu_debug_log(&sample, sx, sy);
+            imu_debug_log(&sample, sx, sy, sz);
 #endif
             float xyz[3];
-            if (sanitize3(sx, sy, sample.z_g, xyz)) {
+            if (sanitize3(sx, sy, sz, xyz)) {
                 if (n < TX_BATCH_MAX) {
                     s_batch[n][0] = xyz[0];
                     s_batch[n][1] = xyz[1];
@@ -783,7 +791,13 @@ static void transport_task(void *arg)
                 strlcpy(sent_rid, s_cmd.rid, sizeof(sent_rid));
             }
 
-            bool ok = post_batch(n, ask);
+            /* 没网就只跳过上报：采样和界面刷新照常（见任务开头那段注释）。
+             * 缓冲区在这个块的末尾照常清零，所以离线不会把样本越攒越多。 */
+            const bool wifi_up = wifi_link_is_up();
+            bool ok = false;
+            if (wifi_up) {
+                ok = post_batch(n, ask);
+            }
 
             /* 结果与按键计数只在成功送达后才清；失败就下一帧重发
              * （与 ask 的重试策略一致，不丢东西） */
