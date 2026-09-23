@@ -1727,7 +1727,11 @@ function init3d(){
 
   var scene = new THREE.Scene();
   var camera = new THREE.PerspectiveCamera(38, W / H, 0.1, 100);
-  camera.position.set(0, 2.4, 4.8);
+  /* 相机仰角要**高**：原来是 (0, 2.4, 4.8) 只有 26.6°，
+   * 板子平放时几乎是"侧着一条线"，左右倾斜根本看不出来（用户反馈：
+   * "平放着向左右倾斜板子不会显示，立起来就会"）。抬到 ~53°，
+   * 平放时看到的是一个完整的方形面，倾斜一眼就能看出来。 */
+  camera.position.set(0, 4.6, 3.4);
   camera.lookAt(0, 0, 0);
 
   scene.add(new THREE.AmbientLight(0xffffff, 0.8));
@@ -1739,7 +1743,7 @@ function init3d(){
      就等于"板子的真实姿态"（见 update3d）。 */
   var g = new THREE.Group();
   g.add(new THREE.Mesh(
-    new THREE.BoxGeometry(2.0, 2.0, 0.16),
+    new THREE.BoxGeometry(2.0, 2.0, 0.2),
     new THREE.MeshStandardMaterial({color: 0x2b3444, roughness: 0.62, metalness: 0.18})));
   /* 屏幕面（+z 那面）用活动色的绿，一眼分出正反面 */
   var scr = new THREE.Mesh(new THREE.PlaneGeometry(1.62, 1.62),
@@ -1747,9 +1751,13 @@ function init3d(){
   scr.position.z = 0.085;
   g.add(scr);
   /* 顶边标记：和板端屏幕的橙色小条同一个约定（+y 是"下"，所以顶边在 -y） */
-  var top = new THREE.Mesh(new THREE.BoxGeometry(0.5, 0.1, 0.05),
+  /* 顶边标记：做成**跨在板子顶边上、两面都露出来的一条棱**，
+   * 而不是贴在某一面上的薄片 —— 原来贴在 +z 面（z=0.09），从背面看被板子挡住。
+   * 现在 z 方向做到 ±0.14（板厚 ±0.1），正反面都看得到；
+   * +y 是"下"（屏幕系），所以顶边在 -y。 */
+  var top = new THREE.Mesh(new THREE.BoxGeometry(0.7, 0.14, 0.28),
                            new THREE.MeshBasicMaterial({color: 0xef9f27}));
-  top.position.set(0, -1.0, 0.09);
+  top.position.set(0, -1.0, 0);
   g.add(top);
   scene.add(g);
 
