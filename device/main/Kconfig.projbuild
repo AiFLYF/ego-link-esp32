@@ -54,4 +54,23 @@ menu "RW1 AI Interaction (board to PC server)"
 
             Turn it off to reduce log noise once the mapping is confirmed.
 
+    config RW1_CAMERA_SELFTEST
+        bool "Camera self-test at boot (capture one frame, then release)"
+        default y
+        help
+            On boot, start the on-board OV2640, capture a single JPEG frame,
+            log its resolution / byte count / JPEG marker validity, then shut
+            the camera down again.
+
+            It releases the camera afterwards on purpose: keeping the DVP
+            interface streaming would compete with LVGL refresh and IMU
+            telemetry for memory bandwidth. The point is to prove the
+            hardware and the Kconfig flags are right -- the actual "capture
+            on demand" feature (weeks 7-9) will call camera_init() again
+            when a photo is requested.
+
+            Requires CONFIG_CAMERA_OV2640 and a JPEG format entry, both of
+            which are set in sdkconfig.bsp.esp32_s3_eye. Failure here never
+            blocks boot; it only logs an error.
+
 endmenu

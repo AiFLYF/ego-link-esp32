@@ -60,3 +60,15 @@ CONFIG_LV_USE_SYSMON=y
 
 # CJK font so the UI can show Chinese AI replies (LVGL built-in)
 CONFIG_LV_USE_TINY_TTF=y
+
+## Camera (on-board OV2640, 8-bit DVP) ##
+
+# 传感器驱动本身默认是 n —— 不开它就根本探测不到摄像头，open("/dev/video2")
+# 之后所有 ioctl 都会失败，而且错误信息看不出是"型号没选"。
+CONFIG_CAMERA_OV2640=y
+
+# 只开上面那一项的话，唯一可用的格式是 YUYV 640x480（一帧 614KB），
+# 走 WiFi 根本传不动。OV2640 的每个格式档位默认也都是 n，要网络传图必须显式开一个，
+# 并且明确指定为默认输出格式。QVGA JPEG 约 10-25 KB/帧。
+CONFIG_CAMERA_OV2640_DVP_JPEG_320X240_50FPS=y
+CONFIG_CAMERA_OV2640_DVP_DEFAULT_FMT_JPEG_320X240_50FPS=y
