@@ -708,6 +708,33 @@ static void ui_timer_cb(lv_timer_t *timer)
     transport_status_t st;
     transport_get_status(&st);
 
+    /* ---------- 显示用的低通滤波 ----------
+     *
+     * 为什么必须滤：`transport` 每周期只把**最后一个样本**写进状态，
+     * 于是界面拿到的是瞬时值。而"倾角"是 `acos(|z|/|a|)` ——
+     * **在 |z| ≈ |a|（接近平放）附近这个函数对噪声极度敏感**：0.03g 的噪声
+     * 就能算出 14°，平放着的板子一会 0° 一会 13°，现场非常困惑。
+     *
+     * 同一个噪声对姿态球几乎没影响（`bx = x * 26px`，0.03g 只让球动不到 1px），
+     * 所以会出现"球稳稳居中、倾角数字乱跳"这种自相矛盾的画面 ——
+     * 2026-09-23 用户拍到并反馈的就是这个。
+     *
+     * 对**显示值**做一阶低通（只影响界面，上报和判定仍用原始值）。 */
+    static float s_disp[3] = {0.0f, 0.0f, 0.0f};
+    static bool s_disp_primed = false;
+    if (!s_disp_primed) {
+        s_disp[0] = st.x_g;
+        s_disp[1] = st.y_g;
+        s_disp[2] = st.z_g;
+        s_disp_primed = true;
+    } else {
+        const float a = 0.25f;
+        s_disp[0] += a * (st.x_g - s_disp[0]);
+        s_disp[1] += a * (st.y_g - s_disp[1]);
+        s_disp[2] += a * (st.z_g - s_disp[2]);
+    }
+    const float dx = s_disp[0], dy = s_disp[1], dz = s_disp[2];
+
     char buf[80];
     bool wifi_up = wifi_link_is_up();
     bool online = wifi_up && st.server_ok;
@@ -785,7 +812,7 @@ static void ui_timer_cb(lv_timer_t *timer)
      * 而"长按 BOOT 标定方向"恰恰要看着它。只在文本真的变了时才写 + 闪。 */
     {
         char detail[32];
-        build_detail(kind, st.activity, st.x_g, st.y_g, detail, sizeof(detail));
+        build_detail(kind, st.activity, dx, dy, detail, sizeof(detail));
         if (strcmp(detail, s_last_detail) != 0) {
             strlcpy(s_last_detail, detail, sizeof(s_last_detail));
             lv_label_set_text(s_lbl_detail, detail);
@@ -794,7 +821,7 @@ static void ui_timer_cb(lv_timer_t *timer)
     }
 
     /* ---------- 活动环数值：|a| 映射到 0..100 ---------- */
-    float mag = sqrtf(st.x_g * st.x_g + st.y_g * st.y_g + st.z_g * st.z_g);
+    float mag = sqrtf(dx * dx + dy * dy + dz * dz);
     int abs_v = (int)(mag / UI_ABS_FULL_G * 100.0f + 0.5f);
     if (abs_v > 100) {
         abs_v = 100;
@@ -807,8 +834,8 @@ static void ui_timer_cb(lv_timer_t *timer)
     }
 
     /* ---------- 姿态球：直接用屏幕坐标系的 x/y，不做二次翻转 ---------- */
-    float bx = st.x_g * UI_BUBBLE_SCALE;
-    float by = st.y_g * UI_BUBBLE_SCALE;
+    float bx = dx * UI_BUBBLE_SCALE;
+    float by = dy * UI_BUBBLE_SCALE;
     if (bx > UI_BUBBLE_MAX) {
         bx = UI_BUBBLE_MAX;
     } else if (bx < -UI_BUBBLE_MAX) {
@@ -824,7 +851,7 @@ static void ui_timer_cb(lv_timer_t *timer)
     /* 球色跟着倾斜量走：水平绿 / 倾斜琥珀 / 大角度红。
      * mag < 0.05g 是「还没拿到有效读数」（开机第一帧、断链时 x/y/z 都是 0），
      * 这时候既不是失重也不该亮红——用暗灰，别让姿态球红着喊失重误导现场。 */
-    float horiz = sqrtf(st.x_g * st.x_g + st.y_g * st.y_g);
+    float horiz = sqrtf(dx * dx + dy * dy);
     uint32_t ball_color;
     if (mag < 0.05f) {
         ball_color = UI_C_FAINT;
@@ -854,22 +881,36 @@ static void ui_timer_cb(lv_timer_t *timer)
      * （屏幕上没有 oN，用户按了也分不清自己在哪一档）。
      * 显示出来之后，标定就是纯屏上操作：长按换档 → 看方向对不对 → 对了就停。 */
     const int ori = accel_input_get_orientation();
+
+    /* `oN` **只在换档后显示 5 秒**，平时倾角小字回到干净的「倾角 N°」。
+     * 理由：这一行宽度是固定的（UI_PANEL_CAP_W = 100），一直挂着 `oN` 会把
+     * 本来就紧的排版挤得更满（用户 2026-09-23 反馈要调整排版）。
+     * 而 `oN` 只在**标定方向**时才需要看 —— 长按 BOOT 换档后它会自己出现 5 秒，
+     * 够看清自己在哪一档了。开机时也显示一次，方便确认当前档位。 */
+    static int s_last_ori = -1;
+    static uint32_t s_ori_at = 0;
+    if (ori != s_last_ori) {
+        s_last_ori = ori;
+        s_ori_at = lv_tick_get();
+    }
+    const bool show_ori = (lv_tick_get() - s_ori_at) < 5000;
+
     if (mag < 0.05f) {
-        snprintf(buf, sizeof(buf), "无读数 o%d", ori);
+        snprintf(buf, sizeof(buf), show_ori ? "无读数 o%d" : "无读数", ori);
     } else if (mag < 0.35f) {
-        snprintf(buf, sizeof(buf), "失重 o%d", ori);
+        snprintf(buf, sizeof(buf), show_ori ? "失重 o%d" : "失重", ori);
     } else {
-        float c = fabsf(st.z_g) / mag;
+        float c = fabsf(dz) / mag;
         if (c > 1.0f) {
             c = 1.0f;
         }
         int deg = (int)(acosf(c) * 57.29578f + 0.5f);
-        snprintf(buf, sizeof(buf), "倾角 %d° o%d", deg, ori);
+        snprintf(buf, sizeof(buf), show_ori ? "倾角 %d° o%d" : "倾角 %d°", deg, ori);
     }
     lv_label_set_text(s_lbl_tilt, buf);
 
     /* ---------- 三轴对称条 ---------- */
-    float axis[3] = {st.x_g, st.y_g, st.z_g};
+    float axis[3] = {dx, dy, dz};
     for (int i = 0; i < 3; i++) {
         int iv = (int)(axis[i] * 100.0f);
         if (iv > UI_AXIS_FULL) {
