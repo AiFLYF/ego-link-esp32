@@ -142,7 +142,20 @@ typedef enum {
     CMD_LED_BLINK,      /* led_blink    —— 闪 n 次（远端物理反馈） */
     CMD_LED_SET,        /* led_set      —— 常亮/熄灭 */
     CMD_SET_ORIENT,     /* set_orient   —— 远程设置方向档位（与长按 BOOT 等价） */
+    CMD_SET_CONFIG,     /* set_config   —— 远程改 WiFi / 服务器地址 / 上报周期 */
 } cmd_kind_t;
+
+/* set_config 的参数（含**字符串**）。用文件级静态而不是扩 run_command 的参数列表：
+ * 那个列表已经有 6 个参数了，再塞 3 个字符串和 1 个 int 只会更难读。
+ * 只有 transport 任务会碰它们，不存在竞态。 */
+static char s_cfg_ssid[NET_SSID_MAX];
+static char s_cfg_pass[NET_PASS_MAX];
+static char s_cfg_url[NET_URL_MAX];
+static int  s_cfg_period;
+
+/* 上报周期（毫秒）—— 做成变量而不是 const，好让 set_config 在运行时改掉它。
+ * 「灵敏度」本质上就是这个：周期越短，网页小球跟得越紧。 */
+static TickType_t s_post_ticks;
 
 /* led_blink 的可选 pattern 参数：让服务端能表达"这是告警/确认/错误"的语义，
  * 而不是只丢一个"闪 N 次"过来。板端映射到对应的预置图案——
@@ -250,6 +263,52 @@ static void start_capture(const char *id)
 }
 
 /* 执行一条刚收到的指令。LED 类指令立刻完成，采集类交给采样循环慢慢累积。 */
+/* 远程改配置 —— 等价于配网页，但不用掏手机。
+ *
+ * 参数都可选，只改传了的那些：{"ssid":"..","pass":"..","url":"..","period_ms":200}
+ *
+ * **WiFi 先试连、连上了才保存**（和配网页 `wifi_link_try_sta` 一致）：
+ * 凭据填错时板子不会失联 —— 这是刻意选的保守做法，代价是这条指令要等几秒。
+ * 试连期间 transport 被占住（遥测会停几秒），所以返回里会带上耗时。 */
+static void run_set_config(const char *id)
+{
+    net_config_t cfg;
+    net_config_load(&cfg);
+
+    utf8_strlcpy(s_cmd.id, id, sizeof(s_cmd.id));
+    s_cmd.running = true;
+    s_cmd.state = TRANSPORT_CMD_RUNNING;
+    s_cmd.started = xTaskGetTickCount();
+    s_cmd.n = 0;
+
+    const bool wifi_change = (s_cfg_ssid[0] != '\0' && strcmp(s_cfg_ssid, cfg.ssid) != 0);
+    if (wifi_change) {
+        char ip[20] = "";
+        ESP_LOGI(TAG, "set_config: 试连 '%s' ...", s_cfg_ssid);
+        if (!wifi_link_try_sta(s_cfg_ssid, s_cfg_pass, 8000, ip, sizeof(ip))) {
+            finish_command(false, false, "WiFi 连不上（密码错或找不到该网络）—— 配置未保存");
+            return;
+        }
+        utf8_strlcpy(cfg.ssid, s_cfg_ssid, sizeof(cfg.ssid));
+        utf8_strlcpy(cfg.pass, s_cfg_pass, sizeof(cfg.pass));
+        ESP_LOGI(TAG, "set_config: 试连成功 (%s)", ip);
+    }
+    if (s_cfg_url[0] != '\0') {
+        utf8_strlcpy(cfg.url, s_cfg_url, sizeof(cfg.url));
+    }
+    if (s_cfg_period >= 100 && s_cfg_period <= 2000) {
+        cfg.period_ms = (uint16_t)s_cfg_period;
+    }
+    if (!net_config_save(&cfg)) {
+        finish_command(false, false, "写 NVS 失败");
+        return;
+    }
+    transport_reload_config();
+    ESP_LOGI(TAG, "set_config ok: ssid='%s' url='%s' period=%d",
+             cfg.ssid, cfg.url, (int)cfg.period_ms);
+    finish_command(true, false, NULL);
+}
+
 static void run_command(cmd_kind_t kind, const char *id,
                         int n, int on_ms, int off_ms, bool on, int pattern)
 {
@@ -294,6 +353,10 @@ static void run_command(cmd_kind_t kind, const char *id,
         ESP_LOGI(TAG, "cmd %s: led_blink n=%d on=%dms off=%dms pattern=%d",
                  s_cmd.id, n, on_ms, off_ms, pattern);
         finish_command(true, false, NULL);
+        break;
+
+    case CMD_SET_CONFIG:
+        run_set_config(id);
         break;
 
     case CMD_SET_ORIENT: {
@@ -583,6 +646,27 @@ static void apply_response(const char *body, size_t len)
                     } else if (strcmp(jname->valuestring, "led_set") == 0) {
                         kind = CMD_LED_SET;
                         p_onf = json_bool(jparams, "on", true);
+                    } else if (strcmp(jname->valuestring, "set_config") == 0) {
+                        /* 字符串参数在这里取好存进文件级静态 —— cJSON 树马上就会被
+                         * Delete 掉，不能留着指针到执行点再用。 */
+                        const cJSON *v;
+                        v = cJSON_IsObject(jparams)
+                            ? cJSON_GetObjectItemCaseSensitive(jparams, "ssid") : NULL;
+                        if (cJSON_IsString(v)) {
+                            utf8_strlcpy(s_cfg_ssid, v->valuestring, sizeof(s_cfg_ssid));
+                        }
+                        v = cJSON_IsObject(jparams)
+                            ? cJSON_GetObjectItemCaseSensitive(jparams, "pass") : NULL;
+                        if (cJSON_IsString(v)) {
+                            utf8_strlcpy(s_cfg_pass, v->valuestring, sizeof(s_cfg_pass));
+                        }
+                        v = cJSON_IsObject(jparams)
+                            ? cJSON_GetObjectItemCaseSensitive(jparams, "url") : NULL;
+                        if (cJSON_IsString(v)) {
+                            utf8_strlcpy(s_cfg_url, v->valuestring, sizeof(s_cfg_url));
+                        }
+                        s_cfg_period = json_int(jparams, "period_ms", 0);
+                        kind = CMD_SET_CONFIG;
                     } else if (strcmp(jname->valuestring, "set_orient") == 0) {
                         /* 方向档位远程设置。参数复用 p_n —— 这条指令不需要样本数。 */
                         kind = CMD_SET_ORIENT;
@@ -746,7 +830,7 @@ static void transport_task(void *arg)
     ESP_LOGI(TAG, "transport: 采样立即开始（没网时只跳过上报）");
 
     const TickType_t sample_ticks = pdMS_TO_TICKS(CONFIG_RW1_SAMPLE_PERIOD_MS);
-    const TickType_t post_ticks = pdMS_TO_TICKS(CONFIG_RW1_TELEMETRY_PERIOD_MS);
+    /* 一次就够：本函数同时把 URL、设备 id 和上报周期都刷一遍（见函数定义）。 */
     transport_reload_config();
     ESP_LOGI(TAG, "telemetry -> %s%s : %d samples @ %d ms, upload every %d ms",
              s_url, TX_PATH,
@@ -814,7 +898,7 @@ static void transport_task(void *arg)
         check_capture_timeout();
 
         const TickType_t now = xTaskGetTickCount();
-        if (n > 0 && ((now - last_post) >= post_ticks || n >= TX_BATCH_MAX)) {
+        if (n > 0 && ((now - last_post) >= s_post_ticks || n >= TX_BATCH_MAX)) {
             bool ask = s_ask_pending;
 
             /* ⚠️ 必须在 post_batch **之前**把"这一帧要发出去的结果"记下来。
@@ -942,6 +1026,14 @@ void transport_reload_config(void)
     net_config_t cfg;
     net_config_load(&cfg);
     strlcpy(s_url, cfg.url, sizeof(s_url));
+
+    /* 上报周期也在这里刷新：`set_config` 改完周期后调本函数即可生效，
+     * 不用重启。夹到 100..2000ms —— 太短会把 WiFi 压满，太长界面就不跟手了。 */
+    int per = (int)cfg.period_ms;
+    if (per < 100 || per > 2000) {
+        per = CONFIG_RW1_TELEMETRY_PERIOD_MS;
+    }
+    s_post_ticks = pdMS_TO_TICKS(per);
 
     /* 设备 id：本函数会被 provisioning 的 httpd 任务调用，而 build_body 在 transport
      * 任务里读它。**值没变就不写** —— 开机写一次之后基本不再变动，把并发窗口压到最小
