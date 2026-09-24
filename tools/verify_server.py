@@ -592,6 +592,69 @@ def main():
         n = len(get_json("http://127.0.0.1:%d/api/commands" % port).get("commands", []))
         check("命令条数被限制在 20 条以内", n <= 20, "实际: %d 条" % n)
 
+        # ---- 摄像头：推帧 → 取帧 → 拍照留档 → 删除 ---------------------------
+        # 放在多设备那节**之前**：多设备节会改"最近上报过的设备"，
+        # 而前面若干节靠那个回退语义工作（那节自己的注释也写明了要放最后）。
+        print("\n[18] 摄像头：推帧 / 取帧 / 拍照留档 / 删除 / 安全")
+        camdev = "cam-01"
+        # 造一个**最小但合法**的 JPEG（头 FF D8、尾 FF D9，中间随便填）——
+        # 服务端只校验魔数，不解析图像，所以不必真造一张图
+        frame = bytes([0xFF, 0xD8, 0xFF, 0xE0]) + b"\x00" * 600 + bytes([0xFF, 0xD9])
+        frame2 = bytes([0xFF, 0xD8, 0xFF, 0xE1]) + b"\x01" * 900 + bytes([0xFF, 0xD9])
+
+        def cam_post(path, body, ctype="image/jpeg"):
+            req = urllib.request.Request("http://127.0.0.1:%d%s" % (port, path),
+                                         data=body, method="POST")
+            req.add_header("Content-Type", ctype)
+            try:
+                with urllib.request.urlopen(req, timeout=8) as r:
+                    return r.status, r.read()
+            except urllib.error.HTTPError as e:
+                return e.code, e.read()      # 4xx 也是有效结果（下面要断言它）
+
+        def cam_get(path):
+            try:
+                with urllib.request.urlopen(
+                        "http://127.0.0.1:%d%s" % (port, path), timeout=8) as r:
+                    return r.status, r.read()
+            except urllib.error.HTTPError as e:
+                return e.code, e.read()
+
+        st, body = cam_post("/api/frame?device=" + camdev, frame)
+        check("推一帧返回 200", st == 200, "实际: %s" % st)
+        st, got = cam_get("/api/frame?device=" + camdev)
+        check("取回的帧与推上去的**逐字节一致**", st == 200 and got == frame,
+              "状态 %s / %d 字节" % (st, len(got)))
+
+        st, body = cam_post("/api/frame?device=" + camdev + "&save=1", frame2)
+        saved = json.loads(body.decode()).get("saved") if st == 200 else None
+        check("带 save=1 会留档", st == 200 and bool(saved), "实际: %s / %s" % (st, saved))
+
+        shots = get_json("http://127.0.0.1:%d/api/shots?device=%s" % (port, camdev))
+        check("照片列表里有它", len(shots.get("shots", [])) >= 1,
+              "实际: %d 张" % len(shots.get("shots", [])))
+        if shots.get("shots"):
+            st, back = cam_get("/api/shots/%s/%s" % (camdev, shots["shots"][0]["name"]))
+            check("取回的照片内容一致", st == 200 and back == frame2,
+                  "状态 %s / %d 字节" % (st, len(back)))
+
+        # 安全：非 JPEG 拒收；路径穿越读不到东西
+        st, _ = cam_post("/api/frame?device=" + camdev, b"NOTJPEG!!")
+        check("非 JPEG 的帧被拒（400）", st == 400, "实际: %s" % st)
+        st, _ = cam_get("/api/shots/" + camdev + "/..%2F..%2Fserver.py")
+        check("照片路径穿越被拒（404）", st == 404, "实际: %s" % st)
+
+        # 删除
+        if shots.get("shots"):
+            st, _ = cam_post("/api/shots/delete",
+                             json.dumps({"device": camdev,
+                                         "name": shots["shots"][0]["name"]}).encode(),
+                             "application/json")
+            check("删除照片返回 200", st == 200, "实际: %s" % st)
+            left = get_json("http://127.0.0.1:%d/api/shots?device=%s" % (port, camdev))
+            check("删完列表里没有了", len(left.get("shots", [])) == len(shots["shots"]) - 1,
+                  "实际: %d 张" % len(left.get("shots", [])))
+
         # ---- 18. 多设备（PROPOSAL §4.1 / 优先级 ③）---------------------------
         # 这一节必须放在最后：它往服务端注册了新设备，会改变"最近上报过的设备"
         # 是哪一台，而前面所有小节都是靠那个回退语义（不带 ?device=）工作的。
