@@ -22,6 +22,7 @@
 /* BSP 把 BSP_CAMERA_DEVICE 定义成 ESP_VIDEO_DVP_DEVICE_NAME，但 bsp/esp32_s3_eye.h
  * **只用了这个宏、没有 include 定义它的头文件**（BSP 自己的 bsp_camera.c 里包含了，
  * 头文件里漏了）。不补这一行，编译会报 'ESP_VIDEO_DVP_DEVICE_NAME' undeclared。 */
+#include "driver/i2c_master.h"
 #include "esp_http_client.h"
 #include "esp_video_device.h"
 #include "sd_card.h"
@@ -50,6 +51,7 @@ static int       s_fd = -1;
 static uint8_t  *s_buf[CAM_NBUF];
 static uint32_t  s_buf_len[CAM_NBUF];
 static uint32_t  s_width;
+static bool      s_is_jpeg;   /* 当前格式是不是硬件 JPEG（GC2145 没有） */
 static uint32_t  s_height;
 static bool      s_started;
 static uint32_t  s_seq;
@@ -97,6 +99,42 @@ static void close_all(void)
 
 /* ------------------------------------------------------------------- API */
 
+/* 把 BSP 那条 I2C（GPIO4/5）整个扫一遍，把应答的地址打出来。
+ *
+ * 为什么值得单独做这一步：摄像头探测失败时，**"没应答"和"地址不对"长得一模一样**
+ * —— 前者是排线/模组，后者是型号选错，排查方向完全相反。扫一遍就能分开：
+ *   只有 0x18（加速度计）      → 摄像头这一端没应答 → FPC 排线 / 模组
+ *   有 0x30                    → 传感器在，是驱动/时序问题
+ *   有别的地址（0x21 / 0x3C）  → 模组型号不是 OV2640
+ *
+ * 注意要在 XCLK 已经跑起来之后调 —— OV2640 没有时钟不会应答 SCCB。
+ * （bsp_camera_start() 里先起 XCLK 再探测，失败时不会释放它，所以这里时钟还在。） */
+static void camera_scan_i2c(void)
+{
+    i2c_master_bus_handle_t bus = bsp_i2c_get_handle();
+    if (bus == NULL) {
+        ESP_LOGW(TAG, "I2C 扫描：拿不到 BSP 的 I2C 句柄");
+        return;
+    }
+    char found[128];
+    int off = 0, n = 0;
+    for (uint8_t a = 0x03; a <= 0x77; a++) {
+        if (i2c_master_probe(bus, a, 50) == ESP_OK) {
+            n++;
+            if (off < (int)sizeof(found) - 8) {
+                off += snprintf(found + off, sizeof(found) - (size_t)off, "%02X ", a);
+            }
+        }
+    }
+    if (n == 0) {
+        ESP_LOGE(TAG, "I2C 扫描：**一个设备都没有** —— 总线本身的问题，不是摄像头");
+    } else {
+        ESP_LOGI(TAG, "I2C 扫描到 %d 个设备: %s", n, found);
+        ESP_LOGI(TAG, "  ↑ 0x18 是加速度计(SC7A20)；摄像头 OV2640 应在 0x30；"
+                      "若一个都不是，看排线");
+    }
+}
+
 esp_err_t camera_init(uint32_t *out_w, uint32_t *out_h)
 {
     if (s_fd >= 0) {
@@ -114,6 +152,9 @@ esp_err_t camera_init(uint32_t *out_w, uint32_t *out_h)
     esp_err_t ret = bsp_camera_start(&cfg);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "bsp_camera_start 失败: %s", esp_err_to_name(ret));
+        /* 失败时**顺手把 I2C 扫一遍**：这一步能把"排线没插"和"型号选错"分开，
+         * 否则两种情况的报错长得一模一样，只能靠猜。 */
+        camera_scan_i2c();
         return ret;
     }
 
@@ -130,19 +171,50 @@ esp_err_t camera_init(uint32_t *out_w, uint32_t *out_h)
         return ESP_FAIL;
     }
 
-    /* ② 定格式：JPEG 320x240。驱动可能调整请求值，所以要读回实际值 */
+    /* ② 定格式 —— **不能写死**。
+     *
+     * 踩过的坑（2026-09-24）：原来写死请求 JPEG 320x240。当时以为板载是 OV2640，
+     * 而实测这块板子是 **OV3660** —— 它的 JPEG 只有 1280x720 这一个档位，
+     * 于是 VIDIOC_S_FMT 直接失败，自检报"这个档位开了吗"，看着像配置问题，
+     * 其实是**型号不同、可用档位就不同**。
+     *
+     * 现在改成：先问驱动"你现在是什么格式"（由 Kconfig 的 *_DVP_DEFAULT_FMT_* 决定，
+     * 而那个是跟着**实际探测到的传感器**走的），只有当它不是 JPEG 时才尝试改成 JPEG。
+     * 这样 OV2640 / OV3660 / GC2145 三种模组都不用改代码。 */
     struct v4l2_format fmt = {0};
-    fmt.type                = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    fmt.fmt.pix.width       = CAM_WIDTH;
-    fmt.fmt.pix.height      = CAM_HEIGHT;
-    fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_JPEG;
-    if (ioctl(s_fd, VIDIOC_S_FMT, &fmt) != 0) {
-        ESP_LOGE(TAG, "VIDIOC_S_FMT 失败（JPEG %dx%d 这个档位开了吗？）", CAM_WIDTH, CAM_HEIGHT);
+    fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    if (ioctl(s_fd, VIDIOC_G_FMT, &fmt) != 0) {
+        ESP_LOGE(TAG, "VIDIOC_G_FMT 失败");
         close_all();
         return ESP_FAIL;
     }
+    ESP_LOGI(TAG, "驱动默认格式: %c%c%c%c %ux%u", (char)(fmt.fmt.pix.pixelformat & 0xFF),
+             (char)((fmt.fmt.pix.pixelformat >> 8) & 0xFF),
+             (char)((fmt.fmt.pix.pixelformat >> 16) & 0xFF),
+             (char)((fmt.fmt.pix.pixelformat >> 24) & 0xFF),
+             (unsigned)fmt.fmt.pix.width, (unsigned)fmt.fmt.pix.height);
+
+    if (fmt.fmt.pix.pixelformat != V4L2_PIX_FMT_JPEG) {
+        /* 不是 JPEG 就试着请求一个 —— 请求值仍可能被驱动改（它会给最接近的档位），
+         * 所以无论成功失败都以读回的值为准。失败也不致命：有的传感器（GC2145）
+         * 压根没有硬件 JPEG，那就用它原本的 YUV422 跑。 */
+        struct v4l2_format want = {0};
+        want.type                = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        want.fmt.pix.width       = CAM_WIDTH;
+        want.fmt.pix.height      = CAM_HEIGHT;
+        want.fmt.pix.pixelformat = V4L2_PIX_FMT_JPEG;
+        if (ioctl(s_fd, VIDIOC_S_FMT, &want) == 0) {
+            fmt = want;
+        } else {
+            ESP_LOGW(TAG, "这颗传感器没有 JPEG 档位，改用它的默认格式（帧会大很多，"
+                          "推流帧率要相应降低）");
+        }
+    }
     s_width  = fmt.fmt.pix.width;
     s_height = fmt.fmt.pix.height;
+    s_is_jpeg = (fmt.fmt.pix.pixelformat == V4L2_PIX_FMT_JPEG);
+    ESP_LOGI(TAG, "最终格式: %s %ux%u", s_is_jpeg ? "JPEG" : "非 JPEG(原始)",
+             (unsigned)s_width, (unsigned)s_height);
 
     /* ③ BSP 定义了 BSP_CAMERA_VFLIP=1 却**没有应用它**（bsp_camera_start 里只有
      *    xclk + esp_video_init）。不补这一下，取到的图是上下颠倒的。 */
@@ -225,6 +297,37 @@ bool camera_ready(void)
     return (s_fd >= 0) && s_started;
 }
 
+/* 按 JPEG 结构自己找帧尾，返回整帧字节数（失败返回 0）。
+ *
+ * 为什么不能只信驱动的 bytesused（2026-09-24 实测）：
+ * esp_video 把 bytesused 填成 element->valid_size，而 **DVP 传 JPEG 时长度不在
+ * 时序里**，valid_size 是未初始化值 —— 实测 OV3660 上报 4294193410（0xFFFF4A02），
+ * 拿它去 POST/写文件会把整个缓冲甚至越界内存发出去。
+ *
+ * 算法：JPEG 的熵编码数据里，FF 后面只可能是 00（字节填充）或标记，
+ * 所以 **SOS(FF DA) 之后第一个 FF D9 就是真正的结尾**。
+ * 先跳过文件头（找 SOS），再找 EOI —— 这样不会把缩略图里的 FFD9 当成结尾。 */
+static uint32_t jpeg_scan_len(const uint8_t *d, uint32_t cap)
+{
+    if (d == NULL || cap < 4 || d[0] != 0xFF || d[1] != 0xD8) {
+        return 0;
+    }
+    uint32_t i = 2;
+    while (i + 1 < cap) {                       /* 跳过头部，找 SOS */
+        if (d[i] == 0xFF && d[i + 1] == 0xDA) {
+            break;
+        }
+        i++;
+    }
+    while (i + 1 < cap) {                       /* SOS 之后找 EOI */
+        if (d[i] == 0xFF && d[i + 1] == 0xD9) {
+            return i + 2;
+        }
+        i++;
+    }
+    return 0;
+}
+
 esp_err_t camera_capture(camera_frame_t *out)
 {
     if (!out || !camera_ready()) {
@@ -244,7 +347,22 @@ esp_err_t camera_capture(camera_frame_t *out)
     }
 
     out->data   = s_buf[b.index];
-    out->len    = b.bytesused;
+    /* 帧长：JPEG 时**以自己扫出来的为准**（见 jpeg_scan_len 的注释）；
+     * 扫不出来（不是 JPEG / 数据坏）才退回驱动的 bytesused，
+     * 而且只在它没超过缓冲区大小时才敢用 —— 否则就是把越界内存当帧长。 */
+    uint32_t cap = s_buf_len[b.index];
+    uint32_t len = 0;
+    if (s_is_jpeg) {
+        len = jpeg_scan_len(out->data, cap);
+    }
+    if (len == 0 && b.bytesused > 0 && b.bytesused <= cap) {
+        len = b.bytesused;
+    }
+    if (len == 0) {
+        ioctl(s_fd, VIDIOC_QBUF, &b);           /* 坏帧还回去，别丢缓冲 */
+        return ESP_ERR_INVALID_SIZE;
+    }
+    out->len    = len;
     out->width  = s_width;
     out->height = s_height;
     out->slot   = (int)b.index;
