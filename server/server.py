@@ -955,9 +955,16 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, json.dumps(LOGGER.stats() if LOGGER else {}, ensure_ascii=False))
         elif path == "/api/frame":
             # 网页的 <img src="/api/frame?device=X&t=..."> 直接取这一帧
-            want = clean_device_id(query_param(query, "device") or "")
+            # ⚠️ 不能直接用 clean_device_id("")：它对空串会返回 DEFAULT_DEVICE，
+            # 于是"没指定设备"会被当成"指定了默认设备"，永远取不到帧（踩过）。
+            raw_dev = (query_param(query, "device") or "").strip()
+            want = clean_device_id(raw_dev) if raw_dev else ""
             with LOCK:
-                fr = FRAMES.get(want) or (FRAMES.get(pick_device(want).id) if want else None)
+                if want:
+                    fr = FRAMES.get(want) or FRAMES.get(pick_device(want).id)
+                else:
+                    # 没指定设备 → 给"最近收到的那一帧"（单板场景网页就是这么用的）
+                    fr = max(FRAMES.values(), key=lambda x: x["ts"]) if FRAMES else None
             if not fr:
                 self._send(404, b"", "image/jpeg")
             else:
@@ -1587,17 +1594,19 @@ footer{max-width:1400px;margin:18px auto 0;color:var(--faint);font-size:11px;lin
       画面仍按 60Hz 平滑（中间做 slerp），所以取数慢一点也不会一跳一跳。</div>
   </section>
 
-  <section class="card wide" id="cardcam" hidden>
+  <section class="card wide" id="cardcam">
     <div class="card-head"><h2>摄像头</h2>
       <span class="src" id="camwho">—</span></div>
     <div class="camwrap">
-      <div class="camview"><img id="camimg" alt="摄像头画面"></div>
+      <div class="camview"><img id="camimg" alt="摄像头画面">
+        <div class="nosig" id="camnosig">点右边「开启实时画面」<br>
+          （板子离线 / 摄像头自检没过时不会有画面）</div></div>
       <div class="camside">
         <button id="camshot">拍照 → 存进板子 SD 卡</button>
         <button id="camlive">开启实时画面</button>
         <div class="hint" style="margin-top:8px">
-          实时画面是板子**推**上来的（板子是 HTTP 客户端，网页连不到板子本身）。
-          开启后约 5 帧/秒，关掉可省 WiFi 带宽。
+          实时画面是板子<b>推</b>上来的（板子是 HTTP 客户端，网页连不到板子本身）。
+          开启后约 2 帧/秒，关掉可省 WiFi 带宽（OV3660 的 JPEG 是 1280x720，一帧约 27KB）。
         </div>
         <div class="hint" id="camstat" style="margin-top:6px">—</div>
       </div>
@@ -2213,24 +2222,33 @@ function sendCmd(name, btn, overrideParams){
  * 网页只拿最近一帧（/api/frame），拍照则由板子写 SD 卡、服务器另存一份给这里展示。 */
 var camDev = "", camOn = false, camTimer = null, camFails = 0;
 
+/* 卡片现在是**常驻**的：早先版本让它 hidden、等收到第一帧才显示，
+ * 但"开启实时画面"按钮就在卡片里 —— 收不到帧就点不到按钮，点不到按钮就
+ * 收不到帧，**死锁**（用户反馈"我好像没看到实时画面"就是这个）。
+ * 这里保留函数只为了别处调用不报错。 */
 function camShow(on){
   var c = $("cardcam");
-  if (c) c.hidden = !on;
+  if (c) c.hidden = false;
 }
 function camFrame(){
   var im = $("camimg");
   if (!im) return;
-  var dev = (selDevice || (devices[0] && devices[0].id) || "");
+  var dev = selDevice || "";      /* 空着就交给服务端回退到"最近上报的那台" */
   camDev = dev;
   im.src = "/api/frame?device=" + encodeURIComponent(dev) + "&t=" + Date.now();
   im.onload = function(){
     camFails = 0;
     camShow(true);
+    var ns = $("camnosig");
+    if (ns) ns.style.display = "none";
     var st = $("camstat");
-    if (st) st.textContent = "画面 " + im.naturalWidth + "×" + im.naturalHeight;
+    if (st) st.textContent = "画面 " + im.naturalWidth + "×" + im.naturalHeight +
+                             "（约 2 帧/秒）";
   };
   im.onerror = function(){
     camFails++;
+    var ns = $("camnosig");
+    if (ns) ns.style.display = "";
     /* 连续取不到就别一直重试了，提示一次即可 */
     if (camFails === 3) {
       var st = $("camstat");
@@ -2258,7 +2276,7 @@ function shotRow(dev, name, bytes, local){
 function renderShots(){
   var host = $("shotlist");
   if (!host) return;
-  var dev = (selDevice || (devices[0] && devices[0].id) || "");
+  var dev = selDevice || "";      /* 空着就交给服务端回退到"最近上报的那台" */
   var who = $("shotwho");
   if (who) who.textContent = dev || "—";
   var server = [];
@@ -2337,7 +2355,7 @@ function idbList(cb){
 }
 /* 拍照：让板子写 SD 卡；同时把这一帧存进本机 IndexedDB 做持久备份 */
 function camShot(){
-  var dev = (selDevice || (devices[0] && devices[0].id) || "");
+  var dev = selDevice || "";      /* 空着就交给服务端回退到"最近上报的那台" */
   sendCmd("cam_capture");
   fetch("/api/frame?device=" + encodeURIComponent(dev) + "&t=" + Date.now())
     .then(function(r){ if (!r.ok) throw new Error("no frame"); return r.blob(); })
