@@ -431,9 +431,11 @@ python tools\ui_preview.py --scale 3  # 拼接图放大 3 倍
 
 ![板端界面预览（含改造前对比）](docs/ui-preview/contact-sheet.png)
 
-### 摄像头（板载 OV2640）
+### 摄像头（板载 OV3660，兼容 OV2640 / GC2145）
 
-板子自带一颗 OV2640，但**驱动栈不是老的 `esp_camera`**，而是 `esp_video` ——
+板子自带一颗摄像头模组。**注意不同批次型号不一样**：实测这块是 **OV3660**，
+而 BSP 文档和网上教程大多写 OV2640 —— 按 OV2640 配就会一直探测不到。
+驱动栈不是老的 `esp_camera`，而是 `esp_video` ——
 一套 Linux V4L2 风格的接口。网上大部分 ESP32 摄像头教程用的是 `esp_camera`
 （`esp_camera_init()` / `esp_camera_fb_get()`），在这块板上照抄会连头文件都找不到。
 
@@ -448,8 +450,9 @@ python tools\ui_preview.py --scale 3  # 拼接图放大 3 倍
 
 | 配置 | 为什么 |
 |---|---|
-| `CONFIG_CAMERA_OV2640=y` | 传感器驱动默认是 `n`。不开就**根本探测不到摄像头**，而且报错长得很像"硬件坏了"，看不出是型号没选 |
-| `CONFIG_CAMERA_OV2640_DVP_JPEG_320X240_50FPS=y` | 每个格式档位默认**也都是** `n`。只开上面那项的话，唯一可用格式是 **YUYV 640×480（一帧 614 KB）**，走 WiFi 根本传不动 |
+| `CONFIG_CAMERA_OV2640=y`<br>`CONFIG_CAMERA_OV3660=y`<br>`CONFIG_CAMERA_GC2145=y` | 传感器驱动默认是 `n`。**三个都开**：它们都支持 DVP + AUTO_DETECT，
+全开就能自动认出实际是哪颗 —— 比猜一个型号靠谱。代价只是几十 KB flash |
+| `CONFIG_CAMERA_OV2640_DVP_JPEG_320X240_50FPS=y`<br>`CONFIG_CAMERA_OV3660_DVP_JPEG_1280X720_12FPS=y`<br>`CONFIG_CAMERA_GC2145_DVP_YUV422_YUYV_320X240_13FPS=y` | 每个格式档位默认**也都是** `n`。而且**三颗的可选档位不一样**：OV2640 有 JPEG 320×240、OV3660 的 JPEG **只有 1280×720**、GC2145 **没有硬件 JPEG**（只有 RGB565/YUV422） |
 
 调用序列（`camera.c` 末尾也留了一份备忘，下次别再从 example 翻起）：
 
@@ -599,8 +602,15 @@ python server\server.py
 | 连不上 WiFi（反复 retry） | 路由器侧问题（密码改了/AP重启/信道）；板子会自动无限重试，恢复后自动重连 |
 | 编译报 `rw1_font.c missing` | 先跑 `python tools/gen_font.py`（见首次上手①） |
 | 屏幕中文显示成方块 | 跑 `gen_font.py`，它会报告"板端文案缺字"；换了显示文案后要重跑再编译 |
-| 串口只有 `camera: 自检失败: 初始化 ESP_FAIL`，上面没有"就绪"那行 | 十有八九是 `CONFIG_CAMERA_OV2640` 没生效（`device/sdkconfig` 里还是 `# CONFIG_CAMERA_OV2640 is not set`）。确认 `sdkconfig.bsp.esp32_s3_eye` 里摄像头那两行在，然后**删掉 `device/sdkconfig` 让它重新生成**并全量重编 —— 已存在的 sdkconfig 会挡住 defaults 里的新项 |
-| 自检过了"就绪"，但报 `自检失败: 取帧 ESP_FAIL` | 格式档位没开：`VIDIOC_S_FMT` 只会接受 Kconfig 里开过的组合。确认 `CONFIG_CAMERA_OV2640_DVP_JPEG_320X240_50FPS=y` 存在 |
+| 串口只有 `camera: 自检失败: 初始化 ESP_FAIL`，上面没有"就绪"那行 | 先看有没有 `failed to detect DVP camera`：
+**有** → 驱动开着，是传感器没响应 —— 看下一行 `Detected Camera sensor PID=0x????`，
+没有它就是**型号不对**（不是排线问题！`esp_video` 会依次试各个已开驱动）；
+**没有** → `CONFIG_CAMERA_*` 没生效。改了 `sdkconfig.bsp.esp32_s3_eye` 之后
+**必须删掉 `device/sdkconfig`** 再重配 —— 已存在的 sdkconfig 会挡住 defaults 里的新项 |
+| 自检报 `VIDIOC_S_FMT 失败` | 请求的格式这颗传感器没有。**别写死分辨率**：OV3660 的 JPEG 只有 1280×720。
+代码现在先 `VIDIOC_G_FMT` 问驱动当前格式（跟着实际传感器走） |
+| 自检过了"就绪"，但帧长是个天文数字（如 4294193410） | `esp_video` 的 `bytesused` 在 **DVP+JPEG** 下是未初始化值（长度不在时序里）。
+代码现在按 JPEG 结构自己找结尾：**SOS(FF DA) 之后第一个 FF D9** |
 | 串口出现 `ov2640: get sensor ID failed` / `esp_video_init: failed to detect DVP camera with address=30` | **这是硬件问题，不是配置问题**：摄像头在 I2C 上不响应（0x30 地址 NACK）。排查顺序：① 断电后把摄像头 **FPC 排线重新插紧**（插到底、卡扣扣好）—— 这是最常见的原因；② 换一个模组确认不是模组坏。**判据**：如果同一份日志里 `accel_input: Detected accelerometer` 是正常的，说明 **I2C 总线本身没问题**（加速度计和摄像头共用 GPIO4/5），问题只在摄像头这一端，所以不用去查引脚或 Kconfig |
 | 仪表盘「设备」卡片里有两台，但实际只插了一块板 | 两块板的设备名撞了。配网页的「设备名」留空会自动按 MAC 命名；如果手动填了同名（比如都填 `rw1`）就会合并成一台。双击 BOOT 进配网改掉其中一个 |
 | 配网时手机搜不到 `EGO-LINK-XXXX`，或板子一开机就重启循环 | 2026-09-22 前的固件有这个 bug：AP 密码是 4 位，而 WPA2 要求 8–63 位，`esp_wifi_set_config()` 会拒绝；当时那行用的是 `ESP_ERROR_CHECK`，于是直接 `abort()` → 重启循环，连屏幕都看不到。已修（密码改 8 位数字 + 失败不再 abort）。**注意：如果只是个别情况，先确认手机没连在 5GHz-only 的网络**——AP 只跑 2.4GHz channel 1 |

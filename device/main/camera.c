@@ -37,7 +37,9 @@
 static const char *TAG = "camera";
 
 /* 必须是 Kconfig 里**开过**的档位。当前开的是 JPEG 320x240（见 sdkconfig.bsp.esp32_s3_eye）。
- * OV2640 只会输出它配置表里存在的组合，填一个没开过的分辨率，S_FMT 会直接失败。 */
+ * 传感器只会输出它配置表里存在的组合，填一个没开过的分辨率/格式，S_FMT 会直接失败。
+ * **而且不同型号的可选档位不一样**（OV3660 的 JPEG 只有 1280x720）—— 所以
+ * 不要写死分辨率，先 G_FMT 问驱动。 */
 #define CAM_WIDTH   320
 #define CAM_HEIGHT  240
 
@@ -105,9 +107,9 @@ static void close_all(void)
  * —— 前者是排线/模组，后者是型号选错，排查方向完全相反。扫一遍就能分开：
  *   只有 0x18（加速度计）      → 摄像头这一端没应答 → FPC 排线 / 模组
  *   有 0x30                    → 传感器在，是驱动/时序问题
- *   有别的地址（0x21 / 0x3C）  → 模组型号不是 OV2640
+ *   有别的地址（0x3C）         → 模组不是 OV2640（实测这块是 OV3660）
  *
- * 注意要在 XCLK 已经跑起来之后调 —— OV2640 没有时钟不会应答 SCCB。
+ * 注意要在 XCLK 已经跑起来之后调 —— 传感器没有时钟不会应答 SCCB。
  * （bsp_camera_start() 里先起 XCLK 再探测，失败时不会释放它，所以这里时钟还在。） */
 static void camera_scan_i2c(void)
 {
@@ -130,8 +132,8 @@ static void camera_scan_i2c(void)
         ESP_LOGE(TAG, "I2C 扫描：**一个设备都没有** —— 总线本身的问题，不是摄像头");
     } else {
         ESP_LOGI(TAG, "I2C 扫描到 %d 个设备: %s", n, found);
-        ESP_LOGI(TAG, "  ↑ 0x18 是加速度计(SC7A20)；摄像头 OV2640 应在 0x30；"
-                      "若一个都不是，看排线");
+        ESP_LOGI(TAG, "  ↑ 0x18 是加速度计(SC7A20)；OV2640 在 0x30，"
+                      "OV3660/GC2145 在 0x3C。都扫不到才轮到怀疑排线");
     }
 }
 
@@ -164,10 +166,11 @@ esp_err_t camera_init(uint32_t *out_w, uint32_t *out_h)
          *   上面有 "failed to detect DVP camera" → 驱动是开着的，是**传感器没响应**
          *     （硬件：FPC 排线没插紧 / 模组故障）。判据：同一 I2C 总线上加速度计
          *     正常的话，总线本身没问题，问题在摄像头这一端。
-         *   上面什么都没有 → CONFIG_CAMERA_OV2640 没开，驱动压根没编进来。 */
+         *   上面什么都没有 → CONFIG_CAMERA_* 没开，驱动压根没编进来。 */
         ESP_LOGE(TAG, "open %s 失败：若上面有 'failed to detect DVP camera'，"
                       "是传感器没响应（检查摄像头 FPC 排线/模组）；"
-                      "否则检查 CONFIG_CAMERA_OV2640 是否开启", BSP_CAMERA_DEVICE);
+                      "否则检查 CONFIG_CAMERA_* 是否开启（三个驱动都该开）",
+                      BSP_CAMERA_DEVICE);
         return ESP_FAIL;
     }
 
