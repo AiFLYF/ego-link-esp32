@@ -56,6 +56,11 @@ static uint32_t  s_width;
 static bool      s_is_jpeg;   /* 当前格式是不是硬件 JPEG（GC2145 没有） */
 static uint32_t  s_height;
 static bool      s_started;
+/* BSP 那一层（I2C + XCLK + esp_video_init 注册 /dev/video2）**只能做一次**：
+ * XCLK 是 LEDC 独占资源、设备名也只能注册一次，第二次调 bsp_camera_start() 必失败。
+ * 自检结束后 camera_deinit() 会关掉 fd，但设备本身还在 —— 重新打开只需要
+ * open + 定格式 + 申请缓冲，不用再走 BSP。 */
+static bool      s_bsp_started;
 static uint32_t  s_seq;
 
 /* ---------------------------------------------------------------- helpers */
@@ -149,15 +154,21 @@ esp_err_t camera_init(uint32_t *out_w, uint32_t *out_h)
         return ESP_OK;
     }
 
-    /* ① BSP 负责 I2C + 16MHz XCLK + esp_video_init()（注册 /dev/video2） */
-    bsp_camera_cfg_t cfg = {0};
-    esp_err_t ret = bsp_camera_start(&cfg);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "bsp_camera_start 失败: %s", esp_err_to_name(ret));
-        /* 失败时**顺手把 I2C 扫一遍**：这一步能把"排线没插"和"型号选错"分开，
-         * 否则两种情况的报错长得一模一样，只能靠猜。 */
-        camera_scan_i2c();
-        return ret;
+    /* ① BSP 负责 I2C + 16MHz XCLK + esp_video_init()（注册 /dev/video2）
+     *    **只做一次**：自检拍完会 camera_deinit() 关掉 fd，之后拍照/推流要重新打开 ——
+     *    那时设备还在，只需要 open + 定格式 + 申请缓冲。再调一次 bsp_camera_start()
+     *    会因为 XCLK 已被占用而失败，表现成"自检能过、但拍照一直失败"（踩过）。 */
+    if (!s_bsp_started) {
+        bsp_camera_cfg_t cfg = {0};
+        esp_err_t ret = bsp_camera_start(&cfg);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "bsp_camera_start 失败: %s", esp_err_to_name(ret));
+            /* 失败时**顺手把 I2C 扫一遍**：这一步能把"排线没插"和"型号选错"分开，
+             * 否则两种情况的报错长得一模一样，只能靠猜。 */
+            camera_scan_i2c();
+            return ret;
+        }
+        s_bsp_started = true;
     }
 
     s_fd = open(BSP_CAMERA_DEVICE, O_RDONLY);
