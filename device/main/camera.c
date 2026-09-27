@@ -9,6 +9,7 @@
 
 #include "camera.h"
 
+#include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
 #include <stdio.h>
@@ -48,6 +49,17 @@ static const char *TAG = "camera";
 
 /* DQBUF 最多等多久。第一帧要等曝光收敛，太短会白白失败。 */
 #define CAM_DQBUF_TIMEOUT_S   2
+
+/* 取一帧最多试几次、每次之间等多久。
+ *
+ * 为什么必须重试（2026-09-27 真机实测）：DVP 的缓冲要等驱动填好才置
+ * V4L2_BUF_FLAG_DONE，而 **esp_video 在队列里还没有就绪帧时是"立刻返回一个没
+ * DONE 的缓冲"，不是阻塞等待** —— 所以单次取帧会瞬时（0~1 ms）失败。
+ * 表现：`cam_capture` 只有 1/7 成功，而且**只在刚 STREAMON 之后那一瞬间能成**，
+ * 之后全挂。开机自检之所以一直能过，就是因为它本来就重试了 5 次（见 camera_selftest）。
+ * 12 × 40 ms = 最多等 480 ms，够一帧（OV3660 1280x720 JPEG 实测约 2 fps）。 */
+#define CAM_CAPTURE_ATTEMPTS   12
+#define CAM_CAPTURE_RETRY_MS   40
 
 static int       s_fd = -1;
 static uint8_t  *s_buf[CAM_NBUF];
@@ -348,40 +360,68 @@ esp_err_t camera_capture(camera_frame_t *out)
         return ESP_ERR_INVALID_STATE;
     }
 
-    struct v4l2_buffer b;
-    buf_init(&b);
-    if (ioctl(s_fd, VIDIOC_DQBUF, &b) != 0) {
-        return ESP_FAIL;
+    esp_err_t last = ESP_ERR_NOT_FOUND;
+
+    /* 为什么要循环见 CAM_CAPTURE_ATTEMPTS 的注释：esp_video 在"队列里还没有
+     * 就绪帧"时是**立刻**返回一个没 DONE 的缓冲，单次取帧必然偶发失败。 */
+    for (int attempt = 0; attempt < CAM_CAPTURE_ATTEMPTS; attempt++) {
+        struct v4l2_buffer b;
+        buf_init(&b);
+
+        if (ioctl(s_fd, VIDIOC_DQBUF, &b) != 0) {
+            /* DQBUF 本身失败时缓冲仍在驱动手里，**不能** QBUF 回去（会重复入队） */
+            last = ESP_FAIL;
+            if (attempt == 0) {
+                ESP_LOGW(TAG, "DQBUF 失败 (errno=%d)，重试", errno);
+            }
+        } else if (!(b.flags & V4L2_BUF_FLAG_DONE)) {
+            /* 缓冲到手但驱动还没填完 —— 必须立刻还回去，否则缓冲越来越少 */
+            ioctl(s_fd, VIDIOC_QBUF, &b);
+            last = ESP_ERR_NOT_FOUND;
+            if (attempt == 0) {
+                ESP_LOGW(TAG, "第 1 次拿到未就绪缓冲 (flags=0x%08x bytesused=%u)，重试",
+                         (unsigned)b.flags, (unsigned)b.bytesused);
+            }
+        } else {
+            out->data = s_buf[b.index];
+            /* 帧长：JPEG 时**以自己扫出来的为准**（见 jpeg_scan_len 的注释）；
+             * 扫不出来（不是 JPEG / 数据坏）才退回驱动的 bytesused，
+             * 而且只在它没超过缓冲区大小时才敢用 —— 否则就是把越界内存当帧长。 */
+            uint32_t cap = s_buf_len[b.index];
+            uint32_t len = 0;
+            if (s_is_jpeg) {
+                len = jpeg_scan_len(out->data, cap);
+            }
+            if (len == 0 && b.bytesused > 0 && b.bytesused <= cap) {
+                len = b.bytesused;
+            }
+            if (len == 0) {
+                ioctl(s_fd, VIDIOC_QBUF, &b);       /* 坏帧还回去，别丢缓冲 */
+                last = ESP_ERR_INVALID_SIZE;
+                if (attempt == 0) {
+                    ESP_LOGW(TAG, "第 1 次帧长扫不出来 (flags=0x%08x bytesused=%u cap=%u)，重试",
+                             (unsigned)b.flags, (unsigned)b.bytesused, (unsigned)cap);
+                }
+            } else {
+                if (attempt > 0) {
+                    ESP_LOGI(TAG, "取帧第 %d 次才成（前 %d 次没就绪）",
+                             attempt + 1, attempt);
+                }
+                out->len    = len;
+                out->width  = s_width;
+                out->height = s_height;
+                out->slot   = (int)b.index;
+                out->seq    = ++s_seq;
+                return ESP_OK;
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(CAM_CAPTURE_RETRY_MS));
     }
 
-    /* 坏帧（V4L2_BUF_FLAG_ERROR）也要还回去，否则缓冲会越来越少 */
-    if (!(b.flags & V4L2_BUF_FLAG_DONE)) {
-        ioctl(s_fd, VIDIOC_QBUF, &b);
-        return ESP_ERR_NOT_FOUND;
-    }
-
-    out->data   = s_buf[b.index];
-    /* 帧长：JPEG 时**以自己扫出来的为准**（见 jpeg_scan_len 的注释）；
-     * 扫不出来（不是 JPEG / 数据坏）才退回驱动的 bytesused，
-     * 而且只在它没超过缓冲区大小时才敢用 —— 否则就是把越界内存当帧长。 */
-    uint32_t cap = s_buf_len[b.index];
-    uint32_t len = 0;
-    if (s_is_jpeg) {
-        len = jpeg_scan_len(out->data, cap);
-    }
-    if (len == 0 && b.bytesused > 0 && b.bytesused <= cap) {
-        len = b.bytesused;
-    }
-    if (len == 0) {
-        ioctl(s_fd, VIDIOC_QBUF, &b);           /* 坏帧还回去，别丢缓冲 */
-        return ESP_ERR_INVALID_SIZE;
-    }
-    out->len    = len;
-    out->width  = s_width;
-    out->height = s_height;
-    out->slot   = (int)b.index;
-    out->seq    = ++s_seq;
-    return ESP_OK;
+    ESP_LOGE(TAG, "取帧失败：连试 %d 次都没拿到就绪帧（最后 %s）",
+             CAM_CAPTURE_ATTEMPTS, esp_err_to_name(last));
+    return last;
 }
 
 void camera_release(const camera_frame_t *frame)
@@ -392,7 +432,12 @@ void camera_release(const camera_frame_t *frame)
     struct v4l2_buffer b;
     buf_init(&b);
     b.index = (uint32_t)frame->slot;
-    ioctl(s_fd, VIDIOC_QBUF, &b);
+    /* **必须检查返回值**：QBUF 要是悄悄失败，这个缓冲就漏出队列了 ——
+     * 两次之后队列空，之后所有 DQBUF 都瞬时失败（2026-09-27 排查时重点怀疑过这条）。 */
+    if (ioctl(s_fd, VIDIOC_QBUF, &b) != 0) {
+        ESP_LOGE(TAG, "QBUF(slot=%d) 失败 (errno=%d) —— 缓冲漏出队列",
+                 frame->slot, errno);
+    }
 }
 
 void camera_deinit(void)
