@@ -188,6 +188,9 @@ static bool s_cam_on = false;
 static uint16_t s_cam_fps = 2;         /* 当前帧率，1..CAM_STREAM_FPS_MAX */
 static TickType_t s_cam_interval = CAM_STREAM_EVERY_TICKS;
 static TickType_t s_cam_last;
+/* cam_stream 带的 JPEG 画质（1..100）。0 = 这次没传，保持 camera 里的当前值。
+ * 值本身存在 camera.c（s_quality），这里只是"解析到执行"之间的搬运。 */
+static int s_cam_quality;
 
 /* ---------------- 上报解耦：单槽邮箱 ---------------------------------------
  *
@@ -608,6 +611,11 @@ static void run_command(cmd_kind_t kind, const char *id,
          * DVP 持续往 PSRAM 写帧，和 LVGL / IMU / WiFi 抢带宽 ——
          * 用户反馈的"拍完照板子就变卡、重启才恢复"就是这个（2026-09-27）。 */
         camera_set_keep_open(s_cam_stream);
+        /* 画质（可选）。0 = 这次没传，保持 camera 里的当前值。
+         * 要在开始取帧之前设好 —— 它是编码器参数。 */
+        if (s_cam_quality > 0) {
+            camera_set_quality(s_cam_quality);
+        }
         /* 帧率在**这里**换算成 tick，推帧那一侧只做一次比较 ——
          * 每帧都算一遍除法没必要，而且 tick 换算依赖 configTICK_RATE_HZ，
          * 集中在一处更好核对。 */
@@ -983,6 +991,10 @@ static void apply_response(const char *body, size_t len)
                             }
                             s_cam_fps = (uint16_t)fps;
                         }
+                        /* JPEG 画质（可选）。**这是唯一能改帧大小的旋钮** ——
+                         * OV3660 的 JPEG 分辨率固定 1280x720，所以"调分辨率"做不到。
+                         * 0 表示这次没传，保持 camera 里的当前值。 */
+                        s_cam_quality = json_int(jparams, "quality", 0);
                     } else if (strcmp(jname->valuestring, "sd_ls") == 0) {
                         kind = CMD_SD_LS;
                     } else if (strcmp(jname->valuestring, "sd_rm") == 0) {

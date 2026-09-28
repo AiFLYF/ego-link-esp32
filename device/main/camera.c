@@ -77,6 +77,28 @@ static const char *TAG = "camera";
  * 帧率设置只决定"最多问多勤"，不会把链路拖死。 */
 #define CAM_STREAM_CAPTURE_ATTEMPTS   2
 
+/* JPEG 质量（1..100）。**这是唯一能改变帧大小的旋钮。**
+ *
+ * 为什么不是"分辨率"：OV3660 的 JPEG 只有 1280x720 一档 —— 驱动格式表
+ * （`espressif__esp_cam_sensor/sensors/ov3660/ov3660.c:73-154`）共 5 档，
+ * JPEG 仅此一档，其余是 RGB565/YUV422 的 240x240 / 640x480（一帧 115KB~614KB，
+ * 比 JPEG 还大，换过去只会更慢）。所以"降分辨率提帧率"这条路是堵死的。
+ *
+ * 质量越低 → 每帧字节数越少 → 上传耗时和带宽同步下降，**帧率与流量一起受益**。
+ * 默认 80：拍照要清晰，而 80 相对默认值已经能明显缩小帧。
+ * 传感器支持与否用 VIDIOC_QUERY_EXT_CTRL 探一次（驱动不支持就静默跳过）。 */
+#define CAM_JPEG_QUALITY_DEFAULT   30
+/* 上下限**只是兜底**：真正合法范围由驱动给（实测 OV3660 是 1..63，不是 1..100）。
+ * 第一次打开时用 VIDIOC_QUERY_EXT_CTRL 问出来存进 s_q_min/s_q_max，
+ * 之后一律按驱动给的范围夹 —— 写死 100 会让 80/95 这种值直接被拒（踩过）。 */
+#define CAM_JPEG_QUALITY_MIN       1
+#define CAM_JPEG_QUALITY_MAX       100
+
+static int  s_quality = CAM_JPEG_QUALITY_DEFAULT;
+static int  s_quality_ok = -1;      /* -1 未知 / 0 不支持 / 1 支持（探一次就定） */
+static int  s_q_min = CAM_JPEG_QUALITY_MIN;   /* 驱动给的合法范围，探到后覆盖 */
+static int  s_q_max = CAM_JPEG_QUALITY_MAX;
+
 static int       s_fd = -1;
 static uint8_t  *s_buf[CAM_NBUF];
 static uint32_t  s_buf_len[CAM_NBUF];
@@ -141,6 +163,56 @@ static void close_all(void)
     s_fd = -1;
 }
 
+/* 把 s_quality 写到传感器（V4L2_CID_JPEG_COMPRESSION_QUALITY）。
+ * 写法照抄官方示例 `esp_video/examples/simple_video_server`：
+ * `ctrl_class` 必须是 `V4L2_CID_JPEG_CLASS`，不是 VFLIP 那种 USER 类。 */
+static void apply_quality(void)
+{
+    if (s_fd < 0) {
+        return;
+    }
+    if (s_quality_ok < 0) {
+        /* 只探一次：驱动不支持就再也别试，免得每开一次摄像头都白刷一条警告 */
+        struct v4l2_query_ext_ctrl q = {0};
+        q.id = V4L2_CID_JPEG_COMPRESSION_QUALITY;
+        s_quality_ok = (ioctl(s_fd, VIDIOC_QUERY_EXT_CTRL, &q) == 0) ? 1 : 0;
+        if (s_quality_ok) {
+            /* **按驱动给的范围来**，别信自己写死的 1..100 ——
+             * 实测这颗 OV3660 是 1..63、默认 17。写死 100 会让 80/95 直接被拒。 */
+            if (q.minimum > 0) {
+                s_q_min = (int)q.minimum;
+            }
+            if (q.maximum > 0) {
+                s_q_max = (int)q.maximum;
+            }
+            if (s_quality > s_q_max) {
+                s_quality = s_q_max;
+            }
+            if (s_quality < s_q_min) {
+                s_quality = s_q_min;
+            }
+            ESP_LOGI(TAG, "JPEG 质量可控：范围 %d..%d，默认 %d，当前用 %d",
+                     s_q_min, s_q_max, (int)q.default_value, s_quality);
+        } else {
+            ESP_LOGW(TAG, "这颗传感器不支持 JPEG 质量控制，画质档位不起作用");
+        }
+    }
+    if (!s_quality_ok) {
+        return;
+    }
+
+    struct v4l2_ext_control ctl = {0};
+    ctl.id = V4L2_CID_JPEG_COMPRESSION_QUALITY;
+    ctl.value = s_quality;
+    struct v4l2_ext_controls ctrls = {0};
+    ctrls.ctrl_class = V4L2_CID_JPEG_CLASS;
+    ctrls.count = 1;
+    ctrls.controls = &ctl;
+    if (ioctl(s_fd, VIDIOC_S_EXT_CTRLS, &ctrls) != 0) {
+        ESP_LOGW(TAG, "设置 JPEG 质量 %d 失败，沿用传感器默认值", s_quality);
+    }
+}
+
 /* 用完就关（除非"实时画面"开着）。见 s_keep_open 的注释。
  * 所有取帧接口的**每一条返回路径**都要调它，漏一条就等于又留下一个常开。 */
 static void close_if_idle(void)
@@ -158,6 +230,25 @@ void camera_set_keep_open(bool on)
     if (!on) {
         camera_deinit();        /* 关推流时立刻释放，不等下一次取帧 */
     }
+}
+
+/* 设置 JPEG 画质（1..100）。夹到合法范围；**已打开就立刻生效**，不必等下一次 init ——
+ * 用户调档位时摄像头通常正开着（推流中），等下次 init 就等于"改了没反应"。 */
+void camera_set_quality(int q)
+{
+    /* 按**驱动给的范围**夹（s_q_min/s_q_max 在第一次 apply_quality 时问出来）。
+     * 探到之前用兜底常量，不会越界。 */
+    if (q < s_q_min) {
+        q = s_q_min;
+    }
+    if (q > s_q_max) {
+        q = s_q_max;
+    }
+    if (q == s_quality) {
+        return;
+    }
+    s_quality = q;
+    apply_quality();
 }
 
 /* 把 BSP 那条 I2C（GPIO4/5）整个扫一遍，把应答的地址打出来。
@@ -297,6 +388,10 @@ esp_err_t camera_init(uint32_t *out_w, uint32_t *out_h)
         /* 翻转失败不致命，只是画面方向可能不对，继续跑 */
         ESP_LOGW(TAG, "VFLIP 设置失败，画面可能上下颠倒");
     }
+
+    /* ③.5 JPEG 质量（画质档位）。**必须在 S_FMT 之后、REQBUFS 之前** ——
+     * 它是编码器参数，要在缓冲建起来之前定好。见 CAM_JPEG_QUALITY_DEFAULT 的注释。 */
+    apply_quality();
 
     /* ④ 申请缓冲并映射到用户空间（DVP 的缓冲本身就在 PSRAM，不占内部 RAM） */
     struct v4l2_requestbuffers req = {0};

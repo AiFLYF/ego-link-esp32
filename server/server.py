@@ -94,6 +94,14 @@ LED_PATTERNS = ("alert", "ack", "error")   # led_blink 的语义图案（板端�
 # 板子一帧要「等帧 + 开一条 TCP + POST 27KB」，实测能稳定跑到的只有每秒几帧，
 # 写大了只是让板端白忙。两边不一致的话，网页上选的值会被静默夹掉、看着像没生效。
 CAM_STREAM_FPS_MAX = 10
+# JPEG 画质的合法范围。**必须和板端 camera.c 的 CAM_JPEG_QUALITY_MIN/MAX 一致。**
+# 画质是**唯一**能改变帧大小的旋钮：OV3660 的 JPEG 分辨率固定 1280x720
+# （驱动格式表 `ov3660.c:73-154` 共 5 档，JPEG 仅一档），所以"调分辨率"做不到。
+CAM_JPEG_QUALITY_MIN = 1
+# ⚠️ 上限是 **63**，不是 100 —— 这是驱动给的合法范围（实测 OV3660：
+# `VIDIOC_QUERY_EXT_CTRL` 返回 1..63、默认 17）。写 100 会让 80/95 这类值
+# 在板端直接被拒（`设置 JPEG 质量 80 失败`），网页上却看着"设置成功了"。
+CAM_JPEG_QUALITY_MAX = 63
 FALL_AUTO_ALERT = True    # 判定跌落时自动下发 LED 告警（远端物理反馈）
 
 ACTIVITY_IDLE = "等待数据…"
@@ -348,6 +356,12 @@ def sanitize_params(name, params):
         out = {"on": bool(p.get("on"))}
         if p.get("fps") is not None:
             out["fps"] = clamp_int(p.get("fps"), 1, CAM_STREAM_FPS_MAX, 2)
+        # JPEG 画质。**这是唯一能改帧大小的旋钮** —— OV3660 的 JPEG 分辨率
+        # 固定 1280x720（驱动格式表里 JPEG 仅一档），所以"调分辨率"做不到，
+        # 只能调画质：调低 → 帧变小 → 上传更快、更省带宽。
+        if p.get("quality") is not None:
+            out["quality"] = clamp_int(p.get("quality"), CAM_JPEG_QUALITY_MIN,
+                                       CAM_JPEG_QUALITY_MAX, 40)
         return out
     if name == "sd_rm":
         # 文件名：只放行"根目录下的文件名"，不接受路径分隔符 —— 板端还会再拦一道，
@@ -2339,10 +2353,20 @@ dialog.modal::backdrop{background:var(--modal-backdrop);backdrop-filter:blur(3px
                 <option value="6">极限 · 板子能给的最快</option>
               </select>
             </div>
+            <div class="field">
+              <label for="camq">画质</label>
+              <select id="camq" title="JPEG 压缩质量。**这是唯一能改变帧大小的旋钮** —— OV3660 的 JPEG 分辨率固定 1280x720（传感器只有这一档），所以只能靠画质换速度：调低 → 每帧变小 → 上传更快、更省带宽。合法范围是驱动给的 1..63（默认 17）。">
+                <option value="15">省流 · 帧最小最快</option>
+                <option value="25">流畅</option>
+                <option value="40" selected>标准 · 清晰</option>
+                <option value="60">高清 · 最清晰也最慢</option>
+              </select>
+            </div>
             <div class="hint">
-              实时画面是板子<b>推</b>上来的，帧率<b>由板子决定</b>（在上面选）。
-              实测上限约 2 帧/秒：一帧要等帧 + 开一条 TCP + POST 27KB
-              （OV3660 的 JPEG 只有 1280x720 这一档），这是链路成本。
+              实时画面是板子<b>推</b>上来的，帧率和画质都<b>由板子决定</b>（在上面选）。
+              实测上限约 2 帧/秒：一帧要等帧 + 开一条 TCP + POST 27KB。
+              分辨率由传感器固定为 1280x720（OV3660 的 JPEG 只有这一档），
+              所以"调分辨率"做不到 —— <b>画质</b>才是真正能换速度的旋钮。
               关掉可省 WiFi 带宽。
             </div>
             <div class="hint" id="camstat">—</div>
@@ -3084,6 +3108,13 @@ function camFps(){
   var n = el ? parseInt(el.value, 10) : 2;
   return (isFinite(n) && n >= 1 && n <= 10) ? n : 2;
 }
+/* 当前选的画质（1..100，和板端 CAM_JPEG_QUALITY_* 对齐）。
+ * 这是**唯一**能改帧大小的旋钮 —— 分辨率由传感器固定 1280x720。 */
+function camQ(){
+  var el = $("camq");
+  var n = el ? parseInt(el.value, 10) : 40;
+  return (isFinite(n) && n >= CAM_JPEG_QUALITY_MIN && n <= CAM_JPEG_QUALITY_MAX) ? n : 40;
+}
 function camSetLive(on){
   camOn = on;
   if (camTimer) { clearInterval(camTimer); camTimer = null; }
@@ -3104,9 +3135,10 @@ function camSetLive(on){
    * 注释里写着"由这个按钮触发 cam_stream"，但**那一句 sendCmd 从来没写**。
    * （当时从服务端看，点过按钮却收不到任何 cam_stream 命令，就是这个原因。）
    *
-   * fps 一起下发：省流/丝滑是**板子**的事（真正决定占多少 WiFi 带宽的是它），
-   * 页面只负责按同样的节奏取。 */
-  sendCmd("cam_stream", null, {on: on, fps: fps});
+   * fps / quality 一起下发：省流还是丝滑是**板子**的事（真正决定占多少 WiFi
+   * 带宽、每帧多大的是它），页面只负责按同样的节奏取。
+   * quality 是**唯一**能改帧大小的旋钮（分辨率被传感器锁在 1280x720）。 */
+  sendCmd("cam_stream", null, {on: on, fps: fps, quality: camQ()});
 }
 function shotRow(dev, name, bytes, local){
   return '<div class="shot"><img src="' + (local ? local : "/api/shots/" +
@@ -3639,6 +3671,9 @@ fetch("/api/commands" + devQuery()).then(function(r){ return r.json(); }).then(f
     /* 正在推流时改帧率 → 立刻重发一次命令，不用先关再开。
      * 没在推流就什么都不做：等用户点「开启实时画面」时会带上新帧率。 */
     if ($("camfps")) $("camfps").onchange = function(){ if (camOn) camSetLive(true); };
+    /* 画质同理：板端 camera_set_quality() 对**已打开**的设备立刻生效，
+     * 所以推流中改画质能马上看到帧变大变小。 */
+    if ($("camq")) $("camq").onchange = function(){ if (camOn) camSetLive(true); };
     renderShots();
   } catch (e) {
     if (window.console) console.warn("摄像头初始化失败（不影响其它功能）: " + e);
