@@ -65,6 +65,11 @@ STEP_MIN_G = 0.25         # 计步：高出窗口均值的幅度阈值（g）
 STEP_REFRACTORY_S = 0.30  # 计步：两步之间的最小间隔（秒）
 DT_NOMINAL = 0.01         # 标称采样间隔（对应板端 CONFIG_RW1_SAMPLE_PERIOD_MS=10）
 DT_TRUST_MAX = 0.05       # 超过这个推断间隔就认为该帧晚到了、时间轴不可信
+# 下界：dt_est = 两批到达间隔 / 本批样本数，**批越小这个推算越不可信**。
+# 板端上报解耦后（2026-09-28），网络一慢就丢帧、下一批样本数很少，
+# (间隔 / 样本数) 能掉到几毫秒 —— sample_hz 直接飘到 311（板子标称才 100）。
+# 它是网页上直接显示的字段，飘高会误导人，所以两头都要钳。
+DT_TRUST_MIN = 0.008      # 8 ms → 125 Hz，给标称的 100 Hz 留 25% 余量
 MOTION_STD = 0.06         # "算得上在动"的短窗标准差阈值（g）
 SHAKE_ZCR = 3.5           # 晃动判定：|a| 起伏频率高于该值（Hz）。步行 1.5~2.5Hz，
                           # 晃动 3~8Hz —— 只靠幅度分不开两者（走路也有 0.5g 起伏），
@@ -1269,7 +1274,7 @@ class Handler(BaseHTTPRequestHandler):
             if prev_post > 0 and len(pts) > 1:
                 dt_est = (now - prev_post) / float(len(pts))
                 dt_est = min(0.6, max(0.002, dt_est))
-                if dt_est > DT_TRUST_MAX:
+                if dt_est > DT_TRUST_MAX or dt_est < DT_TRUST_MIN:
                     dt = st["dt_trusted"] or DT_NOMINAL
                 else:
                     dt = dt_est
