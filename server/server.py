@@ -85,6 +85,10 @@ CMD_NAMES = ("capture_once", "led_blink", "led_set", "set_orient",
 
 LED_MAX_BLINKS = 12       # 一次 led_blink 最多闪几下（板端也会再夹一道）
 LED_PATTERNS = ("alert", "ack", "error")   # led_blink 的语义图案（板端映射到预置图案）
+# 实时画面的帧率上限。**必须和板端 transport.c 的 CAM_STREAM_FPS_MAX 一致** ——
+# 板子一帧要「等帧 + 开一条 TCP + POST 27KB」，实测能稳定跑到的只有每秒几帧，
+# 写大了只是让板端白忙。两边不一致的话，网页上选的值会被静默夹掉、看着像没生效。
+CAM_STREAM_FPS_MAX = 10
 FALL_AUTO_ALERT = True    # 判定跌落时自动下发 LED 告警（远端物理反馈）
 
 ACTIVITY_IDLE = "等待数据…"
@@ -332,8 +336,14 @@ def sanitize_params(name, params):
     if name == "set_orient":
         return {"o": clamp_int(p.get("o"), 0, 15, 0)}
     if name == "cam_stream":
-        # 只有开/关两种状态，布尔化即可（别把任意值透传下去）
-        return {"on": bool(p.get("on"))}
+        # 开/关 + **可选**的帧率（网页上的「帧率」选择器）。
+        # ⚠️ 这里曾经只放行 on，于是 fps 被静默丢掉、网页上选几档都没用
+        # （2026-09-28 实测：四个档位测出来都是 ~1.5 帧/秒）。
+        # **不传就不带这个键** —— 板端是"没传就沿用当前值"，老调用方行为不变。
+        out = {"on": bool(p.get("on"))}
+        if p.get("fps") is not None:
+            out["fps"] = clamp_int(p.get("fps"), 1, CAM_STREAM_FPS_MAX, 2)
+        return out
     if name == "sd_rm":
         # 文件名：只放行"根目录下的文件名"，不接受路径分隔符 —— 板端还会再拦一道，
         # 但服务端不该把明显越界的东西发下去。长度按板端的 s_rm_name[64] 夹。
@@ -2315,8 +2325,17 @@ dialog.modal::backdrop{background:var(--modal-backdrop);backdrop-filter:blur(3px
           <div class="camside">
             <button id="camshot">拍照 → 存进板子 SD 卡</button>
             <button id="camlive">开启实时画面</button>
+            <div class="field">
+              <label for="camfps">帧率</label>
+              <select id="camfps" title="板子推帧的速度，改这里会下发命令给板子。调低省 WiFi 带宽、更稳；调高更跟手。注意板子一帧要「等帧 + 开一条 TCP + POST 27KB」，实测到不了很高 —— 选「丝滑」也可能只有每秒几帧，这是链路上限，不是设置没生效。">
+                <option value="1">省流 · 1 帧/秒</option>
+                <option value="2" selected>标准 · 2 帧/秒</option>
+                <option value="4">流畅 · 4 帧/秒</option>
+                <option value="6">丝滑 · 6 帧/秒</option>
+              </select>
+            </div>
             <div class="hint">
-              实时画面是板子<b>推</b>上来的，开启后约 2 帧/秒。
+              实时画面是板子<b>推</b>上来的，帧率<b>由板子决定</b>（在上面选）。
               关掉可省 WiFi 带宽（OV3660 的 JPEG 是 1280x720，一帧约 27KB）。
             </div>
             <div class="hint" id="camstat">—</div>
@@ -3052,13 +3071,22 @@ function camFrame(){
     }
   };
 }
+/* 当前选的帧率（1..10，和板端 CAM_STREAM_FPS_MAX 对齐）。 */
+function camFps(){
+  var el = $("camfps");
+  var n = el ? parseInt(el.value, 10) : 2;
+  return (isFinite(n) && n >= 1 && n <= 10) ? n : 2;
+}
 function camSetLive(on){
   camOn = on;
   if (camTimer) { clearInterval(camTimer); camTimer = null; }
   var btn = $("camlive");
+  var fps = camFps();
   if (on) {
     camFrame();
-    camTimer = setInterval(camFrame, 200);      /* 5 fps，和板端推送节奏对齐 */
+    /* 取帧间隔跟着**板端的推帧间隔**走 —— 板子只推 2 帧/秒时页面每 200ms 取一次
+     * 纯属白问（三次里两次拿到同一帧，白占连接）。下限 100ms 兜住离谱输入。 */
+    camTimer = setInterval(camFrame, Math.max(100, Math.round(1000 / fps)));
   }
   if (btn) btn.textContent = on ? "关闭实时画面" : "开启实时画面";
   /* ⚠️ **必须把命令下发给板子**，光起本地定时器没用。
@@ -3067,8 +3095,11 @@ function camSetLive(on){
    * 页面每 200ms 轮询到的永远是 404，表现成"实时画面点了没反应、只有拍照才有图"
    * —— 2026-09-28 用户反馈的正是这个。原来的实现只切了本地状态与定时器，
    * 注释里写着"由这个按钮触发 cam_stream"，但**那一句 sendCmd 从来没写**。
-   * （当时从服务端看，点过按钮却收不到任何 cam_stream 命令，就是这个原因。） */
-  sendCmd("cam_stream", null, {on: on});
+   * （当时从服务端看，点过按钮却收不到任何 cam_stream 命令，就是这个原因。）
+   *
+   * fps 一起下发：省流/丝滑是**板子**的事（真正决定占多少 WiFi 带宽的是它），
+   * 页面只负责按同样的节奏取。 */
+  sendCmd("cam_stream", null, {on: on, fps: fps});
 }
 function shotRow(dev, name, bytes, local){
   return '<div class="shot"><img src="' + (local ? local : "/api/shots/" +
@@ -3598,6 +3629,9 @@ fetch("/api/commands" + devQuery()).then(function(r){ return r.json(); }).then(f
   try {
     if ($("camshot")) $("camshot").onclick = camShot;
     if ($("camlive")) $("camlive").onclick = function(){ camSetLive(!camOn); };
+    /* 正在推流时改帧率 → 立刻重发一次命令，不用先关再开。
+     * 没在推流就什么都不做：等用户点「开启实时画面」时会带上新帧率。 */
+    if ($("camfps")) $("camfps").onchange = function(){ if (camOn) camSetLive(true); };
     renderShots();
   } catch (e) {
     if (window.console) console.warn("摄像头初始化失败（不影响其它功能）: " + e);
