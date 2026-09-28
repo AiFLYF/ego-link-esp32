@@ -3061,6 +3061,14 @@ function camSetLive(on){
     camTimer = setInterval(camFrame, 200);      /* 5 fps，和板端推送节奏对齐 */
   }
   if (btn) btn.textContent = on ? "关闭实时画面" : "开启实时画面";
+  /* ⚠️ **必须把命令下发给板子**，光起本地定时器没用。
+   *
+   * 板子是 HTTP 客户端、只会"推"：它不推，服务端 FRAMES 里就没有帧，
+   * 页面每 200ms 轮询到的永远是 404，表现成"实时画面点了没反应、只有拍照才有图"
+   * —— 2026-09-28 用户反馈的正是这个。原来的实现只切了本地状态与定时器，
+   * 注释里写着"由这个按钮触发 cam_stream"，但**那一句 sendCmd 从来没写**。
+   * （当时从服务端看，点过按钮却收不到任何 cam_stream 命令，就是这个原因。） */
+  sendCmd("cam_stream", null, {on: on});
 }
 function shotRow(dev, name, bytes, local){
   return '<div class="shot"><img src="' + (local ? local : "/api/shots/" +
