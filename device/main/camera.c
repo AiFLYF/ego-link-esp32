@@ -73,6 +73,15 @@ static bool      s_started;
  * 自检结束后 camera_deinit() 会关掉 fd，但设备本身还在 —— 重新打开只需要
  * open + 定格式 + 申请缓冲，不用再走 BSP。 */
 static bool      s_bsp_started;
+/* 是否要把摄像头一直开着。**默认 false —— 用完就关**。
+ * 只有"实时画面"开着的时候才置 true（那时候本来就每秒要取两帧）。
+ *
+ * 为什么默认要关：DVP 一旦 STREAMON，就会**持续**把 1280x720 的帧写进 PSRAM
+ * （实测 2 缓冲 × 921600 B），和 LVGL 显存、IMU 采样、WiFi 一起抢内存带宽。
+ * 用户 2026-09-27 反馈"板子屏幕很卡、移动要等几秒"，而**拍过一次照之后就永久变卡
+ * （重启才恢复）** —— 就是因为拍完 fd 和 STREAMON 一直留着。
+ * 关掉之后重开只需要 open + 定格式 + 申请缓冲（BSP 那层有 s_bsp_started 守着）。 */
+static bool      s_keep_open;
 static uint32_t  s_seq;
 
 /* ---------------------------------------------------------------- helpers */
@@ -116,7 +125,24 @@ static void close_all(void)
     s_fd = -1;
 }
 
+/* 用完就关（除非"实时画面"开着）。见 s_keep_open 的注释。
+ * 所有取帧接口的**每一条返回路径**都要调它，漏一条就等于又留下一个常开。 */
+static void close_if_idle(void)
+{
+    if (!s_keep_open) {
+        camera_deinit();
+    }
+}
+
 /* ------------------------------------------------------------------- API */
+
+void camera_set_keep_open(bool on)
+{
+    s_keep_open = on;
+    if (!on) {
+        camera_deinit();        /* 关推流时立刻释放，不等下一次取帧 */
+    }
+}
 
 /* 把 BSP 那条 I2C（GPIO4/5）整个扫一遍，把应答的地址打出来。
  *
@@ -465,6 +491,7 @@ esp_err_t camera_post_frame(const char *base_url, const char *device, bool save)
     camera_frame_t fr = {0};
     esp_err_t ret = camera_capture(&fr);
     if (ret != ESP_OK) {
+        close_if_idle();
         return ret;
     }
 
@@ -484,6 +511,7 @@ esp_err_t camera_post_frame(const char *base_url, const char *device, bool save)
     esp_http_client_handle_t cli = esp_http_client_init(&cfg);
     if (cli == NULL) {
         camera_release(&fr);
+        close_if_idle();
         return ESP_FAIL;
     }
     /* 直接用字节流 POST，不套 JSON —— JPEG 是二进制，套 base64 要多花 33% 带宽 */
@@ -493,6 +521,8 @@ esp_err_t camera_post_frame(const char *base_url, const char *device, bool save)
     int code = esp_http_client_get_status_code(cli);
     esp_http_client_cleanup(cli);
     camera_release(&fr);
+
+    close_if_idle();
 
     if (ret != ESP_OK || code != 200) {
         /* 推流失败不该刷屏：画面丢一帧而已，5 帧/秒下用户根本看不出来 */
@@ -508,11 +538,15 @@ esp_err_t camera_save_to_sd(char *name_out, size_t name_len)
         return ESP_ERR_INVALID_STATE;
     }
     if (!camera_ready() && camera_init(NULL, NULL) != ESP_OK) {
+        /* init 自己失败时内部已经 close_all()（s_fd 必为 -1），这里调一下只是
+         * 为了把"每条返回路径都关"这个不变量写全 —— 不依赖实现细节。 */
+        close_if_idle();
         return ESP_ERR_INVALID_STATE;
     }
     camera_frame_t fr = {0};
     esp_err_t ret = camera_capture(&fr);
     if (ret != ESP_OK) {
+        close_if_idle();
         return ret;
     }
 
@@ -533,16 +567,19 @@ esp_err_t camera_save_to_sd(char *name_out, size_t name_len)
         camera_release(&fr);
         if (wrote != fr.len) {
             ESP_LOGE(TAG, "写 %s 只成功 %u/%u 字节", path, (unsigned)wrote, (unsigned)fr.len);
+            close_if_idle();
             return ESP_FAIL;
         }
         if (name_out && name_len) {
             strlcpy(name_out, name, name_len);
         }
         ESP_LOGI(TAG, "已存 %s（%u 字节）", path, (unsigned)fr.len);
+        close_if_idle();
         return ESP_OK;
     }
     camera_release(&fr);
     ESP_LOGE(TAG, "找不到可用文件名");
+    close_if_idle();
     return ESP_FAIL;
 }
 
