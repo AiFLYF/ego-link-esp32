@@ -2327,16 +2327,18 @@ dialog.modal::backdrop{background:var(--modal-backdrop);backdrop-filter:blur(3px
             <button id="camlive">开启实时画面</button>
             <div class="field">
               <label for="camfps">帧率</label>
-              <select id="camfps" title="板子推帧的速度，改这里会下发命令给板子。调低省 WiFi 带宽、更稳；调高更跟手。注意板子一帧要「等帧 + 开一条 TCP + POST 27KB」，实测到不了很高 —— 选「丝滑」也可能只有每秒几帧，这是链路上限，不是设置没生效。">
-                <option value="1">省流 · 1 帧/秒</option>
-                <option value="2" selected>标准 · 2 帧/秒</option>
-                <option value="4">流畅 · 4 帧/秒</option>
-                <option value="6">丝滑 · 6 帧/秒</option>
+              <select id="camfps" title="板子推帧的速度，改这里会下发命令给板子。调低省 WiFi 带宽；调高更跟手。注意：板子一帧要「等帧 + 开一条 TCP + POST 27KB」，实测上限约 2 帧/秒 —— 选「极限」也不会超过它，那是链路上限，不是设置没生效。">
+                <option value="1">省流 · 最省带宽</option>
+                <option value="2" selected>标准</option>
+                <option value="4">流畅</option>
+                <option value="6">极限 · 板子能给的最快</option>
               </select>
             </div>
             <div class="hint">
               实时画面是板子<b>推</b>上来的，帧率<b>由板子决定</b>（在上面选）。
-              关掉可省 WiFi 带宽（OV3660 的 JPEG 是 1280x720，一帧约 27KB）。
+              实测上限约 2 帧/秒：一帧要等帧 + 开一条 TCP + POST 27KB
+              （OV3660 的 JPEG 只有 1280x720 这一档），这是链路成本。
+              关掉可省 WiFi 带宽。
             </div>
             <div class="hint" id="camstat">—</div>
           </div>

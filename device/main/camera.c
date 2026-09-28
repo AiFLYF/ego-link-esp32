@@ -66,6 +66,17 @@ static const char *TAG = "camera";
 #define CAM_CAPTURE_ATTEMPTS   30
 #define CAM_CAPTURE_RETRY_MS   50
 
+/* 推流时取帧只试这么几次就放弃 —— **必须比拍照路径短得多**。
+ *
+ * 为什么（2026-09-28 真机实测）：推流是"到点就推一帧"，如果这一拍恰好没有
+ * 就绪帧，用拍照那套 1500 ms 的重试去等，就会把这一整轮都耗在空等上 ——
+ * 间隔比实际出帧还快时（实测 DVP 1280x720 JPEG 大约 2 帧/秒），
+ * 表现是**帧率设得越高、画面越卡甚至完全停住**
+ * （实测 4/6 帧/秒档位只剩 0.12 帧/秒）。
+ * 所以推流路径"没有就跳过，下一拍再来" —— 让它**按硬件真实能力自己配速**，
+ * 帧率设置只决定"最多问多勤"，不会把链路拖死。 */
+#define CAM_STREAM_CAPTURE_ATTEMPTS   2
+
 static int       s_fd = -1;
 static uint8_t  *s_buf[CAM_NBUF];
 static uint32_t  s_buf_len[CAM_NBUF];
@@ -385,7 +396,11 @@ static uint32_t jpeg_scan_len(const uint8_t *d, uint32_t cap)
     return 0;
 }
 
-esp_err_t camera_capture(camera_frame_t *out)
+/* 取帧的实际实现。`attempts` 由调用方给：
+ *   - 拍照 / 自检：CAM_CAPTURE_ATTEMPTS（"等到出帧为止"，用户就等这一张）
+ *   - 推流：CAM_STREAM_CAPTURE_ATTEMPTS（"没有就跳过"，理由见那个宏的注释）
+ * 合成一个函数是为了让重试语义只有一处实现，别两份代码慢慢走偏。 */
+static esp_err_t capture_try(camera_frame_t *out, int attempts)
 {
     if (!out || !camera_ready()) {
         return ESP_ERR_INVALID_STATE;
@@ -395,7 +410,7 @@ esp_err_t camera_capture(camera_frame_t *out)
 
     /* 为什么要循环见 CAM_CAPTURE_ATTEMPTS 的注释：esp_video 在"队列里还没有
      * 就绪帧"时是**立刻**返回一个没 DONE 的缓冲，单次取帧必然偶发失败。 */
-    for (int attempt = 0; attempt < CAM_CAPTURE_ATTEMPTS; attempt++) {
+    for (int attempt = 0; attempt < attempts; attempt++) {
         struct v4l2_buffer b;
         buf_init(&b);
 
@@ -461,9 +476,18 @@ esp_err_t camera_capture(camera_frame_t *out)
         vTaskDelay(pdMS_TO_TICKS(CAM_CAPTURE_RETRY_MS));
     }
 
-    ESP_LOGE(TAG, "取帧失败：连试 %d 次都没拿到就绪帧（最后 %s）",
-             CAM_CAPTURE_ATTEMPTS, esp_err_to_name(last));
+    /* 只有"该等到出帧为止"的路径才值得报错 —— 推流那条是主动放弃，
+     * 报错会每拍刷一行，把串口淹掉。 */
+    if (attempts > CAM_STREAM_CAPTURE_ATTEMPTS) {
+        ESP_LOGE(TAG, "取帧失败：连试 %d 次都没拿到就绪帧（最后 %s）",
+                 attempts, esp_err_to_name(last));
+    }
     return last;
+}
+
+esp_err_t camera_capture(camera_frame_t *out)
+{
+    return capture_try(out, CAM_CAPTURE_ATTEMPTS);
 }
 
 void camera_release(const camera_frame_t *frame)
@@ -505,7 +529,11 @@ esp_err_t camera_post_frame(const char *base_url, const char *device, bool save)
     }
 
     camera_frame_t fr = {0};
-    esp_err_t ret = camera_capture(&fr);
+    /* 推流那一拍"没有就跳过"（见 CAM_STREAM_CAPTURE_ATTEMPTS 的注释）；
+     * 但 `save=1` 是拍照留档那一份 —— 它要进网页的照片列表，丢了用户会以为
+     * 没拍上，所以那条路径值得按拍照的预算多等一会儿。 */
+    esp_err_t ret = capture_try(&fr, save ? CAM_CAPTURE_ATTEMPTS
+                                           : CAM_STREAM_CAPTURE_ATTEMPTS);
     if (ret != ESP_OK) {
         close_if_idle();
         return ret;
