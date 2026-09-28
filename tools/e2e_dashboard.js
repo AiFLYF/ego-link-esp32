@@ -33,11 +33,18 @@ const PY = process.env.E2E_PYTHON || 'python';
 const DATA_DIR = path.join(os.tmpdir(), 'rw1-e2e-data');
 
 const procs = [];
-function start(args) {
+const logs = [];
+function start(args, tag) {
   const env = Object.assign({}, process.env, {
     no_proxy: '127.0.0.1,localhost', NO_PROXY: '127.0.0.1,localhost',
   });
-  const p = spawn(PY, args, { cwd: ROOT, env });
+  /* 把子进程输出落盘：失败时能一眼看出是"服务端没起来"还是"产品 bug"，
+     而不是对着一个空日志猜。 */
+  const fs = require('fs');
+  const logPath = path.join(os.tmpdir(), 'rw1-e2e-' + (tag || 'proc') + '.log');
+  const fd = fs.openSync(logPath, 'w');
+  logs.push(logPath);
+  const p = spawn(PY, args, { cwd: ROOT, env, stdio: ['ignore', fd, fd] });
   procs.push(p);
   return p;
 }
@@ -45,6 +52,23 @@ function cleanup() {
   for (const p of procs) { try { p.kill(); } catch (e) { /* 已经没了 */ } }
 }
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+/* 等 HTTP 真的能应答再往下走。
+   固定 `sleep(2500)` 是**不可靠的**：机器忙一点、服务端晚 1 秒绑定端口，
+   后面的 `page.goto` 就会超时，看起来像产品打不开，其实是测试自己抢跑。
+   （踩过：连着跑三套测试时这套报 "navigating ... waiting until domcontentloaded" 超时，
+   单独跑又全绿 —— 就是这个原因。本仓库的记忆里早写着"E2E 必须先就绪探测"。） */
+async function waitHttp(url, maxSec) {
+  const t0 = Date.now();
+  while (Date.now() - t0 < (maxSec || 25) * 1000) {
+    try {
+      const r = await fetch(url, { signal: AbortSignal.timeout(1500) });
+      if (r.ok) return true;
+    } catch (e) { /* 还没起来 */ }
+    await sleep(400);
+  }
+  return false;
+}
 
 const problems = [];
 let passed = 0;
@@ -59,14 +83,25 @@ async function step(name, fn) {
 
 (async () => {
   start(['-u', 'server/server.py', '--port', String(PORT),
-         '--data-dir', DATA_DIR, '--retain-days', '0']);
-  await sleep(2500);
+         '--data-dir', DATA_DIR, '--retain-days', '0'], 'server');
+  if (!await waitHttp(BASE + '/api/latest')) {
+    throw new Error('服务端在 ' + PORT + ' 端口起不来（看 ' + logs[0] + '）');
+  }
   // 两块假板子：一块带 oN，一块不带（模拟不支持 oN 的老固件）
   start(['-u', 'tools/fake_board.py', '--url', BASE, '--device', '第三组-07',
-         '--orient', '7', '--scenario', 'tilt', '--seconds', '180', '--quiet']);
+         '--orient', '7', '--scenario', 'tilt', '--seconds', '180', '--quiet'], 'boardA');
   start(['-u', 'tools/fake_board.py', '--url', BASE, '--device', '老固件-01',
-         '--scenario', 'idle', '--seconds', '180', '--quiet']);
-  await sleep(4000);
+         '--scenario', 'idle', '--seconds', '180', '--quiet'], 'boardB');
+  /* 等两块板子都真的上报过 —— 用"设备列表里有 2 台"当就绪信号，
+     不要 sleep 固定秒数（板子晚到 1 秒，后面的断言就会假失败）。 */
+  const t0 = Date.now();
+  while (Date.now() - t0 < 20000) {
+    try {
+      const j = await (await fetch(BASE + '/api/devices')).json();
+      if ((j.devices || []).length >= 2) break;
+    } catch (e) { /* 再等 */ }
+    await sleep(500);
+  }
 
   const browser = await chromium.launch({
     channel: 'chrome', headless: true,
@@ -131,6 +166,22 @@ async function step(name, fn) {
     await page.waitForSelector('#devcard:not([hidden])', { timeout: 15000 });
     const n = await page.locator('#devs .dev').count();
     if (n !== 2) throw new Error('设备行数 = ' + n);
+  });
+
+  await step('设备卡片不会闪（连续取数 3 秒内始终可见）', async () => {
+    /* 2026-09-26 抓到的真 bug：`/api/latest`（100ms 轮询）不带 devices 字段，
+       而 SSE（500ms）带 —— 于是这一块以取数频率反复藏/显，大部分时间不可见。
+       采样 60 次 × 50ms = 3 秒，覆盖 30 次轮询 + 6 次 SSE。 */
+    const r = await page.evaluate(() => new Promise(resolve => {
+      const el = document.getElementById('devcard');
+      let hidden = 0, n = 0;
+      const t = setInterval(() => {
+        n++;
+        if (el.hidden || getComputedStyle(el).display === 'none') hidden++;
+        if (n >= 60) { clearInterval(t); resolve({ hidden, n }); }
+      }, 50);
+    }));
+    if (r.hidden) throw new Error('3 秒内被藏起来 ' + r.hidden + '/' + r.n + ' 次（应为 0）');
   });
 
   await step('每台前面有复选框', async () => {
@@ -268,9 +319,26 @@ async function step(name, fn) {
   cleanup();
 
   console.log('\n结果: ' + passed + ' 通过' + (problems.length ? ', ' + problems.length + ' 处问题' : ', 无问题'));
-  if (problems.length) { console.log(problems.join('\n')); process.exitCode = 1; }
+  if (problems.length) {
+    console.log(problems.join('\n'));
+    const fs = require('fs');
+    for (const p of logs) {
+      try {
+        const t = fs.readFileSync(p, 'utf8').trim();
+        if (t) console.log('\n--- ' + path.basename(p) + ' ---\n' + t.split('\n').slice(-20).join('\n'));
+      } catch (e) { /* 没日志 */ }
+    }
+    process.exitCode = 1;
+  }
 })().catch(e => {
   console.log('FATAL: ' + (e && e.message));
+  const fs = require('fs');
+  for (const p of logs) {
+    try {
+      const t = fs.readFileSync(p, 'utf8').trim();
+      if (t) console.log('\n--- ' + path.basename(p) + ' ---\n' + t.split('\n').slice(-20).join('\n'));
+    } catch (err) { /* 没日志 */ }
+  }
   cleanup();
   process.exit(1);
 });
