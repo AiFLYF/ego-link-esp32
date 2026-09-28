@@ -3784,6 +3784,9 @@ def main():
         print("       netstat -ano | grep \":%d\"" % args.port)
         print("   拿到 PID 后 taskkill //PID <pid> //F；若杀完仍绑不上（socket 会在")
         print("   内核里滞留一会儿），**重启电脑**最干净。")
+        print("   ★ 也可以**不重启**：绑 0.0.0.0 才冲突，绑具体地址是好的 ——")
+        print("     实测 0.0.0.0 失败(10048) 而 127.0.0.1 / 本机 LAN IP 都能绑成功。")
+        print("     所以用 `--host <本机无线网卡 IP>`（板子要连的那个）即可绕过。")
         print("   不要轻易换端口：板子 NVS 里配的就是这个端口，换端口要重新配网。")
         return 2
 
