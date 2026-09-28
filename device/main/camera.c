@@ -550,6 +550,11 @@ esp_err_t camera_post_frame(const char *base_url, const char *device, bool save)
         .url = url,
         .method = HTTP_METHOD_POST,
         .timeout_ms = 4000,
+        /* ⚠️ 试过把 buffer_size 从 1024 提到 4096，**实测反而更差，已撤回**。
+         * 动机是：27KB 的 body 按 1024 拆成 ~27 次写，每次都要过一遍 lwIP
+         * 发送窗口（默认才 5760 字节），看着像浪费。
+         * 但真机 A/B（2026-09-28）提到 4096 之后推流实测掉到 0.08 帧/秒
+         * （对照组约 2 帧/秒）。撤回即恢复。**别只凭"看着合理"就改这个值。** */
         .buffer_size = 1024,
     };
     esp_http_client_handle_t cli = esp_http_client_init(&cfg);
