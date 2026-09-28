@@ -57,9 +57,14 @@ static const char *TAG = "camera";
  * DONE 的缓冲"，不是阻塞等待** —— 所以单次取帧会瞬时（0~1 ms）失败。
  * 表现：`cam_capture` 只有 1/7 成功，而且**只在刚 STREAMON 之后那一瞬间能成**，
  * 之后全挂。开机自检之所以一直能过，就是因为它本来就重试了 5 次（见 camera_selftest）。
- * 12 × 40 ms = 最多等 480 ms，够一帧（OV3660 1280x720 JPEG 实测约 2 fps）。 */
-#define CAM_CAPTURE_ATTEMPTS   12
-#define CAM_CAPTURE_RETRY_MS   40
+ *
+ * ⚠️ 重试本身**不会**让情况变好（2026-09-28 真机订正）：一开始我把失败归因成
+ * "预算太短、第一帧要 160~500 ms"，于是把 12 次加到 30 次 —— 结果**更糟**
+ * （0/4 成功）。真正的原因是下面那段里写的"重复入队"：每多试一次就多坏一次队列。
+ * 修好重复入队之后重试才有意义，这里给 30 × 50 ms = **1500 ms** 的宽预算，
+ * 因为 `STREAMON` 后第一帧确实要等（实测自检那 315 ms 里大部分是等帧）。 */
+#define CAM_CAPTURE_ATTEMPTS   30
+#define CAM_CAPTURE_RETRY_MS   50
 
 static int       s_fd = -1;
 static uint8_t  *s_buf[CAM_NBUF];
@@ -401,8 +406,19 @@ esp_err_t camera_capture(camera_frame_t *out)
                 ESP_LOGW(TAG, "DQBUF 失败 (errno=%d)，重试", errno);
             }
         } else if (!(b.flags & V4L2_BUF_FLAG_DONE)) {
-            /* 缓冲到手但驱动还没填完 —— 必须立刻还回去，否则缓冲越来越少 */
-            ioctl(s_fd, VIDIOC_QBUF, &b);
+            /* 缓冲到手但驱动还没填完。**关键：按 QUEUED 标志决定要不要还回去。**
+             *
+             * 真机实测（2026-09-28）：esp_video 在"没就绪"时返回的缓冲**仍带
+             * V4L2_BUF_FLAG_QUEUED（实测 flags=0x41 = MAPPED|QUEUED）**，
+             * 说明它**压根没有出队**。原来无条件 QBUF 回去 = **重复入队**，
+             * 会把驱动内部的缓冲链表搞坏 —— 之后 DVP 再也不产出帧。
+             * 现象正是"第一张拍成功、之后全部失败"，而且**重试次数越多越糟**
+             * （30 次重试 = 30 次重复入队，比 12 次还差）。
+             *
+             * 所以：只有 QUEUED 已清（真出队了）才还回去；否则原样留在队列里。 */
+            if (!(b.flags & V4L2_BUF_FLAG_QUEUED)) {
+                ioctl(s_fd, VIDIOC_QBUF, &b);
+            }
             last = ESP_ERR_NOT_FOUND;
             if (attempt == 0) {
                 ESP_LOGW(TAG, "第 1 次拿到未就绪缓冲 (flags=0x%08x bytesused=%u)，重试",
