@@ -9,6 +9,7 @@
 
 #include "camera.h"
 
+#include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
 #include <stdio.h>
@@ -49,6 +50,55 @@ static const char *TAG = "camera";
 /* DQBUF 最多等多久。第一帧要等曝光收敛，太短会白白失败。 */
 #define CAM_DQBUF_TIMEOUT_S   2
 
+/* 取一帧最多试几次、每次之间等多久。
+ *
+ * 为什么必须重试（2026-09-27 真机实测）：DVP 的缓冲要等驱动填好才置
+ * V4L2_BUF_FLAG_DONE，而 **esp_video 在队列里还没有就绪帧时是"立刻返回一个没
+ * DONE 的缓冲"，不是阻塞等待** —— 所以单次取帧会瞬时（0~1 ms）失败。
+ * 表现：`cam_capture` 只有 1/7 成功，而且**只在刚 STREAMON 之后那一瞬间能成**，
+ * 之后全挂。开机自检之所以一直能过，就是因为它本来就重试了 5 次（见 camera_selftest）。
+ *
+ * ⚠️ 重试本身**不会**让情况变好（2026-09-28 真机订正）：一开始我把失败归因成
+ * "预算太短、第一帧要 160~500 ms"，于是把 12 次加到 30 次 —— 结果**更糟**
+ * （0/4 成功）。真正的原因是下面那段里写的"重复入队"：每多试一次就多坏一次队列。
+ * 修好重复入队之后重试才有意义，这里给 30 × 50 ms = **1500 ms** 的宽预算，
+ * 因为 `STREAMON` 后第一帧确实要等（实测自检那 315 ms 里大部分是等帧）。 */
+#define CAM_CAPTURE_ATTEMPTS   30
+#define CAM_CAPTURE_RETRY_MS   50
+
+/* 推流时取帧只试这么几次就放弃 —— **必须比拍照路径短得多**。
+ *
+ * 为什么（2026-09-28 真机实测）：推流是"到点就推一帧"，如果这一拍恰好没有
+ * 就绪帧，用拍照那套 1500 ms 的重试去等，就会把这一整轮都耗在空等上 ——
+ * 间隔比实际出帧还快时（实测 DVP 1280x720 JPEG 大约 2 帧/秒），
+ * 表现是**帧率设得越高、画面越卡甚至完全停住**
+ * （实测 4/6 帧/秒档位只剩 0.12 帧/秒）。
+ * 所以推流路径"没有就跳过，下一拍再来" —— 让它**按硬件真实能力自己配速**，
+ * 帧率设置只决定"最多问多勤"，不会把链路拖死。 */
+#define CAM_STREAM_CAPTURE_ATTEMPTS   2
+
+/* JPEG 质量（1..100）。**这是唯一能改变帧大小的旋钮。**
+ *
+ * 为什么不是"分辨率"：OV3660 的 JPEG 只有 1280x720 一档 —— 驱动格式表
+ * （`espressif__esp_cam_sensor/sensors/ov3660/ov3660.c:73-154`）共 5 档，
+ * JPEG 仅此一档，其余是 RGB565/YUV422 的 240x240 / 640x480（一帧 115KB~614KB，
+ * 比 JPEG 还大，换过去只会更慢）。所以"降分辨率提帧率"这条路是堵死的。
+ *
+ * 质量越低 → 每帧字节数越少 → 上传耗时和带宽同步下降，**帧率与流量一起受益**。
+ * 默认 80：拍照要清晰，而 80 相对默认值已经能明显缩小帧。
+ * 传感器支持与否用 VIDIOC_QUERY_EXT_CTRL 探一次（驱动不支持就静默跳过）。 */
+#define CAM_JPEG_QUALITY_DEFAULT   30
+/* 上下限**只是兜底**：真正合法范围由驱动给（实测 OV3660 是 1..63，不是 1..100）。
+ * 第一次打开时用 VIDIOC_QUERY_EXT_CTRL 问出来存进 s_q_min/s_q_max，
+ * 之后一律按驱动给的范围夹 —— 写死 100 会让 80/95 这种值直接被拒（踩过）。 */
+#define CAM_JPEG_QUALITY_MIN       1
+#define CAM_JPEG_QUALITY_MAX       100
+
+static int  s_quality = CAM_JPEG_QUALITY_DEFAULT;
+static int  s_quality_ok = -1;      /* -1 未知 / 0 不支持 / 1 支持（探一次就定） */
+static int  s_q_min = CAM_JPEG_QUALITY_MIN;   /* 驱动给的合法范围，探到后覆盖 */
+static int  s_q_max = CAM_JPEG_QUALITY_MAX;
+
 static int       s_fd = -1;
 static uint8_t  *s_buf[CAM_NBUF];
 static uint32_t  s_buf_len[CAM_NBUF];
@@ -56,6 +106,20 @@ static uint32_t  s_width;
 static bool      s_is_jpeg;   /* 当前格式是不是硬件 JPEG（GC2145 没有） */
 static uint32_t  s_height;
 static bool      s_started;
+/* BSP 那一层（I2C + XCLK + esp_video_init 注册 /dev/video2）**只能做一次**：
+ * XCLK 是 LEDC 独占资源、设备名也只能注册一次，第二次调 bsp_camera_start() 必失败。
+ * 自检结束后 camera_deinit() 会关掉 fd，但设备本身还在 —— 重新打开只需要
+ * open + 定格式 + 申请缓冲，不用再走 BSP。 */
+static bool      s_bsp_started;
+/* 是否要把摄像头一直开着。**默认 false —— 用完就关**。
+ * 只有"实时画面"开着的时候才置 true（那时候本来就每秒要取两帧）。
+ *
+ * 为什么默认要关：DVP 一旦 STREAMON，就会**持续**把 1280x720 的帧写进 PSRAM
+ * （实测 2 缓冲 × 921600 B），和 LVGL 显存、IMU 采样、WiFi 一起抢内存带宽。
+ * 用户 2026-09-27 反馈"板子屏幕很卡、移动要等几秒"，而**拍过一次照之后就永久变卡
+ * （重启才恢复）** —— 就是因为拍完 fd 和 STREAMON 一直留着。
+ * 关掉之后重开只需要 open + 定格式 + 申请缓冲（BSP 那层有 s_bsp_started 守着）。 */
+static bool      s_keep_open;
 static uint32_t  s_seq;
 
 /* ---------------------------------------------------------------- helpers */
@@ -99,7 +163,93 @@ static void close_all(void)
     s_fd = -1;
 }
 
+/* 把 s_quality 写到传感器（V4L2_CID_JPEG_COMPRESSION_QUALITY）。
+ * 写法照抄官方示例 `esp_video/examples/simple_video_server`：
+ * `ctrl_class` 必须是 `V4L2_CID_JPEG_CLASS`，不是 VFLIP 那种 USER 类。 */
+static void apply_quality(void)
+{
+    if (s_fd < 0) {
+        return;
+    }
+    if (s_quality_ok < 0) {
+        /* 只探一次：驱动不支持就再也别试，免得每开一次摄像头都白刷一条警告 */
+        struct v4l2_query_ext_ctrl q = {0};
+        q.id = V4L2_CID_JPEG_COMPRESSION_QUALITY;
+        s_quality_ok = (ioctl(s_fd, VIDIOC_QUERY_EXT_CTRL, &q) == 0) ? 1 : 0;
+        if (s_quality_ok) {
+            /* **按驱动给的范围来**，别信自己写死的 1..100 ——
+             * 实测这颗 OV3660 是 1..63、默认 17。写死 100 会让 80/95 直接被拒。 */
+            if (q.minimum > 0) {
+                s_q_min = (int)q.minimum;
+            }
+            if (q.maximum > 0) {
+                s_q_max = (int)q.maximum;
+            }
+            if (s_quality > s_q_max) {
+                s_quality = s_q_max;
+            }
+            if (s_quality < s_q_min) {
+                s_quality = s_q_min;
+            }
+            ESP_LOGI(TAG, "JPEG 质量可控：范围 %d..%d，默认 %d，当前用 %d",
+                     s_q_min, s_q_max, (int)q.default_value, s_quality);
+        } else {
+            ESP_LOGW(TAG, "这颗传感器不支持 JPEG 质量控制，画质档位不起作用");
+        }
+    }
+    if (!s_quality_ok) {
+        return;
+    }
+
+    struct v4l2_ext_control ctl = {0};
+    ctl.id = V4L2_CID_JPEG_COMPRESSION_QUALITY;
+    ctl.value = s_quality;
+    struct v4l2_ext_controls ctrls = {0};
+    ctrls.ctrl_class = V4L2_CID_JPEG_CLASS;
+    ctrls.count = 1;
+    ctrls.controls = &ctl;
+    if (ioctl(s_fd, VIDIOC_S_EXT_CTRLS, &ctrls) != 0) {
+        ESP_LOGW(TAG, "设置 JPEG 质量 %d 失败，沿用传感器默认值", s_quality);
+    }
+}
+
+/* 用完就关（除非"实时画面"开着）。见 s_keep_open 的注释。
+ * 所有取帧接口的**每一条返回路径**都要调它，漏一条就等于又留下一个常开。 */
+static void close_if_idle(void)
+{
+    if (!s_keep_open) {
+        camera_deinit();
+    }
+}
+
 /* ------------------------------------------------------------------- API */
+
+void camera_set_keep_open(bool on)
+{
+    s_keep_open = on;
+    if (!on) {
+        camera_deinit();        /* 关推流时立刻释放，不等下一次取帧 */
+    }
+}
+
+/* 设置 JPEG 画质（1..100）。夹到合法范围；**已打开就立刻生效**，不必等下一次 init ——
+ * 用户调档位时摄像头通常正开着（推流中），等下次 init 就等于"改了没反应"。 */
+void camera_set_quality(int q)
+{
+    /* 按**驱动给的范围**夹（s_q_min/s_q_max 在第一次 apply_quality 时问出来）。
+     * 探到之前用兜底常量，不会越界。 */
+    if (q < s_q_min) {
+        q = s_q_min;
+    }
+    if (q > s_q_max) {
+        q = s_q_max;
+    }
+    if (q == s_quality) {
+        return;
+    }
+    s_quality = q;
+    apply_quality();
+}
 
 /* 把 BSP 那条 I2C（GPIO4/5）整个扫一遍，把应答的地址打出来。
  *
@@ -149,15 +299,21 @@ esp_err_t camera_init(uint32_t *out_w, uint32_t *out_h)
         return ESP_OK;
     }
 
-    /* ① BSP 负责 I2C + 16MHz XCLK + esp_video_init()（注册 /dev/video2） */
-    bsp_camera_cfg_t cfg = {0};
-    esp_err_t ret = bsp_camera_start(&cfg);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "bsp_camera_start 失败: %s", esp_err_to_name(ret));
-        /* 失败时**顺手把 I2C 扫一遍**：这一步能把"排线没插"和"型号选错"分开，
-         * 否则两种情况的报错长得一模一样，只能靠猜。 */
-        camera_scan_i2c();
-        return ret;
+    /* ① BSP 负责 I2C + 16MHz XCLK + esp_video_init()（注册 /dev/video2）
+     *    **只做一次**：自检拍完会 camera_deinit() 关掉 fd，之后拍照/推流要重新打开 ——
+     *    那时设备还在，只需要 open + 定格式 + 申请缓冲。再调一次 bsp_camera_start()
+     *    会因为 XCLK 已被占用而失败，表现成"自检能过、但拍照一直失败"（踩过）。 */
+    if (!s_bsp_started) {
+        bsp_camera_cfg_t cfg = {0};
+        esp_err_t ret = bsp_camera_start(&cfg);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "bsp_camera_start 失败: %s", esp_err_to_name(ret));
+            /* 失败时**顺手把 I2C 扫一遍**：这一步能把"排线没插"和"型号选错"分开，
+             * 否则两种情况的报错长得一模一样，只能靠猜。 */
+            camera_scan_i2c();
+            return ret;
+        }
+        s_bsp_started = true;
     }
 
     s_fd = open(BSP_CAMERA_DEVICE, O_RDONLY);
@@ -232,6 +388,10 @@ esp_err_t camera_init(uint32_t *out_w, uint32_t *out_h)
         /* 翻转失败不致命，只是画面方向可能不对，继续跑 */
         ESP_LOGW(TAG, "VFLIP 设置失败，画面可能上下颠倒");
     }
+
+    /* ③.5 JPEG 质量（画质档位）。**必须在 S_FMT 之后、REQBUFS 之前** ——
+     * 它是编码器参数，要在缓冲建起来之前定好。见 CAM_JPEG_QUALITY_DEFAULT 的注释。 */
+    apply_quality();
 
     /* ④ 申请缓冲并映射到用户空间（DVP 的缓冲本身就在 PSRAM，不占内部 RAM） */
     struct v4l2_requestbuffers req = {0};
@@ -331,46 +491,98 @@ static uint32_t jpeg_scan_len(const uint8_t *d, uint32_t cap)
     return 0;
 }
 
-esp_err_t camera_capture(camera_frame_t *out)
+/* 取帧的实际实现。`attempts` 由调用方给：
+ *   - 拍照 / 自检：CAM_CAPTURE_ATTEMPTS（"等到出帧为止"，用户就等这一张）
+ *   - 推流：CAM_STREAM_CAPTURE_ATTEMPTS（"没有就跳过"，理由见那个宏的注释）
+ * 合成一个函数是为了让重试语义只有一处实现，别两份代码慢慢走偏。 */
+static esp_err_t capture_try(camera_frame_t *out, int attempts)
 {
     if (!out || !camera_ready()) {
         return ESP_ERR_INVALID_STATE;
     }
 
-    struct v4l2_buffer b;
-    buf_init(&b);
-    if (ioctl(s_fd, VIDIOC_DQBUF, &b) != 0) {
-        return ESP_FAIL;
+    esp_err_t last = ESP_ERR_NOT_FOUND;
+
+    /* 为什么要循环见 CAM_CAPTURE_ATTEMPTS 的注释：esp_video 在"队列里还没有
+     * 就绪帧"时是**立刻**返回一个没 DONE 的缓冲，单次取帧必然偶发失败。 */
+    for (int attempt = 0; attempt < attempts; attempt++) {
+        struct v4l2_buffer b;
+        buf_init(&b);
+
+        if (ioctl(s_fd, VIDIOC_DQBUF, &b) != 0) {
+            /* DQBUF 本身失败时缓冲仍在驱动手里，**不能** QBUF 回去（会重复入队） */
+            last = ESP_FAIL;
+            if (attempt == 0) {
+                ESP_LOGW(TAG, "DQBUF 失败 (errno=%d)，重试", errno);
+            }
+        } else if (!(b.flags & V4L2_BUF_FLAG_DONE)) {
+            /* 缓冲到手但驱动还没填完。**关键：按 QUEUED 标志决定要不要还回去。**
+             *
+             * 真机实测（2026-09-28）：esp_video 在"没就绪"时返回的缓冲**仍带
+             * V4L2_BUF_FLAG_QUEUED（实测 flags=0x41 = MAPPED|QUEUED）**，
+             * 说明它**压根没有出队**。原来无条件 QBUF 回去 = **重复入队**，
+             * 会把驱动内部的缓冲链表搞坏 —— 之后 DVP 再也不产出帧。
+             * 现象正是"第一张拍成功、之后全部失败"，而且**重试次数越多越糟**
+             * （30 次重试 = 30 次重复入队，比 12 次还差）。
+             *
+             * 所以：只有 QUEUED 已清（真出队了）才还回去；否则原样留在队列里。 */
+            if (!(b.flags & V4L2_BUF_FLAG_QUEUED)) {
+                ioctl(s_fd, VIDIOC_QBUF, &b);
+            }
+            last = ESP_ERR_NOT_FOUND;
+            if (attempt == 0) {
+                ESP_LOGW(TAG, "第 1 次拿到未就绪缓冲 (flags=0x%08x bytesused=%u)，重试",
+                         (unsigned)b.flags, (unsigned)b.bytesused);
+            }
+        } else {
+            out->data = s_buf[b.index];
+            /* 帧长：JPEG 时**以自己扫出来的为准**（见 jpeg_scan_len 的注释）；
+             * 扫不出来（不是 JPEG / 数据坏）才退回驱动的 bytesused，
+             * 而且只在它没超过缓冲区大小时才敢用 —— 否则就是把越界内存当帧长。 */
+            uint32_t cap = s_buf_len[b.index];
+            uint32_t len = 0;
+            if (s_is_jpeg) {
+                len = jpeg_scan_len(out->data, cap);
+            }
+            if (len == 0 && b.bytesused > 0 && b.bytesused <= cap) {
+                len = b.bytesused;
+            }
+            if (len == 0) {
+                ioctl(s_fd, VIDIOC_QBUF, &b);       /* 坏帧还回去，别丢缓冲 */
+                last = ESP_ERR_INVALID_SIZE;
+                if (attempt == 0) {
+                    ESP_LOGW(TAG, "第 1 次帧长扫不出来 (flags=0x%08x bytesused=%u cap=%u)，重试",
+                             (unsigned)b.flags, (unsigned)b.bytesused, (unsigned)cap);
+                }
+            } else {
+                if (attempt > 0) {
+                    ESP_LOGI(TAG, "取帧第 %d 次才成（前 %d 次没就绪）",
+                             attempt + 1, attempt);
+                }
+                out->len    = len;
+                out->width  = s_width;
+                out->height = s_height;
+                out->slot   = (int)b.index;
+                out->seq    = ++s_seq;
+                return ESP_OK;
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(CAM_CAPTURE_RETRY_MS));
     }
 
-    /* 坏帧（V4L2_BUF_FLAG_ERROR）也要还回去，否则缓冲会越来越少 */
-    if (!(b.flags & V4L2_BUF_FLAG_DONE)) {
-        ioctl(s_fd, VIDIOC_QBUF, &b);
-        return ESP_ERR_NOT_FOUND;
+    /* 只有"该等到出帧为止"的路径才值得报错 —— 推流那条是主动放弃，
+     * 报错会每拍刷一行，把串口淹掉。 */
+    if (attempts > CAM_STREAM_CAPTURE_ATTEMPTS) {
+        ESP_LOGE(TAG, "取帧失败：连试 %d 次都没拿到就绪帧（最后 %s）",
+                 attempts, esp_err_to_name(last));
     }
+    return last;
+}
 
-    out->data   = s_buf[b.index];
-    /* 帧长：JPEG 时**以自己扫出来的为准**（见 jpeg_scan_len 的注释）；
-     * 扫不出来（不是 JPEG / 数据坏）才退回驱动的 bytesused，
-     * 而且只在它没超过缓冲区大小时才敢用 —— 否则就是把越界内存当帧长。 */
-    uint32_t cap = s_buf_len[b.index];
-    uint32_t len = 0;
-    if (s_is_jpeg) {
-        len = jpeg_scan_len(out->data, cap);
-    }
-    if (len == 0 && b.bytesused > 0 && b.bytesused <= cap) {
-        len = b.bytesused;
-    }
-    if (len == 0) {
-        ioctl(s_fd, VIDIOC_QBUF, &b);           /* 坏帧还回去，别丢缓冲 */
-        return ESP_ERR_INVALID_SIZE;
-    }
-    out->len    = len;
-    out->width  = s_width;
-    out->height = s_height;
-    out->slot   = (int)b.index;
-    out->seq    = ++s_seq;
-    return ESP_OK;
+esp_err_t camera_capture(camera_frame_t *out)
+{
+    return capture_try(out, CAM_CAPTURE_ATTEMPTS);
 }
 
 void camera_release(const camera_frame_t *frame)
@@ -381,7 +593,12 @@ void camera_release(const camera_frame_t *frame)
     struct v4l2_buffer b;
     buf_init(&b);
     b.index = (uint32_t)frame->slot;
-    ioctl(s_fd, VIDIOC_QBUF, &b);
+    /* **必须检查返回值**：QBUF 要是悄悄失败，这个缓冲就漏出队列了 ——
+     * 两次之后队列空，之后所有 DQBUF 都瞬时失败（2026-09-27 排查时重点怀疑过这条）。 */
+    if (ioctl(s_fd, VIDIOC_QBUF, &b) != 0) {
+        ESP_LOGE(TAG, "QBUF(slot=%d) 失败 (errno=%d) —— 缓冲漏出队列",
+                 frame->slot, errno);
+    }
 }
 
 void camera_deinit(void)
@@ -407,8 +624,13 @@ esp_err_t camera_post_frame(const char *base_url, const char *device, bool save)
     }
 
     camera_frame_t fr = {0};
-    esp_err_t ret = camera_capture(&fr);
+    /* 推流那一拍"没有就跳过"（见 CAM_STREAM_CAPTURE_ATTEMPTS 的注释）；
+     * 但 `save=1` 是拍照留档那一份 —— 它要进网页的照片列表，丢了用户会以为
+     * 没拍上，所以那条路径值得按拍照的预算多等一会儿。 */
+    esp_err_t ret = capture_try(&fr, save ? CAM_CAPTURE_ATTEMPTS
+                                           : CAM_STREAM_CAPTURE_ATTEMPTS);
     if (ret != ESP_OK) {
+        close_if_idle();
         return ret;
     }
 
@@ -423,11 +645,17 @@ esp_err_t camera_post_frame(const char *base_url, const char *device, bool save)
         .url = url,
         .method = HTTP_METHOD_POST,
         .timeout_ms = 4000,
+        /* ⚠️ 试过把 buffer_size 从 1024 提到 4096，**实测反而更差，已撤回**。
+         * 动机是：27KB 的 body 按 1024 拆成 ~27 次写，每次都要过一遍 lwIP
+         * 发送窗口（默认才 5760 字节），看着像浪费。
+         * 但真机 A/B（2026-09-28）提到 4096 之后推流实测掉到 0.08 帧/秒
+         * （对照组约 2 帧/秒）。撤回即恢复。**别只凭"看着合理"就改这个值。** */
         .buffer_size = 1024,
     };
     esp_http_client_handle_t cli = esp_http_client_init(&cfg);
     if (cli == NULL) {
         camera_release(&fr);
+        close_if_idle();
         return ESP_FAIL;
     }
     /* 直接用字节流 POST，不套 JSON —— JPEG 是二进制，套 base64 要多花 33% 带宽 */
@@ -437,6 +665,8 @@ esp_err_t camera_post_frame(const char *base_url, const char *device, bool save)
     int code = esp_http_client_get_status_code(cli);
     esp_http_client_cleanup(cli);
     camera_release(&fr);
+
+    close_if_idle();
 
     if (ret != ESP_OK || code != 200) {
         /* 推流失败不该刷屏：画面丢一帧而已，5 帧/秒下用户根本看不出来 */
@@ -452,11 +682,15 @@ esp_err_t camera_save_to_sd(char *name_out, size_t name_len)
         return ESP_ERR_INVALID_STATE;
     }
     if (!camera_ready() && camera_init(NULL, NULL) != ESP_OK) {
+        /* init 自己失败时内部已经 close_all()（s_fd 必为 -1），这里调一下只是
+         * 为了把"每条返回路径都关"这个不变量写全 —— 不依赖实现细节。 */
+        close_if_idle();
         return ESP_ERR_INVALID_STATE;
     }
     camera_frame_t fr = {0};
     esp_err_t ret = camera_capture(&fr);
     if (ret != ESP_OK) {
+        close_if_idle();
         return ret;
     }
 
@@ -477,16 +711,19 @@ esp_err_t camera_save_to_sd(char *name_out, size_t name_len)
         camera_release(&fr);
         if (wrote != fr.len) {
             ESP_LOGE(TAG, "写 %s 只成功 %u/%u 字节", path, (unsigned)wrote, (unsigned)fr.len);
+            close_if_idle();
             return ESP_FAIL;
         }
         if (name_out && name_len) {
             strlcpy(name_out, name, name_len);
         }
         ESP_LOGI(TAG, "已存 %s（%u 字节）", path, (unsigned)fr.len);
+        close_if_idle();
         return ESP_OK;
     }
     camera_release(&fr);
     ESP_LOGE(TAG, "找不到可用文件名");
+    close_if_idle();
     return ESP_FAIL;
 }
 

@@ -156,6 +156,19 @@ void wifi_link_start(void)
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg));
     ESP_ERROR_CHECK(esp_wifi_start());
 
+    /* ⚠️ **试过 WIFI_PS_NONE（关省电），实测反而更差，已撤回。**
+     *
+     * 理由本来是：STA 默认 WIFI_PS_MIN_MODEM 会在 DTIM 间隔里睡眠，
+     * 每个来回多等一个 beacon 周期（~100ms），而推流一帧 27KB 只跑到约 57 KB/s
+     * （≈5760B 发送窗口 / ~100ms），量级吻合 —— 看着像省电的锅。
+     *
+     * 但真机 A/B（2026-09-28）：加上 `esp_wifi_set_ps(WIFI_PS_NONE)` 之后，
+     * 推流实测从 ~2 帧/秒 **掉到 0.07 帧/秒**，板端同时出现
+     * `link DOWN ok=41 fail=14 dropped=35`。modem 常开让电流上升，
+     * 这块板子同时挂着 DVP 摄像头 + LCD + WiFi，USB 供电下可能反而拖垮了链路。
+     * **结论：省电不是瓶颈，别关它。** 撤回后帧率恢复到 ~2 帧/秒。
+     */
+
     /* PROPOSAL §1.8 验收 #10：开机自检一行，看清配置到底从哪来。
      * 设备名打的是**生效 id**（留空时按 MAC 生成的 rw1-XXXX），
      * 因为那才是仪表盘上会出现的名字 —— 打印空串会让人以为没配好。 */

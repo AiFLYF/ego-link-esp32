@@ -43,11 +43,12 @@ static const char *TAG = "transport";
 
 #define TX_PATH "/api/telemetry"
 
-/* Generous on purpose: a slow LAN should not be mistaken for a dead server.
- * The AI reply itself no longer needs a long timeout — the server answers the
- * ask frame immediately ("正在思考…") and delivers the real text on a later
- * frame, so there is nothing here to wait 8 s for. */
-#define TX_HTTP_TIMEOUT_MS 5000
+/* 上报现在跑在独立的 upload_task 里（见下面 tx_job_t 那段注释），**不再阻塞界面**，
+ * 所以这个超时只决定"这一批数据什么时候被放弃"，可以收得很短：
+ * 同网段一次往返是毫秒级，1 s 都等不到就说明链路真有问题 ——
+ * 丢掉这一批、下一批重来即可（单槽邮箱本来就允许丢帧）。
+ * 原来这里是 5000，配合"同步跑在采样循环里"的旧写法，一次卡顿要拖满 5 秒。 */
+#define TX_HTTP_TIMEOUT_MS 1000
 
 /* Give up on a queued question after this many failed uploads (≈ this many
  * telemetry periods) instead of retrying forever. */
@@ -173,13 +174,79 @@ typedef enum {
 /* sd_rm 要删的文件名（字符串参数，和 set_config 一样先用静态存下来） */
 static char s_rm_name[64];
 
-/* 实时画面开关。开了之后采样循环会按 CAM_STREAM_EVERY_TICKS 推帧给服务器。
- * **默认关**：推一帧要占 WiFi 约 10~20 KB，而且 camera_post_frame() 是阻塞的
- * （一次约 100 ms），会占住采样循环 —— 所以做成按需开启，不用时零开销。 */
-#define CAM_STREAM_EVERY_TICKS 50      /* 10ms/拍 → 50 拍 = 500ms ≈ 2 帧/秒 */
+/* 实时画面开关。开了之后 upload_task 会按 s_cam_interval 推帧给服务器。
+ * **默认关**：推一帧要占 WiFi 约 27 KB（OV3660 的 JPEG 只有 1280x720 这一个档位），
+ * 而且 camera_post_frame() 是阻塞的 —— 所以做成按需开启，不用时零开销。 */
+#define CAM_STREAM_EVERY_TICKS 50      /* 10ms/拍 → 50 拍 = 500ms ≈ 2 帧/秒（默认档） */
+/* 帧率上限。网页上那个「帧率」选择器改的就是它（`cam_stream` 命令带 fps 参数）。
+ * 卡在 10 是因为**板子这边到不了更高**：一帧要"等帧 + 开一条 TCP + POST 27 KB"，
+ * 实测能稳定跑到的量级是每秒几帧；写大了只会让 upload_task 一直忙，
+ * 白占 CPU 与 WiFi 带宽，画面反而更卡。 */
+#define CAM_STREAM_FPS_MAX     10
 static volatile bool s_cam_stream = false;
 static bool s_cam_on = false;
+static uint16_t s_cam_fps = 2;         /* 当前帧率，1..CAM_STREAM_FPS_MAX */
+static TickType_t s_cam_interval = CAM_STREAM_EVERY_TICKS;
 static TickType_t s_cam_last;
+/* cam_stream 带的 JPEG 画质（1..100）。0 = 这次没传，保持 camera 里的当前值。
+ * 值本身存在 camera.c（s_quality），这里只是"解析到执行"之间的搬运。 */
+static int s_cam_quality;
+
+/* ---------------- 上报解耦：单槽邮箱 ---------------------------------------
+ *
+ * 背景（用户 2026-09-27 反馈"板子很卡、移动都要等几秒才反应"）：
+ * post_batch() 原来是在采样循环里**同步**调用的，网络一慢（实测板端一次
+ * POST 要 1.4 s，超时上限 5 s）整个采样循环就停住 —— s_st 不更新，
+ * ui_timer_cb 读到的一直是旧值，于是姿态球和读数几秒才动一次。
+ *
+ * 现在改成：采样循环只负责"攒够一批 → 丢进邮箱"，立刻返回继续采样；
+ * 另起一个 upload_task 专门发 HTTP。网络再慢也碰不到界面。
+ *
+ * 为什么是**单槽**而不是队列：网络慢的时候宁可丢帧也不积压 ——
+ * 队列会让"网络恢复后补发一堆过期数据"，对课堂演示毫无意义，还白占内存。
+ * 丢掉的批次数记在 s_tx_dropped 里备查。 */
+typedef struct {
+    float    xyz[TX_BATCH_MAX][3];
+    uint16_t n;
+    bool     ask;
+    bool     had_result;
+    char     cmd_rid[TRANSPORT_CMD_ID_LEN];
+} tx_job_t;
+
+static tx_job_t          s_tx_slot;
+static volatile bool     s_tx_ready;
+static SemaphoreHandle_t s_tx_mutex;
+static SemaphoreHandle_t s_tx_wake;
+static volatile uint32_t s_tx_dropped;
+
+static void tx_job_post(const tx_job_t *job)
+{
+    if (xSemaphoreTake(s_tx_mutex, pdMS_TO_TICKS(50)) != pdTRUE) {
+        s_tx_dropped++;                 /* 拿不到锁：宁可丢帧，绝不卡采样 */
+        return;
+    }
+    if (s_tx_ready) {
+        s_tx_dropped++;                 /* 上一批还没发走 → 用新的覆盖 */
+    }
+    s_tx_slot = *job;
+    s_tx_ready = true;
+    xSemaphoreGive(s_tx_mutex);
+    xSemaphoreGive(s_tx_wake);
+}
+
+static bool tx_job_take(tx_job_t *out)
+{
+    if (xSemaphoreTake(s_tx_mutex, portMAX_DELAY) != pdTRUE) {
+        return false;
+    }
+    const bool ok = s_tx_ready;
+    if (ok) {
+        *out = s_tx_slot;
+        s_tx_ready = false;
+    }
+    xSemaphoreGive(s_tx_mutex);
+    return ok;
+}
 
 static char s_cfg_ssid[NET_SSID_MAX];
 static char s_cfg_pass[NET_PASS_MAX];
@@ -539,8 +606,26 @@ static void run_command(cmd_kind_t kind, const char *id,
         s_cmd.started = xTaskGetTickCount();
         s_cmd.n = 0;
         s_cam_stream = s_cam_on;
-        snprintf(s_cmd.note, sizeof(s_cmd.note), "实时画面已%s",
-                 s_cam_stream ? "开启（约 2 帧/秒）" : "关闭");
+        /* 只有推流时才让摄像头一直开着；关推流会**立刻** deinit。
+         * 不这样的话，拍过一次照（或开过一次推流）之后 fd 就一直留着，
+         * DVP 持续往 PSRAM 写帧，和 LVGL / IMU / WiFi 抢带宽 ——
+         * 用户反馈的"拍完照板子就变卡、重启才恢复"就是这个（2026-09-27）。 */
+        camera_set_keep_open(s_cam_stream);
+        /* 画质（可选）。0 = 这次没传，保持 camera 里的当前值。
+         * 要在开始取帧之前设好 —— 它是编码器参数。 */
+        if (s_cam_quality > 0) {
+            camera_set_quality(s_cam_quality);
+        }
+        /* 帧率在**这里**换算成 tick，推帧那一侧只做一次比较 ——
+         * 每帧都算一遍除法没必要，而且 tick 换算依赖 configTICK_RATE_HZ，
+         * 集中在一处更好核对。 */
+        s_cam_interval = pdMS_TO_TICKS(1000u / (uint32_t)s_cam_fps);
+        if (s_cam_stream) {
+            snprintf(s_cmd.note, sizeof(s_cmd.note), "实时画面已开启（%u 帧/秒）",
+                     (unsigned)s_cam_fps);
+        } else {
+            snprintf(s_cmd.note, sizeof(s_cmd.note), "实时画面已关闭");
+        }
         status_lock();
         s_st.cmd_count++;
         status_unlock();
@@ -708,13 +793,14 @@ static bool sanitize3(float x, float y, float z, float out[3])
  * with 15 significant digits, so a float 0.012f comes out as
  * "0.0120000001634057" and a 50-sample batch balloons to ~2.7 kB. "%.3f" gives
  * exactly the precision the analysis needs (1 mg) in a third of the bytes. */
-static char *build_body(int n, bool ask, const char *source)
+static char *build_body(const tx_job_t *job, const char *source)
 {
+    const int n = (int)job->n;
     if (n <= 0) {
         return NULL;
     }
     size_t cap = 256 + (size_t)n * 28 + strlen(s_ask_text) * 2 + 64
-                 + (s_cmd.ready ? (320 + CMD_NOTE_LEN + 24) : 0) + 32
+                 + (job->had_result ? (320 + CMD_NOTE_LEN + 24) : 0) + 32
                  + strlen(s_device) * 6 + 24;   /* "dev" 字段：设备名是用户输入，转义后可能翻倍 */
     char *buf = malloc(cap);
     if (buf == NULL) {
@@ -744,7 +830,7 @@ static char *build_body(int n, bool ask, const char *source)
             return NULL;
         }
         off += snprintf(buf + off, cap - (size_t)off, "%s[%.3f,%.3f,%.3f]",
-                        i ? "," : "", s_batch[i][0], s_batch[i][1], s_batch[i][2]);
+                        i ? "," : "", job->xyz[i][0], job->xyz[i][1], job->xyz[i][2]);
     }
 
     if ((size_t)off + 128 > cap) {
@@ -753,7 +839,7 @@ static char *build_body(int n, bool ask, const char *source)
     }
     off += snprintf(buf + off, cap - (size_t)off,
                     "],\"x\":%.3f,\"y\":%.3f,\"z\":%.3f,\"source\":\"",
-                    s_batch[n - 1][0], s_batch[n - 1][1], s_batch[n - 1][2]);
+                    job->xyz[n - 1][0], job->xyz[n - 1][1], job->xyz[n - 1][2]);
 
     const char *src = (source != NULL && source[0]) ? source : "?";
     if (!json_escape_append(buf, cap, &off, src) ||
@@ -761,9 +847,9 @@ static char *build_body(int n, bool ask, const char *source)
         free(buf);
         return NULL;
     }
-    off += snprintf(buf + off, cap - (size_t)off, "\",\"ask\":%s", ask ? "true" : "false");
+    off += snprintf(buf + off, cap - (size_t)off, "\",\"ask\":%s", job->ask ? "true" : "false");
 
-    if (ask) {
+    if (job->ask) {
         if ((size_t)off + 16 > cap) {
             free(buf);
             return NULL;
@@ -776,8 +862,11 @@ static char *build_body(int n, bool ask, const char *source)
         off += snprintf(buf + off, cap - (size_t)off, "\"");
     }
 
-    /* 远程指令的执行结果（带同一个 request_id 回传给服务器） */
-    if (s_cmd.ready) {
+    /* 远程指令的执行结果（带同一个 request_id 回传给服务器）。
+     * 判断依据用 job 的快照，而不是当前的 s_cmd.ready —— POST 现在跑在独立任务里，
+     * 等真正发出去时 s_cmd 可能已经被新命令覆盖了。rid 对不上就说明快照过期，
+     * 这一批不带结果（新结果会在下一批带上）。 */
+    if (job->had_result && strcmp(s_cmd.rid, job->cmd_rid) == 0) {
         if ((size_t)off + 288 + CMD_NOTE_LEN + 24 > cap) {
             free(buf);
             return NULL;
@@ -892,6 +981,20 @@ static void apply_response(const char *body, size_t len)
                         const cJSON *v = cJSON_IsObject(jparams)
                             ? cJSON_GetObjectItemCaseSensitive(jparams, "on") : NULL;
                         s_cam_on = cJSON_IsTrue(v);
+                        /* 帧率（可选）：网页上的「帧率」选择器传进来。
+                         * **没传就沿用当前值** —— 老页面只传 on，行为一字不变。
+                         * 夹在 1..CAM_STREAM_FPS_MAX，挡住网页传来的 0 或离谱值。 */
+                        int fps = json_int(jparams, "fps", 0);
+                        if (fps > 0) {
+                            if (fps > CAM_STREAM_FPS_MAX) {
+                                fps = CAM_STREAM_FPS_MAX;
+                            }
+                            s_cam_fps = (uint16_t)fps;
+                        }
+                        /* JPEG 画质（可选）。**这是唯一能改帧大小的旋钮** ——
+                         * OV3660 的 JPEG 分辨率固定 1280x720，所以"调分辨率"做不到。
+                         * 0 表示这次没传，保持 camera 里的当前值。 */
+                        s_cam_quality = json_int(jparams, "quality", 0);
                     } else if (strcmp(jname->valuestring, "sd_ls") == 0) {
                         kind = CMD_SD_LS;
                     } else if (strcmp(jname->valuestring, "sd_rm") == 0) {
@@ -1003,7 +1106,7 @@ static esp_err_t http_event_handler(esp_http_client_event_t *evt)
     return ESP_OK;
 }
 
-static bool post_batch(int n, bool ask)
+static bool post_batch(const tx_job_t *job)
 {
     char url[NET_URL_MAX + 16];
     snprintf(url, sizeof(url), "%s%s", s_url, TX_PATH);
@@ -1013,7 +1116,7 @@ static bool post_batch(int n, bool ask)
     strlcpy(source, s_st.source, sizeof(source));
     status_unlock();
 
-    char *body = build_body(n, ask, source);
+    char *body = build_body(job, source);
     if (body == NULL) {
         ESP_LOGE(TAG, "out of memory building telemetry body");
         return false;
@@ -1053,7 +1156,7 @@ static bool post_batch(int n, bool ask)
             ESP_LOGW(TAG, "response truncated at %d bytes (raise TX_RESP_BUF)", s_acc.len);
         }
         apply_response(s_acc.buf, (size_t)s_acc.len);
-        if (ask) {
+        if (job->ask) {
             ESP_LOGI(TAG, "AI reply: %s", s_acc.buf);
         }
         return true;
@@ -1112,7 +1215,6 @@ static void transport_task(void *arg)
 
     TickType_t last_post = xTaskGetTickCount();
     int n = 0;
-    char last_activity[TRANSPORT_ACTIVITY_LEN] = "";
     const char *last_source = "?";   /* IMU 型号，只在变化时才写进状态 */
 
     while (true) {
@@ -1157,14 +1259,6 @@ static void transport_task(void *arg)
                  * 节奏：每 SD_LOG_EVERY_SAMPLES 个样本一行（100 Hz 下 ≈ 500 ms）。
                  * 注意这里在 `n++` **之后**，n 从 1 开始 —— 拿 TX_BATCH_MAX(128)
                  * 当模数就永远等不到：每批才 ~50 个样本就重置了（第一版就是这么错的）。 */
-                /* 实时画面：**按需**推帧。camera_post_frame() 是阻塞的（约 100ms），
-                 * 所以只在用户开了"实时画面"时才走，不用时零开销。
-                 * 节拍按 tick 数而不是样本数 —— 推帧慢下来时样本数会少，tick 不会。 */
-                if (s_cam_stream && (xTaskGetTickCount() - s_cam_last) >= CAM_STREAM_EVERY_TICKS) {
-                    s_cam_last = xTaskGetTickCount();
-                    camera_post_frame(s_url, s_device, false);
-                }
-
                 if ((n % SD_LOG_EVERY_SAMPLES) == 0) {
                     char act[32];
                     status_lock();
@@ -1196,108 +1290,21 @@ static void transport_task(void *arg)
 
         const TickType_t now = xTaskGetTickCount();
         if (n > 0 && ((now - last_post) >= s_post_ticks || n >= TX_BATCH_MAX)) {
-            bool ask = s_ask_pending;
-
-            /* ⚠️ 必须在 post_batch **之前**把"这一帧要发出去的结果"记下来。
+            /* 把这一批**快照**进单槽邮箱，然后立刻回去采样 ——
+             * HTTP 交给 upload_task 去发，网络再慢也卡不到界面。
              *
-             * 为什么：post_batch() 内部会解析服务器回复，而 LED 类指令是**同步执行**的
-             * —— run_command() 直接调 finish_command()，于是 s_cmd.ready 在 post_batch
-             * 返回**之前**就被设成了 true。原来的写法是 post_batch 之后无条件清 ready，
-             * 结果"刚设好的结果"在同一轮里被立刻清掉，**永远发不出去**，
-             * 服务器只能判超时（现象：灯确实闪了，网页上却显示超时/失败）。
-             * capture_once 不中招，因为它只 start_capture()，结果要等 200ms 后由采样
-             * 循环补上 —— 那时早过了清除点。所以这个 bug 只打 LED 指令。
-             * （2026-09-23 真机实测：capture_once 往返 782ms 正常，led_blink / led_set
-             *   连续 6 次全部 10 秒超时，就是这个原因。）
-             *
-             * 按 rid 精确清除而不是按布尔值：同一帧里完全可能"发走旧结果 + 收到新指令
-             * 并立刻完成"，只比对布尔会把新结果一起清掉。 */
-            char sent_rid[TRANSPORT_CMD_ID_LEN];
-            const bool had_result = s_cmd.ready;
-            sent_rid[0] = '\0';
-            if (had_result) {
-                strlcpy(sent_rid, s_cmd.rid, sizeof(sent_rid));
+             * 邮箱是覆盖式的：上一批还没发走就用新的盖掉（宁可丢帧不积压）。
+             * 指令结果按 rid 快照：POST 期间 s_cmd 可能被新命令覆盖，
+             * 所以带上 rid，发的时候再比对一次（见 upload_task）。 */
+            tx_job_t job = {0};
+            memcpy(job.xyz, s_batch, (size_t)n * sizeof(s_batch[0]));
+            job.n = (uint16_t)n;
+            job.ask = s_ask_pending;
+            job.had_result = s_cmd.ready;
+            if (job.had_result) {
+                strlcpy(job.cmd_rid, s_cmd.rid, sizeof(job.cmd_rid));
             }
-
-            /* 没网就只跳过上报：采样和界面刷新照常（见任务开头那段注释）。
-             * 缓冲区在这个块的末尾照常清零，所以离线不会把样本越攒越多。 */
-            const bool wifi_up = wifi_link_is_up();
-            bool ok = false;
-            if (wifi_up) {
-                ok = post_batch(n, ask);
-            }
-
-            /* 结果与按键计数只在成功送达后才清；失败就下一帧重发
-             * （与 ask 的重试策略一致，不丢东西） */
-            if (ok) {
-                if (had_result && strcmp(s_cmd.rid, sent_rid) == 0) {
-                    s_cmd.ready = false;
-                }
-                s_btn_pending = 0;
-            }
-
-            status_lock();
-            s_st.batch_last = (uint16_t)n;
-            s_st.orient = (uint8_t)accel_input_get_orientation();
-            /* P0-2：写**屏幕坐标系**的值（即 s_batch 里已 map 过的），不是原始传感器值。
-             * ui.c 的姿态球直接按 x_g/y_g 放点、不做二次翻转，所以这里必须是屏幕系——
-             * 否则「板子屏幕上看到的倾斜方向」与「网页仪表盘」会相反。
-             * 这正是 accel_input_map_to_screen 存在的唯一理由（见 accel_input.h）。
-             * 顺带把原来的每样本更新收敛成每上报一次（P1-7）。 */
-            s_st.x_g = s_batch[n - 1][0];
-            s_st.y_g = s_batch[n - 1][1];
-            s_st.z_g = s_batch[n - 1][2];
-            strlcpy(s_st.source, last_source, sizeof(s_st.source));
-            s_st.cmd_state = s_cmd.state;
-            if (s_cmd.rid[0] != '\0') {
-                strlcpy(s_st.cmd_id, s_cmd.rid, sizeof(s_st.cmd_id));
-            }
-            char act[TRANSPORT_ACTIVITY_LEN];
-            strlcpy(act, s_st.activity, sizeof(act));
-            const bool reply_changed =
-                (s_st.reply[0] != '\0' && strcmp(s_st.reply, s_last_reply) != 0);
-            if (reply_changed) {
-                strlcpy(s_last_reply, s_st.reply, sizeof(s_last_reply));
-            }
-            status_unlock();
-
-            /* 服务器/AI 的回复变了就闪两下 —— 这是"远端反馈真的回来了"的物理信号 */
-            if (reply_changed) {
-                led_feedback_play(LED_FB_REPLY);
-            }
-
-            /* A button press must never be silently swallowed: keep the flag and
-             * retry on the next frame, but stop after a few tries. */
-            if (ask) {
-                if (ok) {
-                    s_ask_pending = false;
-                    s_ask_attempts = 0;
-                } else if (++s_ask_attempts >= TX_ASK_MAX_ATTEMPTS) {
-                    ESP_LOGW(TAG, "ask dropped after %d failed uploads", s_ask_attempts);
-                    s_ask_pending = false;
-                    s_ask_attempts = 0;
-                } else {
-                    ESP_LOGW(TAG, "ask upload failed, retry %d/%d",
-                             s_ask_attempts, TX_ASK_MAX_ATTEMPTS);
-                }
-            }
-
-            if (ok && strcmp(act, last_activity) != 0) {
-                strlcpy(last_activity, act, sizeof(last_activity));
-                ESP_LOGI(TAG, "activity: %s (x=%+.2f y=%+.2f z=%+.2f)",
-                         act, s_batch[n - 1][0], s_batch[n - 1][1], s_batch[n - 1][2]);
-            }
-
-            /* Heartbeat every 20 uploads (10 s at the default period). This used
-             * to key off "activity changed 20 times", so whenever the board sat
-             * still the counter stayed 0 and it logged on every single frame. */
-            if ((++s_post_count % 20) == 0) {
-                status_lock();
-                uint32_t okc = s_st.posts_ok, failc = s_st.posts_fail;
-                status_unlock();
-                ESP_LOGI(TAG, "link %s ok=%u fail=%u batch=%d", ok ? "OK" : "DOWN",
-                         (unsigned)okc, (unsigned)failc, n);
-            }
+            tx_job_post(&job);
 
             n = 0;
             last_post = xTaskGetTickCount();
@@ -1307,12 +1314,132 @@ static void transport_task(void *arg)
     }
 }
 
+/* ---------------------------------------------------------------------------
+ * 上报任务：把邮箱里的批次发出去，并处理服务器的回复。
+ *
+ * 这里集中了原来塞在采样循环里的全部"发完之后才做的事" ——
+ * 清 s_cmd.ready、ask 重试、LED 反馈、活动变化日志、心跳日志。
+ * 它们本来就只依赖"这一批到底发出去了没有"，跟采样节拍无关。
+ *
+ * 实时画面推帧也搬到这里：camera_post_frame() 是阻塞的（约 100 ms），
+ * 留在采样循环里会每 500 ms 拖慢一次采样。所以 take 用带超时的版本，
+ * 超时的那一轮正好用来检查要不要推帧。
+ * ------------------------------------------------------------------------- */
+static void upload_task(void *arg)
+{
+    (void)arg;
+    tx_job_t job;
+    char last_activity[TRANSPORT_ACTIVITY_LEN] = "";
+
+    while (true) {
+        if (xSemaphoreTake(s_tx_wake, pdMS_TO_TICKS(100)) != pdTRUE) {
+            if (s_cam_stream &&
+                (xTaskGetTickCount() - s_cam_last) >= s_cam_interval) {
+                s_cam_last = xTaskGetTickCount();
+                camera_post_frame(s_url, s_device, false);
+            }
+            continue;
+        }
+
+        if (!tx_job_take(&job)) {
+            continue;
+        }
+
+        /* 没网就只跳过上报：采样和界面刷新照常（见 transport_task 开头那段注释）。 */
+        const bool wifi_up = wifi_link_is_up();
+        bool ok = false;
+        if (wifi_up) {
+            ok = post_batch(&job);
+        }
+
+        /* 结果与按键计数只在成功送达后才清；失败就下一批重发
+         * （与 ask 的重试策略一致，不丢东西）。
+         * 按 rid 精确比对：POST 期间可能已经有新命令覆盖了 s_cmd，
+         * 那时 s_cmd.rid != job.cmd_rid，**绝不能清** —— 那清掉的是别人的结果。 */
+        if (ok) {
+            if (job.had_result && strcmp(s_cmd.rid, job.cmd_rid) == 0) {
+                s_cmd.ready = false;
+            }
+            s_btn_pending = 0;
+        }
+
+        status_lock();
+        s_st.batch_last = job.n;
+        s_st.orient = (uint8_t)accel_input_get_orientation();
+        /* 用这一批的**最后一个样本**对齐屏幕上的值（屏幕系，见 accel_input_map_to_screen）。
+         * 采样循环那边每 5 个样本也会刷一次（20 Hz，让球跟手），这里是"发完一批"的对齐点。 */
+        s_st.x_g = job.xyz[job.n - 1][0];
+        s_st.y_g = job.xyz[job.n - 1][1];
+        s_st.z_g = job.xyz[job.n - 1][2];
+        s_st.cmd_state = s_cmd.state;
+        if (s_cmd.rid[0] != '\0') {
+            strlcpy(s_st.cmd_id, s_cmd.rid, sizeof(s_st.cmd_id));
+        }
+        char act[TRANSPORT_ACTIVITY_LEN];
+        strlcpy(act, s_st.activity, sizeof(act));
+        const bool reply_changed =
+            (s_st.reply[0] != '\0' && strcmp(s_st.reply, s_last_reply) != 0);
+        if (reply_changed) {
+            strlcpy(s_last_reply, s_st.reply, sizeof(s_last_reply));
+        }
+        status_unlock();
+
+        /* 服务器/AI 的回复变了就闪两下 —— 这是"远端反馈真的回来了"的物理信号 */
+        if (reply_changed) {
+            led_feedback_play(LED_FB_REPLY);
+        }
+
+        /* A button press must never be silently swallowed: keep the flag and
+         * retry on the next frame, but stop after a few tries. */
+        if (job.ask) {
+            if (ok) {
+                s_ask_pending = false;
+                s_ask_attempts = 0;
+            } else if (++s_ask_attempts >= TX_ASK_MAX_ATTEMPTS) {
+                ESP_LOGW(TAG, "ask dropped after %d failed uploads", s_ask_attempts);
+                s_ask_pending = false;
+                s_ask_attempts = 0;
+            } else {
+                ESP_LOGW(TAG, "ask upload failed, retry %d/%d",
+                         s_ask_attempts, TX_ASK_MAX_ATTEMPTS);
+            }
+        }
+
+        if (ok && strcmp(act, last_activity) != 0) {
+            strlcpy(last_activity, act, sizeof(last_activity));
+            ESP_LOGI(TAG, "activity: %s (x=%+.2f y=%+.2f z=%+.2f)",
+                     act, job.xyz[job.n - 1][0], job.xyz[job.n - 1][1], job.xyz[job.n - 1][2]);
+        }
+
+        /* Heartbeat every 20 uploads (10 s at the default period).
+         * 顺带报出被覆盖丢掉的批次数 —— 它是"网络跟不上采样"的唯一可见信号。 */
+        if ((++s_post_count % 20) == 0) {
+            status_lock();
+            uint32_t okc = s_st.posts_ok, failc = s_st.posts_fail;
+            status_unlock();
+            ESP_LOGI(TAG, "link %s ok=%u fail=%u batch=%u dropped=%u",
+                     ok ? "OK" : "DOWN", (unsigned)okc, (unsigned)failc,
+                     (unsigned)job.n, (unsigned)s_tx_dropped);
+        }
+    }
+}
+
 void transport_start(void)
 {
     if (s_lock == NULL) {
         s_lock = xSemaphoreCreateMutex();
     }
+    /* 上报邮箱：一把互斥锁保护单槽，一个二值信号量负责唤醒。
+     * 顺序很重要 —— 两个都在起任务之前建好，否则 upload_task 可能拿到 NULL 句柄。 */
+    if (s_tx_mutex == NULL) {
+        s_tx_mutex = xSemaphoreCreateMutex();
+    }
+    if (s_tx_wake == NULL) {
+        s_tx_wake = xSemaphoreCreateBinary();
+    }
+    /* 采样任务优先级 5、上报任务 4：采样永远优先，网络再慢也不许反过来挤采样。 */
     xTaskCreatePinnedToCore(transport_task, "transport", 8192, NULL, 5, NULL, 0);
+    xTaskCreatePinnedToCore(upload_task, "upload", 6144, NULL, 4, NULL, 0);
 }
 
 void transport_reload_config(void)

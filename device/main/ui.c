@@ -640,7 +640,16 @@ static void set_offline_pulse(bool on)
     }
 }
 
-/* 姿态球平滑跟随：把生硬的 2Hz 跳变变成 260ms 的滑动 */
+/* 姿态球平滑跟随。
+ *
+ * 时长**不能太长**：ui_timer_cb 每 33 ms 调一次本函数，只要位置变了就重建动画，
+ * 所以动画几乎永远走不完 —— 等效行为是"每 33 ms 走掉剩余距离的 ease_out(33/时长)"。
+ * 260 ms 时 33 ms 处只走 38%（等效时间常数 ~87 ms），球看着就是"慢慢爬"、
+ * 跟不上手；降到 60 ms 后时间常数 ~44 ms，跟手得多，而且每帧重建动画
+ * 带来的内存分配与动画表操作也便宜得多。
+ * （用户 2026-09-27 反馈"移动都要等几秒才能反应"——这是其中一个叠加因素。） */
+#define UI_BUBBLE_ANIM_MS 60
+
 static void move_bubble(int tx, int ty)
 {
     if (tx == s_bubble_tx && ty == s_bubble_ty) {
@@ -650,7 +659,7 @@ static void move_bubble(int tx, int ty)
     lv_anim_t a;
     lv_anim_init(&a);
     lv_anim_set_var(&a, s_bubble);
-    lv_anim_set_duration(&a, 260);
+    lv_anim_set_duration(&a, UI_BUBBLE_ANIM_MS);
     lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
     lv_anim_set_exec_cb(&a, anim_translate_x);
     lv_anim_set_values(&a, lv_obj_get_style_translate_x(s_bubble, 0), tx);
@@ -658,7 +667,7 @@ static void move_bubble(int tx, int ty)
 
     lv_anim_init(&a);
     lv_anim_set_var(&a, s_bubble);
-    lv_anim_set_duration(&a, 260);
+    lv_anim_set_duration(&a, UI_BUBBLE_ANIM_MS);
     lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
     lv_anim_set_exec_cb(&a, anim_translate_y);
     lv_anim_set_values(&a, lv_obj_get_style_translate_y(s_bubble, 0), ty);

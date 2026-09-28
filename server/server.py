@@ -34,6 +34,8 @@ import json
 import math
 import os
 import queue
+import socket
+import sys
 import threading
 import time
 import urllib.request
@@ -54,10 +56,20 @@ LLM_TIMEOUT = 25.0        # 大模型请求超时（后台线程里等，不影�
 MAX_BATCH = 400           # 单次 POST 最多接受的样本数（防止畸形/恶意负载）
 BOARD_REPLY_MAX = 512     # 回传板端的回复字节上限（UTF-8 安全截断）
 
+# 仪表盘自托管字体白名单（详见 Handler._send_vendor_font）。字体名来自 URL，
+# 所以不放正则、只放**逐字写死**的文件名 —— 这是最难被绕过的白名单。
+FONT_FILES = ("sora-400.woff2", "sora-600.woff2", "sora-700.woff2", "sora-800.woff2",
+              "plexmono-400.woff2", "plexmono-500.woff2", "plexmono-600.woff2")
+
 STEP_MIN_G = 0.25         # 计步：高出窗口均值的幅度阈值（g）
 STEP_REFRACTORY_S = 0.30  # 计步：两步之间的最小间隔（秒）
 DT_NOMINAL = 0.01         # 标称采样间隔（对应板端 CONFIG_RW1_SAMPLE_PERIOD_MS=10）
 DT_TRUST_MAX = 0.05       # 超过这个推断间隔就认为该帧晚到了、时间轴不可信
+# 下界：dt_est = 两批到达间隔 / 本批样本数，**批越小这个推算越不可信**。
+# 板端上报解耦后（2026-09-28），网络一慢就丢帧、下一批样本数很少，
+# (间隔 / 样本数) 能掉到几毫秒 —— sample_hz 直接飘到 311（板子标称才 100）。
+# 它是网页上直接显示的字段，飘高会误导人，所以两头都要钳。
+DT_TRUST_MIN = 0.008      # 8 ms → 125 Hz，给标称的 100 Hz 留 25% 余量
 MOTION_STD = 0.06         # "算得上在动"的短窗标准差阈值（g）
 SHAKE_ZCR = 3.5           # 晃动判定：|a| 起伏频率高于该值（Hz）。步行 1.5~2.5Hz，
                           # 晃动 3~8Hz —— 只靠幅度分不开两者（走路也有 0.5g 起伏），
@@ -78,6 +90,18 @@ CMD_NAMES = ("capture_once", "led_blink", "led_set", "set_orient",
 
 LED_MAX_BLINKS = 12       # 一次 led_blink 最多闪几下（板端也会再夹一道）
 LED_PATTERNS = ("alert", "ack", "error")   # led_blink 的语义图案（板端映射到预置图案）
+# 实时画面的帧率上限。**必须和板端 transport.c 的 CAM_STREAM_FPS_MAX 一致** ——
+# 板子一帧要「等帧 + 开一条 TCP + POST 27KB」，实测能稳定跑到的只有每秒几帧，
+# 写大了只是让板端白忙。两边不一致的话，网页上选的值会被静默夹掉、看着像没生效。
+CAM_STREAM_FPS_MAX = 10
+# JPEG 画质的合法范围。**必须和板端 camera.c 的 CAM_JPEG_QUALITY_MIN/MAX 一致。**
+# 画质是**唯一**能改变帧大小的旋钮：OV3660 的 JPEG 分辨率固定 1280x720
+# （驱动格式表 `ov3660.c:73-154` 共 5 档，JPEG 仅一档），所以"调分辨率"做不到。
+CAM_JPEG_QUALITY_MIN = 1
+# ⚠️ 上限是 **63**，不是 100 —— 这是驱动给的合法范围（实测 OV3660：
+# `VIDIOC_QUERY_EXT_CTRL` 返回 1..63、默认 17）。写 100 会让 80/95 这类值
+# 在板端直接被拒（`设置 JPEG 质量 80 失败`），网页上却看着"设置成功了"。
+CAM_JPEG_QUALITY_MAX = 63
 FALL_AUTO_ALERT = True    # 判定跌落时自动下发 LED 告警（远端物理反馈）
 
 ACTIVITY_IDLE = "等待数据…"
@@ -325,8 +349,20 @@ def sanitize_params(name, params):
     if name == "set_orient":
         return {"o": clamp_int(p.get("o"), 0, 15, 0)}
     if name == "cam_stream":
-        # 只有开/关两种状态，布尔化即可（别把任意值透传下去）
-        return {"on": bool(p.get("on"))}
+        # 开/关 + **可选**的帧率（网页上的「帧率」选择器）。
+        # ⚠️ 这里曾经只放行 on，于是 fps 被静默丢掉、网页上选几档都没用
+        # （2026-09-28 实测：四个档位测出来都是 ~1.5 帧/秒）。
+        # **不传就不带这个键** —— 板端是"没传就沿用当前值"，老调用方行为不变。
+        out = {"on": bool(p.get("on"))}
+        if p.get("fps") is not None:
+            out["fps"] = clamp_int(p.get("fps"), 1, CAM_STREAM_FPS_MAX, 2)
+        # JPEG 画质。**这是唯一能改帧大小的旋钮** —— OV3660 的 JPEG 分辨率
+        # 固定 1280x720（驱动格式表里 JPEG 仅一档），所以"调分辨率"做不到，
+        # 只能调画质：调低 → 帧变小 → 上传更快、更省带宽。
+        if p.get("quality") is not None:
+            out["quality"] = clamp_int(p.get("quality"), CAM_JPEG_QUALITY_MIN,
+                                       CAM_JPEG_QUALITY_MAX, 40)
+        return out
     if name == "sd_rm":
         # 文件名：只放行"根目录下的文件名"，不接受路径分隔符 —— 板端还会再拦一道，
         # 但服务端不该把明显越界的东西发下去。长度按板端的 s_rm_name[64] 夹。
@@ -860,6 +896,58 @@ def decimate(seq, maxn):
     return [seq[min(len(seq) - 1, int(i * step))] for i in range(maxn)]
 
 
+def port_already_serving(host, port):
+    """端口上是不是已经有人在应答了？
+
+    ⚠️ Windows 上 `SO_REUSEADDR` 允许**两个进程绑同一个端口**（Unix 不允许），
+    于是"重复启动服务端"不会报错，而是第二个进程静默地抢走一部分请求：
+    表现是**启动横幅明明打出来了，页面却连不上、或者数据一半新一半旧**。
+    2026-09-26 就被这个坑掉了一轮排查（E2E 报"服务端起不来"，可日志里横幅好端端的）。
+
+    所以启动前先探一下，已经有人就**响亮地退出**，别让它变成玄学问题。
+    """
+    probe_host = "127.0.0.1" if host in ("0.0.0.0", "", "::", "*") else host
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(0.6)
+    try:
+        s.connect((probe_host, port))
+        return True                      # 连得上 = 已经有人在那儿
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
+class DashboardServer(ThreadingHTTPServer):
+    """带大 backlog 的 HTTP 服务器。
+
+    ⚠️ `socketserver` 默认 `request_queue_size = 5`，这对本项目的负载**不够**：
+    打开一次仪表盘会**并发**发起十几个连接（6 个字体 + three.min.js + latest +
+    stream + commands + logs），而教室里 20 块板子还在同时 POST 遥测。
+    backlog 一满，内核直接回 ECONNREFUSED —— 浏览器那边看到的是
+    "字体没加载、悄悄退回系统字体"（最阴的一种：页面照样能开，只是字体变了），
+    或者 SSE 断连重试。2026-09-26 用真浏览器 + 假板子复现，一次开页就丢 3 个字体。
+
+    `daemon_threads`：Ctrl-C 时不会被 SSE 长连接卡住不退。
+    `handle_error`：客户端提前断开是**正常现象**（关页面、切设备重连 SSE），
+    不该打一整段 Python 堆栈出来吓用户。
+    """
+
+    daemon_threads = True
+    allow_reuse_address = True
+    request_queue_size = 256
+
+    def handle_error(self, request, client_address):
+        exc = sys.exc_info()[1]
+        # 只吞"连接层面的正常中断"。**不要**写成 `OSError` ——
+        # ConnectionReset/Aborted/BrokenPipe/Timeout 都是它的子类，
+        # 但磁盘写满、文件句柄泄漏这类真错误也是，吞掉就等于把真问题藏了。
+        if isinstance(exc, (ConnectionAbortedError, ConnectionResetError,
+                            BrokenPipeError, TimeoutError)):
+            return                      # 客户端断开，属于正常现象，不打印
+        ThreadingHTTPServer.handle_error(self, request, client_address)
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "RW1/1.1"
     protocol_version = "HTTP/1.1"     # 让板端的 esp_http_client 能复用连接
@@ -868,7 +956,7 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     # ---- helpers ---------------------------------------------------------
-    def _send_vendor_js(self, relpath):
+    def _send_vendor(self, relpath, ctype):
         """只服务仓库里那几个 vendor 文件；路径写死在调用点，不接受外部输入。"""
         full = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                             relpath.replace("/", os.sep))
@@ -879,7 +967,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, json.dumps({"ok": False, "error": str(exc)}))
             return
         self.send_response(200)
-        self.send_header("Content-Type", "text/javascript; charset=utf-8")
+        self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
         # 内容不会变，缓存久一点；不然每次打开页面都要重下 600KB
         self.send_header("Cache-Control", "public, max-age=86400")
@@ -888,6 +976,21 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(data)
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
             pass
+
+    def _send_vendor_font(self, name):
+        """仪表盘用的自托管字体（Sora / IBM Plex Mono）。
+
+        为什么非要自己托管、不走 CDN：教室/局域网经常没有外网，引 CDN 必然白屏；
+        而 `font-family` 里写 "Sora" 却没把字体送到浏览器，等于**静默退回系统字体** ——
+        设计规则明确禁止系统默认无衬线，这种"看着像生效了其实没生效"最要命。
+
+        `name` 来自 URL，所以这里是**真·外部输入**：用白名单卡死，
+        只允许仓库里实际存在的这几个文件名（任何 `..`、斜杠、反斜杠都不在名单里）。
+        """
+        if name not in FONT_FILES:
+            self._send(404, json.dumps({"ok": False, "error": "no such font"}))
+            return
+        self._send_vendor("docs/vendor/fonts/" + name, "font/woff2")
 
     def _send(self, code, body, ctype="application/json; charset=utf-8", extra=None):
         data = body if isinstance(body, bytes) else body.encode("utf-8")
@@ -929,7 +1032,12 @@ class Handler(BaseHTTPRequestHandler):
             # jsonl（含设备名、事件文本）也一并暴露出去。
             # 用仓库里 vendor 的那份，不引 CDN —— 教室/局域网常常没有外网，
             # 引 CDN 必然白屏（配网页当初就是踩过这个才改成内联的）。
-            self._send_vendor_js("docs/vendor/three/build/three.min.js")
+            self._send_vendor("docs/vendor/three/build/three.min.js",
+                              "text/javascript; charset=utf-8")
+        elif path.startswith("/vendor/fonts/"):
+            # 同样是白名单。字体必须真送到浏览器，否则 font-family 会静默回落到
+            # 系统字体 —— 那正是设计规则明令禁止的东西，而且看不出来。
+            self._send_vendor_font(path[len("/vendor/fonts/"):])
         elif path == "/api/devices":
             with LOCK:
                 devs = devices_snapshot()
@@ -940,6 +1048,12 @@ class Handler(BaseHTTPRequestHandler):
             with LOCK:
                 dev = pick_device(clean_device_id(want) if want else None)
                 snap = snapshot(dev)
+                # ⚠️ **必须带上设备列表**：网页的 pull() 是每 100ms 一次，
+                # 而 renderDevices() 在"列表 ≤ 1 台"时会把「设备」区域藏起来。
+                # 早先这里不带 devices，于是多板课堂下那一块会以取数频率疯狂闪烁
+                # （SSE 每 500ms 把它显示出来、/api/latest 每 100ms 又把它藏起来），
+                # 而且大部分时间是不可见的 —— 2026-09-26 用真浏览器才抓到。
+                snap["devices"] = devices_snapshot()
                 snap["samples"] = [[round(t, 2), x, y, z]
                                    for (t, x, y, z) in decimate(dev.samples, 240)]
             self._send(200, json.dumps(snap, ensure_ascii=False))
@@ -1174,7 +1288,7 @@ class Handler(BaseHTTPRequestHandler):
             if prev_post > 0 and len(pts) > 1:
                 dt_est = (now - prev_post) / float(len(pts))
                 dt_est = min(0.6, max(0.002, dt_est))
-                if dt_est > DT_TRUST_MAX:
+                if dt_est > DT_TRUST_MAX or dt_est < DT_TRUST_MIN:
                     dt = st["dt_trusted"] or DT_NOMINAL
                 else:
                     dt = dt_est
@@ -1297,286 +1411,981 @@ class Handler(BaseHTTPRequestHandler):
 # 网页仪表盘
 # --------------------------------------------------------------------------
 DASHBOARD_HTML = """<!doctype html>
-<html lang="zh">
+<!-- data-theme 写在标记里 = 默认明亮（用户 2026-09-26 要求）。
+     下面那个内联脚本会在**首次绘制之前**把它改成用户上次选的那套。 -->
+<html lang="zh-CN" data-theme="light">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Ego Link · 实时仪表盘</title>
+<script>
+/* 主题必须在**首次绘制之前**定下来，否则会先闪一下明亮再跳深色（FOUC）。
+   所以它必须是 head 里第一段内联脚本，不能等 DOMContentLoaded、也不能放外链。 */
+(function(){
+  try {
+    var t = localStorage.getItem("rw1-theme");
+    if (t === "light" || t === "dark") document.documentElement.setAttribute("data-theme", t);
+  } catch (e) { /* 隐私模式读不到 localStorage —— 保持标记里的默认值（明亮） */ }
+})();
+</script>
 <!-- 空 favicon：不写这行浏览器会去请求 /favicon.ico，服务端没有这条路由，
      于是每次打开页面都留一条 404 在控制台（2026-09-23 E2E 抓到的）。 -->
 <link rel="icon" href="data:,">
 <script src="/vendor/three.min.js"></script>
 <style>
 /* ==========================================================================
-   设计语言与开发板屏幕（device/main/ui.c）刻意保持一致：
-   同一套语义色、同一套「圆环 + 姿态球 + 三轴对称条」的表达，
-   现场看板子和看网页看到的是同一个东西。
+   设计令牌（Design Tokens）
+   --------------------------------------------------------------------------
+   这个页面和开发板屏幕（device/main/ui.c）共用一套**语义色含义**：
+   同一台板子、同一时刻，屏幕上和网页上说的是同一件事。
+   但两边的**表现形式**不同 —— 板子是 240x240 的 LVGL 面板，这里是浏览器。
+   所以这里不照抄板端的像素参数，只共享语义，视觉语言另起一套更严格的规则。
+
+   硬性规则（违反即视为 bug）：
+     · 字体：不用 Inter / Roboto / 泛型 sans-serif；标题正文用 Sora，
+       数字代码用 IBM Plex Mono，两者都是**仓库内自托管**的 woff2 ——
+       教室局域网常常没有外网，引 CDN 必然白屏（配网页当初就是踩过这个坑）。
+       中文回落到明确列出的 CJK 字面，而不是让它掉到系统默认字体。
+     · 颜色：全部 OKLCH，按角色命名。主色**只有青绿一个**，只出现在
+       「可操作 / 系统活着」的地方；活动语义色只用于数据本身。
+       底色不是纯黑（纯黑会让所有层级糊成一团），文字不是纯白。
+     · 圆角：全站只有 3 个值（6 / 10 / 14）。禁止到处 16px。
+       圆形（状态点、气泡球、圆环）是形状不是圆角，不占额度。
+     · 间距：8px 基准网格 —— 4/8/12/16/24/32/48/64/96，没有别的值。
+     · 字号：正文 15px，标题按 1.25~1.5 倍逐级步进，
+       hero 48px = 正文的 3.2 倍（规则要求 ≥ 3 倍）。
+     · 阴影：按层级分三档，不是一刀切的大模糊。
+
+   ⚠️ **这一套已冻结**（2026-09-26 用户看过截图后确认："后面的都按照这个来设置"）。
+   以后新增页面 / 卡片**照抄这套令牌**，不要另起一套视觉语言。
+   改完必须跑 `node tools/e2e_design.js`（19 条断言，含离线空状态与 320px 窄屏）——
+   设计规则是硬约束，只靠看截图不算验证。
+   细节与踩过的坑见 `.workbuddy-ai/memory/2026-09-26.md`。
+
+   ⚠️ 关于"字号不要太大"（2026-09-26 第二版）：
+   第一版老老实实按 15 → 19 → 24 → 32 → 48 铺了五级，结果**九个标题同时在喊**
+   （3 个区域标题 32px + 6 个卡片标题 24px），一屏里没有重点，看着就是"乱"。
+   现在砍掉 32px 那一级：正文 15 / 卡片标题 19 / 区域标题 24 / hero 48。
+   步进 1.267 和 1.263 仍然落在规则要求的 1.25~1.5 里，hero 仍然是正文的 3.2 倍。
+   **规则约束的是比例，不是"层级越多越好"。**
    ========================================================================== */
+
+/* ---- 字体：仓库自托管，不走 CDN ---- */
+@font-face{font-family:"Sora";src:url("/vendor/fonts/sora-400.woff2") format("woff2");font-weight:400;font-style:normal;font-display:swap}
+@font-face{font-family:"Sora";src:url("/vendor/fonts/sora-600.woff2") format("woff2");font-weight:600;font-style:normal;font-display:swap}
+@font-face{font-family:"Sora";src:url("/vendor/fonts/sora-700.woff2") format("woff2");font-weight:700;font-style:normal;font-display:swap}
+@font-face{font-family:"PlexMono";src:url("/vendor/fonts/plexmono-400.woff2") format("woff2");font-weight:400;font-style:normal;font-display:swap}
+@font-face{font-family:"PlexMono";src:url("/vendor/fonts/plexmono-500.woff2") format("woff2");font-weight:500;font-style:normal;font-display:swap}
+@font-face{font-family:"PlexMono";src:url("/vendor/fonts/plexmono-600.woff2") format("woff2");font-weight:600;font-style:normal;font-display:swap}
+
 :root{
   color-scheme:dark;
-  --bg:#0a0e14; --bg-deep:#05070a;
-  --card:#141a23; --card-hi:#1b2230;
-  --line:#252d3a; --track:#232c39; --mark:#3d4757;
-  --text:#e6edf3; --dim:#8b949e; --faint:#5a6472;
-  --green:#3fb950; --teal:#2dd4bf; --blue:#58a6ff;
-  --amber:#e3b341; --red:#f85149; --purple:#a371f7;
-  /* 当前活动语义色（JS 按 classify 结果注入 RGB 分量），驱动 hero 卡片与环的联动 */
-  --act-rgb:63,185,80;
-  --r:16px;
+
+  /* 中文回落是**逐个点名的**字体，不是泛型 sans-serif */
+  --font-display:"Sora","PingFang SC","Microsoft YaHei UI","Microsoft YaHei","Noto Sans CJK SC","Source Han Sans SC",sans-serif;
+  --font-body:"Sora","PingFang SC","Microsoft YaHei UI","Microsoft YaHei","Noto Sans CJK SC","Source Han Sans SC",sans-serif;
+  --font-mono:"PlexMono","IBM Plex Mono","Cascadia Mono",Consolas,"Microsoft YaHei UI",monospace;
+
+  /* ---- 表面：由深到浅四层，都是低饱和冷中性色（不是蓝黑，也不是纯黑） ---- */
+  --color-bg:           oklch(0.170 0.010 258);
+  --color-surface:      oklch(0.216 0.011 258);
+  --color-surface-2:    oklch(0.252 0.012 258);
+  --color-surface-3:    oklch(0.290 0.013 258);
+  --color-line:         oklch(0.310 0.013 258);
+  --color-line-strong:  oklch(0.400 0.015 258);
+
+  /* ---- 文字：三级，对比度都过 WCAG AA（按最亮的卡片底色算最坏情况） ---- */
+  --color-text:         oklch(0.950 0.006 258);
+  --color-text-muted:   oklch(0.780 0.013 258);
+  --color-text-faint:   oklch(0.655 0.013 258);
+
+  /* ---- 主色：只有一个。出现在主按钮、焦点环、在线指示 ---- */
+  --color-action-primary:      oklch(0.800 0.130 178);
+  --color-action-primary-hi:   oklch(0.860 0.130 178);
+  --color-action-primary-ink:  oklch(0.200 0.030 178);
+  --color-action-primary-soft: oklch(0.800 0.130 178 / 0.16);
+
+  /* 危险操作（格式化 SD / 删文件）的按钮底与文字色。
+     它不算"主色"，是**语义例外**：破坏性动作必须一眼看出跟别的不一样。 */
+  --color-danger:     oklch(0.660 0.200 25);
+  --color-danger-hi:  oklch(0.720 0.200 25);
+  --color-danger-ink: oklch(0.170 0.030 25);
+
+  /* ---- 数据语义色：只用于数据本身（活动词、圆环、轴条、曲线、事件点） ----
+     色相刻意与板端 UI_C_* 保持同一含义，换端不用重新学。 */
+  --color-still:  oklch(0.735 0.170 145);   /* 静置 */
+  --color-walk:   oklch(0.690 0.165 295);   /* 步行 */
+  --color-move:   oklch(0.730 0.150 250);   /* 运动 */
+  --color-shake:  oklch(0.810 0.140 80);    /* 晃动 */
+  --color-fall:   oklch(0.660 0.200 25);    /* 跌落 */
+  --color-idle:   oklch(0.655 0.013 258);   /* 无读数 */
+
+  /* 当前活动的颜色与 RGB 分量：JS 按 classify() 结果注入，驱动 hero 整体联动 */
+  --act-color: var(--color-idle);
+  --act-rgb: 135,141,148;
+
+  /* ---- 间距：8px 基准网格，没有第五个值 ---- */
+  --sp-1:4px; --sp-2:8px; --sp-3:12px; --sp-4:16px; --sp-6:24px;
+  --sp-8:32px; --sp-12:48px; --sp-16:64px; --sp-24:96px;
+
+  /* ---- 圆角：全站只有这 3 个 ---- */
+  --radius-control:6px;   /* 按钮 / 输入框 / 下拉 / 标签 / 状态块 */
+  --radius-card:10px;     /* 卡片 / 面板 / 画面 / 图表 */
+  --radius-modal:14px;    /* 弹窗 */
+
+  /* ---- 字号：正文 15 → 卡片标题 19 → 区域标题 24 → hero 48 ---- */
+  --fs-meta:12.5px;
+  --fs-body:15px;
+  --fs-h3:19px;    /* 卡片 / 面板标题 */
+  --fs-h2:24px;    /* 区域标题 */
+  --fs-hero:48px;  /* hero 活动词 = 正文 3.2 倍 */
+
+  /* ---- 阴影：三档，分别对应「浮在页面上」「浮在卡片上」「浮在所有东西上」 ----
+     深色底上的阴影靠"更黑"来分层；浅色底上同样的黑度会显得脏，
+     所以浅色主题那一份把 alpha 压到 1/5 左右（见下面的 light 块）。 */
+  --shadow-1:0 1px 1px oklch(0 0 0/.30), 0 2px 6px oklch(0 0 0/.22);
+  --shadow-2:0 1px 1px oklch(0 0 0/.32), 0 4px 10px oklch(0 0 0/.26), 0 12px 28px oklch(0 0 0/.20);
+  --shadow-3:0 2px 2px oklch(0 0 0/.36), 0 10px 24px oklch(0 0 0/.32), 0 32px 64px oklch(0 0 0/.34);
+  --ring:0 0 0 3px var(--color-action-primary-soft);
+
+  /* ---- 下面这些是「只在个别地方用一次」的表面/色调，抽成令牌是为了能整套换主题 ---- */
+  --appbar-bg:oklch(0.170 0.010 258 / .84);              /* 顶栏（半透明 + 毛玻璃） */
+  --bg-wash:radial-gradient(1100px 520px at 8% -12%, oklch(0.300 0.020 258 / .42), transparent 70%);
+  --stage-veil:linear-gradient(180deg, oklch(0.196 0.011 258), transparent);  /* hero 带子的"抬起感" */
+  --ball-from:oklch(0.270 0.013 258);                    /* 姿态球的球面渐变 */
+  --ball-to:oklch(0.190 0.010 258);
+  --video-bg:oklch(0.140 0.008 258);                     /* 摄像头/照片的取景框底 */
+  --modal-backdrop:oklch(0.140 0.008 258 / .70);
+  --sheen:oklch(1 0 0 / .05);                            /* 卡片/弹窗顶部 1px 内高光 */
+  /* 语义色的"淡底"版本（状态胶囊、选中行、状态块）。深色底上要淡得能透出底色，
+     浅色底上要用更深的同色相 —— 所以每个主题各一份，不靠 color-mix()。 */
+  --tint-primary:oklch(0.800 0.130 178 / .10);
+  --tint-primary-line:oklch(0.800 0.130 178 / .40);
+  --tint-danger:oklch(0.660 0.200 25 / .10);
+  --tint-danger-line:oklch(0.660 0.200 25 / .40);
+  --tint-still:oklch(0.735 0.170 145 / .16);
+  --tint-shake:oklch(0.810 0.140 80 / .16);
+  --tint-fall:oklch(0.660 0.200 25 / .16);
+
+  --w-max:1440px;
+  --ease:cubic-bezier(.16,1,.3,1);
 }
+
+/* ==========================================================================
+   浅色主题 —— **默认就是这一套**（用户 2026-09-26 要求"默认明亮"）
+   --------------------------------------------------------------------------
+   只覆盖"角色令牌"的值，不改任何一条结构/尺寸规则 —— 两套主题共用同一份
+   圆角、间距、字号阶梯、组件结构。这样"设计规则"只写一遍，两个主题都受约束。
+
+   数值不是眼睛调的，是按**最坏底色**算过 WCAG AA 的（卡片 surface 最亮，
+   所以它才是最难过的那个底）：
+     正文 15.6 / 次级 7.6 / 弱文字 5.4（对 surface）；弱文字对 surface-2 是 4.7
+     主按钮白字对主色 5.3；危险按钮 5.9
+     数据语义色（静置/步行/运动/晃动/跌落）对 surface 分别 5.5/6.9/5.8/5.2/5.9
+   `tools/e2e_design.js` 会**在两个主题下各跑一遍**这些断言，改坏了会红。
+
+   两条容易翻车的规则，这里都刻意避开了：
+     · 禁纯白大面积：底是 oklch(0.962)（≈#f1f2f5），卡片是 oklch(0.990)（≈#fbfcfd），
+       都不是 #fff。
+     · 主色只有一个：浅色里主色变深（0.500 而不是 0.800）——
+       深色的亮青绿放到白底上对比度不够，直接照抄会挂。
+   ========================================================================== */
+html[data-theme="light"]{
+  color-scheme:light;
+
+  --color-bg:           oklch(0.962 0.004 258);
+  --color-surface:      oklch(0.990 0.002 258);
+  --color-surface-2:    oklch(0.945 0.005 258);
+  --color-surface-3:    oklch(0.900 0.006 258);
+  --color-line:         oklch(0.905 0.006 258);
+  --color-line-strong:  oklch(0.820 0.008 258);
+
+  --color-text:         oklch(0.250 0.012 258);
+  --color-text-muted:   oklch(0.440 0.014 258);
+  --color-text-faint:   oklch(0.520 0.014 258);
+
+  --color-action-primary:      oklch(0.500 0.115 178);
+  --color-action-primary-hi:   oklch(0.450 0.115 178);
+  --color-action-primary-ink:  oklch(0.990 0.008 178);
+  --color-action-primary-soft: oklch(0.500 0.115 178 / 0.20);
+
+  --color-danger:     oklch(0.520 0.200 25);
+  --color-danger-hi:  oklch(0.470 0.200 25);
+  --color-danger-ink: oklch(0.990 0.008 25);
+
+  --color-still:  oklch(0.500 0.150 145);
+  --color-walk:   oklch(0.480 0.170 295);
+  --color-move:   oklch(0.500 0.160 250);
+  --color-shake:  oklch(0.530 0.140 80);
+  --color-fall:   oklch(0.520 0.200 25);
+  --color-idle:   oklch(0.520 0.014 258);
+
+  --tint-primary:oklch(0.500 0.115 178 / .10);
+  --tint-primary-line:oklch(0.500 0.115 178 / .34);
+  --tint-danger:oklch(0.520 0.200 25 / .10);
+  --tint-danger-line:oklch(0.520 0.200 25 / .34);
+  --tint-still:oklch(0.500 0.150 145 / .14);
+  --tint-shake:oklch(0.530 0.140 80 / .16);
+  --tint-fall:oklch(0.520 0.200 25 / .14);
+
+  /* 浅色底上的阴影必须比深色淡得多，否则整页显脏 */
+  --shadow-1:0 1px 1px oklch(0 0 0/.05), 0 2px 6px oklch(0 0 0/.05);
+  --shadow-2:0 1px 1px oklch(0 0 0/.06), 0 4px 10px oklch(0 0 0/.06), 0 12px 28px oklch(0 0 0/.06);
+  --shadow-3:0 2px 2px oklch(0 0 0/.08), 0 10px 24px oklch(0 0 0/.10), 0 32px 64px oklch(0 0 0/.12);
+
+  --appbar-bg:oklch(0.988 0.002 258 / .82);
+  --bg-wash:radial-gradient(1100px 520px at 8% -12%, oklch(0.930 0.010 258 / .70), transparent 70%);
+  --stage-veil:linear-gradient(180deg, oklch(0.998 0.002 258), transparent);
+  --ball-from:oklch(0.998 0.002 258);
+  --ball-to:oklch(0.940 0.005 258);
+  --video-bg:oklch(0.930 0.004 258);
+  --modal-backdrop:oklch(0.300 0.010 258 / .32);
+  --sheen:transparent;
+}
+
 *{box-sizing:border-box;margin:0}
+html{-webkit-text-size-adjust:100%}
+/* [hidden] 来自浏览器默认样式表（UA 样式），**任何作者样式里的 display 都能盖掉它**：
+   `.card{display:flex}` 一写，#card3d 上那个 hidden 就形同虚设 —— 3D 还没初始化完，
+   一张空卡片已经先亮在那里了（本仓库经验库里第 1 类高频真 bug）。
+   所以在最前面显式提权一次，后面所有 display 都盖不掉它。 */
+[hidden]{display:none !important}
+
 body{
-  background:radial-gradient(1200px 600px at 20% -10%,#131b27 0%,var(--bg) 55%,var(--bg-deep) 100%);
-  background-attachment:fixed;
-  color:var(--text);
-  font:14px/1.6 "Microsoft YaHei",system-ui,-apple-system,"Segoe UI",sans-serif;
-  padding:20px 20px 40px;
   min-height:100vh;
+  background-color:var(--color-bg);
+  /* 一处极淡的顶光，给纯色底一点纵深；不用蓝紫渐变 */
+  background-image:var(--bg-wash);
+  background-attachment:fixed;
+  color:var(--color-text);
+  font:400 var(--fs-body)/1.6 var(--font-body);
   -webkit-font-smoothing:antialiased;
+  text-rendering:optimizeLegibility;
 }
-.mono{font-family:Consolas,"SF Mono",ui-monospace,monospace;font-variant-numeric:tabular-nums}
-h1,h2{font-weight:650;letter-spacing:.2px}
+h1,h2,h3{font-family:var(--font-display);text-wrap:balance}
+.mono{font-family:var(--font-mono);font-variant-numeric:tabular-nums}
+.shell{max-width:var(--w-max);margin:0 auto;padding-inline:var(--sp-8)}
+/* 三类辅助文字，权重依次退下去 */
+.src{font:400 var(--fs-meta)/1.5 var(--font-mono);color:var(--color-text-faint)}
+.hint{font:400 var(--fs-meta)/1.7 var(--font-body);color:var(--color-text-muted)}
+.hint b{color:var(--color-text);font-weight:600}
+.empty{font:400 var(--fs-meta)/1.6 var(--font-body);color:var(--color-text-faint);padding:var(--sp-3) 0}
+.eyebrow{
+  display:inline-flex;align-items:center;gap:var(--sp-2);
+  font:500 var(--fs-meta)/1 var(--font-mono);
+  letter-spacing:.18em;text-transform:uppercase;color:var(--color-text-faint);
+}
+.eyebrow::before{content:"";width:20px;height:1px;background:var(--color-line-strong)}
+.panel-head{display:flex;align-items:baseline;justify-content:space-between;gap:var(--sp-4);flex-wrap:wrap}
+.panel-title{font:600 var(--fs-h3)/1.3 var(--font-display);letter-spacing:-.01em}
 
-/* ---------- 顶栏 ---------- */
-.top{display:flex;align-items:flex-start;justify-content:space-between;gap:20px;flex-wrap:wrap;max-width:1400px;margin:0 auto 18px}
-.brand{display:flex;gap:14px;align-items:flex-start}
-.logo{
-  width:38px;height:38px;border-radius:12px;flex:none;margin-top:2px;
-  background:linear-gradient(140deg,var(--teal),var(--blue) 55%,var(--purple));
-  box-shadow:0 6px 20px -6px var(--teal);
-  position:relative;
+/* ==========================================================================
+   顶栏：一屏里最安静的一层。它只回答"连上没有、跑多快"，不抢注意力。
+   ========================================================================== */
+.appbar{
+  position:sticky;top:0;z-index:40;
+  background:var(--appbar-bg);
+  backdrop-filter:blur(16px) saturate(140%);
+  border-bottom:1px solid var(--color-line);
 }
-.logo::after{content:"";position:absolute;inset:11px;border-radius:50%;background:var(--bg);opacity:.85}
-h1{font-size:19px;line-height:1.35}
-.sub{color:var(--dim);font-size:12px;max-width:720px}
-.pills{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.appbar .shell{
+  min-height:56px;display:flex;align-items:center;gap:var(--sp-6);
+  flex-wrap:wrap;padding-block:var(--sp-2);
+}
+.brand{display:flex;align-items:center;gap:var(--sp-3);min-width:0}
+.brand .mark{
+  width:26px;height:26px;flex:none;
+  border-radius:var(--radius-control);
+  border:1px solid var(--tint-primary-line);
+  background:var(--tint-primary);
+  display:grid;place-items:center;color:var(--color-action-primary);
+}
+.brand .mark svg{width:15px;height:15px;display:block}
+.brand b{font:600 var(--fs-body)/1.2 var(--font-display);letter-spacing:-.01em}
+.brand span{
+  font:500 10.5px/1 var(--font-mono);letter-spacing:.16em;text-transform:uppercase;
+  color:var(--color-text-faint);
+}
+.appbar .gap{flex:1 1 auto}
+
+.status{display:flex;align-items:center;gap:var(--sp-2);flex-wrap:wrap}
 .pill{
-  display:inline-flex;align-items:center;gap:7px;
-  padding:6px 13px;border-radius:99px;font-size:12px;
-  background:var(--card);border:1px solid var(--line);color:var(--dim);
-  white-space:nowrap;
+  display:inline-flex;align-items:center;gap:var(--sp-2);
+  height:28px;padding:0 var(--sp-3);
+  border-radius:var(--radius-control);
+  border:1px solid var(--color-line);
+  background:var(--color-surface);
+  font:500 var(--fs-meta)/1 var(--font-mono);
+  color:var(--color-text-muted);white-space:nowrap;
 }
-.pill i{width:7px;height:7px;border-radius:50%;background:currentColor;flex:none}
-.pill.on{color:var(--green);border-color:#1c3a26;background:#0f1d15}
-.pill.off{color:var(--red);border-color:#3d1f1f;background:#1c1113}
-.pill.off i{animation:breathe 1.6s ease-in-out infinite}
-.pill.warn{color:var(--amber);border-color:#3a2f14;background:#1d1911}
-@keyframes breathe{0%,100%{opacity:1}50%{opacity:.25}}
+.pill i{width:6px;height:6px;border-radius:50%;background:currentColor;flex:none}
+.pill.on{color:var(--color-action-primary);border-color:var(--tint-primary-line);background:var(--tint-primary)}
+.pill.off{color:var(--color-fall);border-color:var(--tint-danger-line);background:var(--tint-danger)}
+.pill.off i{animation:breathe 1.7s ease-in-out infinite}
+@keyframes breathe{0%,100%{opacity:1}50%{opacity:.22}}
 
-/* ---------- 设备列表（多板场景） ---------- */
-/* 只有 1 台板时不显示这一块 —— 单板课堂不该多出一张只有一个按钮的卡片 */
-.devlist{display:grid;gap:10px;grid-template-columns:repeat(auto-fill,minmax(240px,1fr))}
-.dev{
-  display:flex;flex-direction:column;gap:5px;text-align:left;
-  padding:11px 13px;border-radius:12px;cursor:pointer;
-  border:1px solid var(--line);background:var(--card-hi);
-  transition:border-color .18s,background .18s,box-shadow .18s;
+/* ==========================================================================
+   Hero 舞台：首屏只讲一件事 —— 板子现在在干什么。
+   --------------------------------------------------------------------------
+   它刻意**不是一张卡片**：是一整条横贯页面的带子，直接坐在页面底色上，
+   只有它配得上 48px 的字号和整片活动色染底。
+   ⚠️ 带子内部**一个卡片都不放**（第一版把图表和 AI 回复做成了卡片，
+   于是"带子里又套卡片"，盒子套盒子就是"乱"的来源）。内部一律用
+   发丝线 + 留白来分块。
+   ========================================================================== */
+.stage{
+  border-bottom:1px solid var(--color-line);
+  padding-block:var(--sp-16);
+  background-image:
+    radial-gradient(880px 320px at 4% 0%, rgb(var(--act-rgb) / .10), transparent 64%),
+    var(--stage-veil);
+  transition:background-image .7s var(--ease);
 }
-.dev:hover{background:#222c3c;border-color:#37445a}
-.dev.sel{border-color:rgba(88,166,255,.7);background:#12202f;box-shadow:0 0 0 1px rgba(88,166,255,.22)}
-.dev .row1{display:flex;align-items:center;gap:8px;min-width:0}
-.dev .dot{width:8px;height:8px;border-radius:50%;flex:none}
-.dev .dot.off{animation:breathe 1.6s ease-in-out infinite}
-.dev .did{font-weight:650;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.dev .meta{font-size:11px;color:var(--faint);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-
-/* ---------- 卡片网格 ---------- */
-.grid{display:grid;gap:14px;max-width:1400px;margin:0 auto;grid-template-columns:320px minmax(0,1fr) 320px}
-.card{
-  background:linear-gradient(180deg,var(--card-hi),var(--card));
-  border:1px solid var(--line);border-radius:var(--r);
-  padding:16px;min-width:0;
-  transition:border-color .25s ease,transform .25s ease,box-shadow .25s ease;
+.stage-head{
+  display:flex;align-items:baseline;justify-content:space-between;
+  gap:var(--sp-6);flex-wrap:wrap;margin-bottom:var(--sp-8);
 }
-.card:hover{border-color:#37445a;transform:translateY(-1px)}
-/* hero 卡片随当前活动色微染：边框一圈淡色 + 外发光，和板端面板边框一个语言 */
-.card.hero{
-  border-color:rgba(var(--act-rgb),.38);
-  box-shadow:0 0 0 1px rgba(var(--act-rgb),.10),0 22px 60px -30px rgba(var(--act-rgb),.55);
+
+/* 三列：读数 | 姿态 | AI。列宽**刻意不等**，比例按"内容真的填得满"调 ——
+   列给太宽，右边会拖出一条比 32px 栅格间距宽得多的空档，三列就不像一行了。 */
+.stage-grid{
+  display:grid;gap:var(--sp-8);align-items:stretch;
+  grid-template-columns:minmax(0,1fr) minmax(0,.82fr) minmax(0,1fr);
 }
-.card.wide{max-width:1400px;margin:14px auto 0}
-/* 存储占用圆环：比一条横条直观，而且点一下就能进管理 */
-.ringwrap{display:flex;align-items:center;gap:16px;margin-top:6px}
-.ring{position:relative;width:104px;height:104px;flex:0 0 auto;cursor:pointer;
-  border-radius:50%;transition:transform .15s}
-.ring:hover{transform:scale(1.04)}
-.ring svg{display:block;transform:rotate(-90deg)}
-.ring .ringtxt{position:absolute;inset:0;display:flex;flex-direction:column;
-  align-items:center;justify-content:center;line-height:1.15}
-.ring .ringtxt b{font-size:20px;font-weight:650}
-.ring .ringtxt span{font-size:11px;color:var(--faint,#8892a4)}
-.ringmeta{font-size:12px;line-height:1.7}
-.ringmeta .k{color:var(--faint,#8892a4)}
-/* 摄像头：左画面右按钮，窄屏自动堆叠 */
-.camwrap{display:grid;grid-template-columns:minmax(0,1fr) 240px;gap:14px;margin-top:6px}
-.camview{background:#0b0f16;border-radius:10px;overflow:hidden;aspect-ratio:4/3;
-  display:flex;align-items:center;justify-content:center;position:relative}
-.camview img{width:100%;height:100%;object-fit:contain;display:block}
-.camview .nosig{color:#5b6678;font-size:12px}
-.camside{display:flex;flex-direction:column;gap:8px}
-.shot{display:flex;align-items:center;gap:10px;padding:6px 8px;border-radius:8px}
-.shot img{width:56px;height:42px;object-fit:cover;border-radius:6px;background:#0b0f16}
-.shot .nm{font-size:12px;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-@media (max-width:900px){.camwrap{grid-template-columns:1fr}}
-.card-head{display:flex;align-items:baseline;justify-content:space-between;gap:10px;margin-bottom:12px}
-h2{font-size:13px;color:var(--text)}
-.card-head .src{font-size:11px;color:var(--faint)}
-
-/* ---------- 环形仪表 ---------- */
-.gauge{position:relative;width:100%;max-width:210px;margin:4px auto 10px;aspect-ratio:1}
-.gauge svg{width:100%;height:100%;display:block;transform:rotate(135deg)}
-.gauge circle{fill:none;stroke-linecap:round;transform-origin:70px 70px}
-.gauge .track{stroke:var(--track);stroke-width:11;stroke-dasharray:263.9 351.9}
-.gauge .val{
-  stroke:var(--green);stroke-width:11;stroke-dasharray:0 351.9;
-  transition:stroke-dasharray .5s cubic-bezier(.22,1,.36,1),stroke .4s;
-  filter:drop-shadow(0 0 5px rgba(var(--act-rgb),.55));
+.hero-readout{display:grid;grid-template-columns:168px minmax(0,1fr);gap:var(--sp-6);align-items:center}
+.hero-ring{position:relative;width:168px;height:168px;flex:none}
+.hero-ring svg{width:100%;height:100%;display:block;transform:rotate(135deg)}
+.hero-ring .track{fill:none;stroke:var(--color-surface-3);stroke-width:9;stroke-linecap:round;stroke-dasharray:263.9 351.9}
+.hero-ring .val{
+  fill:none;stroke:var(--color-idle);stroke-width:9;stroke-linecap:round;
+  stroke-dasharray:0 351.9;
+  transition:stroke-dasharray .5s var(--ease),stroke .4s ease;
 }
-.gauge-mid{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px}
-.act{font-size:30px;font-weight:700;letter-spacing:2px;line-height:1.1;transition:color .4s}
-.act.pop{animation:pop .42s cubic-bezier(.16,1,.3,1)}
-@keyframes pop{0%{opacity:.2;transform:translateY(4px)}100%{opacity:1;transform:none}}
-.abs{font-size:14px;color:var(--dim)}
-.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;border-top:1px solid var(--line);padding-top:12px}
-.stats>div{display:flex;flex-direction:column;gap:2px;text-align:center}
-.stats span{font-size:11px;color:var(--faint)}
-.stats b{font-size:16px;font-weight:650;font-variant-numeric:tabular-nums}
-.stats b.sm{font-size:12px;font-weight:500;color:var(--dim)}
+.ring-mid{
+  position:absolute;inset:0;display:flex;flex-direction:column;
+  align-items:center;justify-content:center;gap:var(--sp-1);
+}
+.ring-mid b{font:600 var(--fs-h2)/1 var(--font-mono);font-variant-numeric:tabular-nums}
+.ring-mid span{font:500 11px/1 var(--font-mono);letter-spacing:.14em;color:var(--color-text-faint)}
 
-/* ---------- 曲线 ---------- */
-#cv{width:100%;height:220px;display:block;border-radius:10px}
-.legend{display:flex;gap:16px;font-size:11px;color:var(--faint);margin-top:8px;flex-wrap:wrap}
-.legend i{display:inline-block;width:10px;height:3px;border-radius:2px;vertical-align:middle;margin-right:5px}
+/* hero 标题：全页最大的字。48px = 正文 15px 的 3.2 倍。 */
+.hero-word{
+  font:700 var(--fs-hero)/1.02 var(--font-display);
+  letter-spacing:-.02em;color:var(--act-color);
+  transition:color .45s ease;
+}
+.hero-word.pop{animation:pop .45s var(--ease)}
+@keyframes pop{from{opacity:.15;transform:translateY(6px)}to{opacity:1;transform:none}}
+/* 读数行：三个「小标签 + 大数字」，标签比数字小两级，层级一眼看得出 */
+.hero-metrics{display:flex;gap:var(--sp-8);margin-top:var(--sp-6);flex-wrap:wrap}
+.hero-metrics>div{display:flex;flex-direction:column;gap:var(--sp-2)}
+.hero-metrics dt{
+  font:500 10.5px/1 var(--font-mono);letter-spacing:.14em;
+  text-transform:uppercase;color:var(--color-text-faint);
+}
+.hero-metrics dd{font:600 var(--fs-h3)/1.1 var(--font-mono);font-variant-numeric:tabular-nums}
+.hero-metrics dd.is-text{font:600 var(--fs-body)/1.3 var(--font-body)}
 
-/* ---------- 姿态球 + 三轴条 ---------- */
+.hero-attitude{display:grid;gap:var(--sp-6);align-content:start}
+/* flex 而不是 grid：AI 那一列要**撑满整行高度**，否则右边留一块空洞 */
+.hero-ai{display:flex;flex-direction:column}
+
+/* ---- 姿态球：几何尺寸与旧版同一套手感（BUBBLE_MAX 是按这个半径定的） ----
+   刻意**左对齐**（不 margin:auto 居中）：上面那行标题是左对齐的，
+   球在中间飘着会和标题错开，三列看起来就不像一行了。 */
 .ball{
-  position:relative;width:100%;max-width:190px;aspect-ratio:1;margin:6px auto 14px;
-  border-radius:50%;border:1px solid var(--line);
-  background:radial-gradient(circle at 50% 40%,#0f1620,#0a0e14 70%);
+  position:relative;width:100%;max-width:210px;aspect-ratio:1;
+  border-radius:50%;border:1px solid var(--color-line);
+  background:radial-gradient(circle at 50% 38%, var(--ball-from), var(--ball-to) 72%);
 }
-.ball .ring2{position:absolute;left:50%;top:50%;width:34%;height:34%;transform:translate(-50%,-50%);border-radius:50%;border:1px dashed var(--track)}
-.ball .cross::before,.ball .cross::after{content:"";position:absolute;background:var(--line)}
+.ball .ring2{
+  position:absolute;left:50%;top:50%;width:34%;height:34%;
+  transform:translate(-50%,-50%);border-radius:50%;border:1px dashed var(--color-line);
+}
+.ball .cross::before,.ball .cross::after{content:"";position:absolute;background:var(--color-line)}
 .ball .cross::before{left:50%;top:14%;bottom:14%;width:1px}
 .ball .cross::after{top:50%;left:14%;right:14%;height:1px}
-/* 45° 斜辅助线：与板端同一套水平仪刻度，更弱 */
 .ball .cross2{position:absolute;left:50%;top:50%;width:52%;height:52%;transform:translate(-50%,-50%) rotate(45deg)}
-.ball .cross2::before,.ball .cross2::after{content:"";position:absolute;background:var(--mark);opacity:.7}
+.ball .cross2::before,.ball .cross2::after{content:"";position:absolute;background:var(--color-line-strong);opacity:.45}
 .ball .cross2::before{left:50%;top:0;bottom:0;width:1px}
 .ball .cross2::after{top:50%;left:0;right:0;height:1px}
 .ball .dot{
-  position:absolute;left:50%;top:50%;width:20px;height:20px;margin:-10px 0 0 -10px;border-radius:50%;
-  background:var(--green);box-shadow:0 0 18px -2px var(--green);
-  /* 小球：**短且线性**。原来 .3s 的 ease-out 配 500ms 一次的数据更新，
-     观感是「猛冲一下、然后停住」的顿感（用户反馈「不灵敏」）。
-     0.15s linear 让它贴着数据走，没有加速-减速的假动作。 */
+  position:absolute;left:50%;top:50%;width:20px;height:20px;margin:-10px 0 0 -10px;
+  border-radius:50%;background:var(--color-still);
+  /* 小球短且线性：0.15s linear 让它贴着数据走，没有加速-减速的假动作。
+     原来 .3s ease-out 配 500ms 一次的数据更新，观感是"猛冲一下然后停住"。 */
   transition:transform .15s linear,background .4s,box-shadow .4s;
 }
-.bars{display:flex;flex-direction:column;gap:9px}
-.bar{display:grid;grid-template-columns:14px 1fr 52px;gap:9px;align-items:center;font-size:12px}
-.bar em{font-style:normal;font-weight:700}
-.bar .t{position:relative;height:7px;border-radius:4px;background:var(--track);overflow:visible}
-.bar .t i{position:absolute;top:0;height:100%;border-radius:4px;left:50%;width:0;transition:left .3s,width .3s,background .3s}
-/* 0 位中线：和板端轴条同色同位 */
-.bar .t::after{content:"";position:absolute;left:50%;top:-1px;bottom:-1px;width:1px;transform:translateX(-.5px);background:var(--mark)}
-.bar .v{text-align:right;font-size:12px;font-variant-numeric:tabular-nums}
+.bars{display:flex;flex-direction:column;gap:var(--sp-3)}
+.bar{display:grid;grid-template-columns:16px minmax(0,1fr) 56px;gap:var(--sp-3);align-items:center}
+.bar em{font:600 var(--fs-meta)/1 var(--font-mono);font-style:normal}
+.bar .t{position:relative;height:6px;border-radius:var(--radius-control);background:var(--color-surface-3)}
+.bar .t i{position:absolute;top:0;height:100%;border-radius:var(--radius-control);left:50%;width:0;transition:left .3s,width .3s,background .3s}
+.bar .t::after{content:"";position:absolute;left:50%;top:-2px;bottom:-2px;width:1px;transform:translateX(-.5px);background:var(--color-line-strong)}
+.bar .v{text-align:right;font:500 var(--fs-meta)/1 var(--font-mono)}
 
-/* ---------- AI 回复 ---------- */
-.reply{margin-top:14px;padding:12px 14px 12px 12px;border-radius:12px;background:#0d1219;border:1px solid var(--line);border-left:3px solid rgba(88,166,255,.6);position:relative}
-.reply .tag{
-  display:inline-block;font-size:10px;font-weight:700;letter-spacing:.5px;
-  color:var(--blue);background:#1f6feb33;border-radius:99px;padding:2px 9px;margin-bottom:7px;
+/* ---- AI 回复：**引用块**，不是卡片 ----
+   一根左侧竖条 + 缩进就够了。第一版给它套了卡片（边框 + 底色 + 阴影），
+   在 hero 带子里就是"卡片里套卡片"，纯属加噪。 */
+.reply{
+  flex:1 1 auto;position:relative;
+  display:flex;flex-direction:column;gap:var(--sp-3);
+  padding-left:var(--sp-4);border-left:2px solid var(--color-line-strong);
+  min-height:120px;
 }
-.reply .txt{font-size:13px;color:var(--dim);white-space:pre-wrap;word-break:break-word;transition:color .3s}
-.reply.has .txt{color:var(--amber)}
-.reply.pending .txt{color:var(--dim)}
+.reply .tag{
+  /* 字距收到 .08em：这个标签是"拉丁 + 中文"混排（AI 回复），
+     等宽字体上 .16em 的字距会把 A 和 I 拉得像两个词，中文也跟着散。 */
+  font:600 11px/1 var(--font-mono);letter-spacing:.08em;text-transform:uppercase;
+  color:var(--color-text-faint);
+}
+.reply .txt{font-size:var(--fs-body);color:var(--color-text-muted);white-space:pre-wrap;word-break:break-word}
+.reply.has{border-left-color:var(--color-shake)}
+.reply.has .tag{color:var(--color-shake)}
+.reply.has .txt{color:var(--color-text)}
+.reply-foot{
+  margin-top:auto;display:flex;justify-content:space-between;gap:var(--sp-4);flex-wrap:wrap;
+  font:400 11.5px/1.5 var(--font-mono);color:var(--color-text-faint);
+}
 .reply.pending::after{
-  content:"";position:absolute;right:14px;top:14px;width:13px;height:13px;border-radius:50%;
-  border:2px solid var(--track);border-top-color:var(--amber);animation:spin .9s linear infinite;
+  content:"";position:absolute;right:0;top:0;
+  width:13px;height:13px;border-radius:50%;
+  border:2px solid var(--color-surface-3);border-top-color:var(--color-action-primary);
+  animation:spin .9s linear infinite;
 }
 @keyframes spin{to{transform:rotate(360deg)}}
 
-/* ---------- 按钮 ---------- */
-.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
-button{
-  font:inherit;font-size:13px;cursor:pointer;border-radius:9px;padding:8px 16px;
-  border:1px solid var(--line);background:var(--card-hi);color:var(--text);
-  transition:background .18s,border-color .18s,transform .06s;
+/* hero 带子内部的分块：发丝线 + 留白，不用卡片 */
+.stage-block{
+  margin-top:var(--sp-8);padding-top:var(--sp-8);
+  border-top:1px solid var(--color-line);
+  display:flex;flex-direction:column;gap:var(--sp-4);
 }
-button:hover:not(:disabled){background:#222c3c;border-color:#37445a}
+.stage-actions{
+  display:flex;align-items:center;gap:var(--sp-3);flex-wrap:wrap;
+  margin-top:var(--sp-8);padding-top:var(--sp-8);border-top:1px solid var(--color-line);
+}
+.cmdbar{display:flex;align-items:center;gap:var(--sp-2);flex-wrap:wrap;flex:1 1 auto}
+/* 破坏性指令（格式化 SD 卡）与安全指令之间**留一道可伸缩的间隔**，
+   把它顶到最右边 —— 一排按钮里挨着「读取存储信息」，误点代价太大。 */
+.cmdbar .cmd-gap{flex:1 1 var(--sp-6)}
+
+/* ==========================================================================
+   区域：每一块上下各留 64px，块与块之间用一条发丝线分隔。
+   宁可页面长一点，也不要挤成一坨 —— 信息密度要能喘气。
+   ========================================================================== */
+.region{padding-block:var(--sp-16);border-bottom:1px solid var(--color-line)}
+.region:last-of-type{border-bottom:0}
+.region-head{
+  display:flex;align-items:baseline;justify-content:space-between;
+  gap:var(--sp-6);flex-wrap:wrap;margin-bottom:var(--sp-8);
+}
+.region-head h2{font:600 var(--fs-h2)/1.2 var(--font-display);letter-spacing:-.02em}
+/* 区域说明用等宽小字，靠右 —— 它是注脚，不该跟标题争大小。
+   第一版写成了 15px 正文段落，三段加起来就是三坨噪音。 */
+.region-sub{
+  font:400 var(--fs-meta)/1.6 var(--font-mono);color:var(--color-text-faint);
+  max-width:64ch;text-align:right;
+}
+.region-tools{display:flex;align-items:center;gap:var(--sp-3);flex-wrap:wrap}
+
+/* 用 flex + flex-grow 而不是固定列数：某张卡被 JS 隐藏时，
+   同排的卡会自动占满整行，不会留一个空洞。
+   align-items:flex-start（不是 stretch）—— 同排两张卡内容量差很多时，
+   拉平高度只会让短的那张底下空出一大块，比高低不齐更难看。 */
+.cols{display:flex;flex-wrap:wrap;gap:var(--sp-6);align-items:flex-start}
+.cols>*{flex:1 1 430px;min-width:0}
+.cols>.lead{flex:1.3 1 520px}
+
+/* 卡片：**平面 + 发丝线 + 一档轻阴影**。
+   第一版每张卡都带渐变和 shadow-2，六张卡同时喊"我在这一层"，
+   结果 hero 反而压不住它们。层次要靠"hero 更重"来给，不是"卡片更重"。 */
+.card{
+  display:flex;flex-direction:column;gap:var(--sp-4);
+  padding:var(--sp-6);
+  border:1px solid var(--color-line);
+  border-radius:var(--radius-card);
+  background:var(--color-surface);
+  box-shadow:var(--shadow-1);
+}
+.card-head{display:flex;align-items:baseline;justify-content:space-between;gap:var(--sp-4);flex-wrap:wrap}
+.card-head h3{font:600 var(--fs-h3)/1.2 var(--font-display);letter-spacing:-.015em}
+.card-head h3.sm{font-size:var(--fs-body)}
+
+/* ---- 设备列表（多板场景；只有一台时整块不出现） ----
+   做成**表格式的行**而不是卡片：设备是重复项，一屏可能有 20 台，
+   列对齐比卡片好扫读，也不会出现"很宽的卡片里挤着一行小字、右边空一大片"。
+   选中态用左侧 2px 强调条 + 淡底，不用整块高亮（整块高亮会跟 hover 撞车）。 */
+.devlist{
+  display:flex;flex-direction:column;
+  border:1px solid var(--color-line);border-radius:var(--radius-card);
+  background:var(--color-surface);overflow:hidden;
+}
+.dev{
+  display:grid;align-items:center;gap:var(--sp-4);
+  grid-template-columns:18px 8px minmax(110px,180px) minmax(150px,240px) minmax(0,1fr);
+  padding:var(--sp-3) var(--sp-4);
+  border-bottom:1px solid var(--color-line);
+  cursor:pointer;transition:background .16s;
+}
+.dev:last-child{border-bottom:0}
+.dev:hover{background:var(--color-surface-2)}
+.dev.sel{background:var(--tint-primary);box-shadow:inset 2px 0 0 var(--color-action-primary)}
+/* 设备行是"可点的 div"，必须自己把键盘可达性补上：
+   给它 tabindex/role（见 renderDevices），这里给焦点样式。
+   用 outline + 负 offset，不去动 box-shadow（那被选中态的强调条占着）。 */
+.dev:focus-visible{outline:2px solid var(--color-action-primary);outline-offset:-2px}
+.dev input[type=checkbox]{accent-color:var(--color-action-primary);width:15px;height:15px;cursor:pointer}
+.dev .dot{width:8px;height:8px;border-radius:50%}
+.dev .dot.off{animation:breathe 1.7s ease-in-out infinite}
+.dev .did{font:600 var(--fs-body)/1.3 var(--font-display);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dev .meta{
+  font:400 11.5px/1.5 var(--font-mono);color:var(--color-text-faint);
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+}
+
+/* ==========================================================================
+   控件：**两级**。
+   ---- 主操作（.primary）：实心青绿，一屏只允许一个 ----
+   ---- 其余一律"退下去"：透明底 + 发丝线 + 次级文字色 ----
+   第一版所有按钮都是"深底 + 边框 + 文字"，8 个按钮重量完全一样，
+   主操作跳不出来，一排看过去就是一团。
+   ========================================================================== */
+button{
+  font:600 var(--fs-body)/1 var(--font-body);
+  height:36px;padding:0 var(--sp-4);
+  border-radius:var(--radius-control);
+  border:1px solid var(--color-line);
+  background:transparent;
+  color:var(--color-text-muted);
+  cursor:pointer;
+  transition:background .16s,border-color .16s,color .16s,transform .06s;
+}
+button:hover:not(:disabled){
+  background:var(--color-surface-2);color:var(--color-text);border-color:var(--color-line-strong);
+}
 button:active:not(:disabled){transform:translateY(1px)}
-button.primary{background:#1f6feb;border-color:#2f81f7;color:#fff}
-button.primary:hover:not(:disabled){background:#2f81f7}
-button:disabled{opacity:.45;cursor:not-allowed}
-.hint{font-size:12px;color:var(--dim)}
+button:focus-visible{outline:none;box-shadow:var(--ring)}
+button:disabled{opacity:.38;cursor:not-allowed}
+button.primary{
+  background:var(--color-action-primary);
+  border-color:var(--color-action-primary);
+  color:var(--color-action-primary-ink);
+}
+button.primary:hover:not(:disabled){
+  background:var(--color-action-primary-hi);border-color:var(--color-action-primary-hi);
+  color:var(--color-action-primary-ink);
+}
+button.danger{color:var(--color-fall);border-color:var(--tint-danger-line)}
+button.danger:hover:not(:disabled){background:var(--tint-danger);color:var(--color-fall);border-color:var(--color-danger)}
+button.sm{height:28px;padding:0 var(--sp-3);font-size:var(--fs-meta)}
+/* 图标按钮：和状态胶囊同高（28px），走"退下去"那一档 ——
+   主题切换是工具，不该跟主操作抢注意力。 */
+button.icon{width:32px;height:28px;padding:0;display:grid;place-items:center;flex:none}
+button.icon svg{width:15px;height:15px;display:block}
+/* 图标显示的是"点了会变成什么"：明亮时显示月亮（去深色），深色时显示太阳 */
+html[data-theme="light"] button.icon .i-sun{display:none}
+html[data-theme="dark"] button.icon .i-moon{display:none}
 
-/* ---------- 指令 / 事件列表 ---------- */
+input[type=text],input[type=password],input[type=number],select{
+  height:36px;padding:0 var(--sp-3);
+  border-radius:var(--radius-control);
+  border:1px solid var(--color-line);
+  background:var(--color-bg);           /* 输入框比卡片更深 = 凹进去 */
+  color:var(--color-text);
+  font:400 var(--fs-body)/1 var(--font-body);
+}
+input::placeholder{color:var(--color-text-faint)}
+input:focus,select:focus{outline:none;border-color:var(--color-action-primary);box-shadow:var(--ring)}
+select{padding-right:var(--sp-2);font-family:var(--font-mono);font-size:var(--fs-meta)}
+.field{display:flex;flex-direction:column;gap:var(--sp-2)}
+.field>label{font:500 10.5px/1 var(--font-mono);letter-spacing:.14em;text-transform:uppercase;color:var(--color-text-faint)}
+.formrow{display:flex;gap:var(--sp-4);flex-wrap:wrap;align-items:flex-end}
+.actions{display:flex;align-items:center;gap:var(--sp-3);flex-wrap:wrap}
+
+/* ==========================================================================
+   列表：指令记录 / 事件流 / 文件。做成紧凑的"数据表"，
+   行与行之间用发丝线，不用卡片套卡片。
+   ========================================================================== */
 .list{display:flex;flex-direction:column}
-.item{display:flex;gap:10px;align-items:baseline;padding:8px 6px;border-bottom:1px dashed #1b2230;font-size:12px;flex-wrap:wrap;border-radius:8px;transition:background .18s}
-.item:hover{background:rgba(255,255,255,.025)}
+.item{
+  display:flex;align-items:baseline;gap:var(--sp-3);flex-wrap:wrap;
+  padding:var(--sp-3) 0;
+  border-bottom:1px solid var(--color-line);
+  font-size:var(--fs-meta);color:var(--color-text-muted);
+  /* ⚠️ 指令参数是一整串**没有空格**的 JSON（{"n":3,"on_ms":80,"off_ms":80,...}）。
+     默认情况下它算一个"不可断词"，flex 子项的 min-width:auto 又不允许收缩到
+     min-content 以下 —— 于是它把整页撑宽。实测 320px 下溢出 44px，
+     而 set_config 的参数更长（ssid/url/period_ms），390px 手机上也会破。
+     overflow-wrap:anywhere 允许在任意位置断行（并且会**降低 min-content**，
+     这正是 flex 能收缩的前提）；min-width:0 是配套的那一半。 */
+  overflow-wrap:anywhere;
+}
+.item>*{min-width:0}
 .item:last-child{border-bottom:0}
-.st{padding:2px 9px;border-radius:99px;font-size:11px;white-space:nowrap;flex:none}
-.st-queued{background:#21262d;color:var(--dim)}
-.st-sent{background:#d2992233;color:var(--amber)}
-.st-done{background:#2ea04333;color:var(--green)}
-.st-failed,.st-timeout{background:#f8514933;color:var(--red)}
-.item .name{color:var(--text);font-weight:600}
-.item .meta{color:var(--faint);font-size:11px}
+.item .name{color:var(--color-text);font-weight:600;font-family:var(--font-display)}
+.item .meta{color:var(--color-text-faint);font-size:11.5px;font-family:var(--font-mono)}
+.st{
+  font:500 11px/1 var(--font-mono);letter-spacing:.06em;
+  padding:4px var(--sp-2);border-radius:var(--radius-control);
+  white-space:nowrap;flex:none;
+}
+.st-queued{background:var(--color-surface-3);color:var(--color-text-muted)}
+.st-sent{background:var(--tint-shake);color:var(--color-shake)}
+.st-done{background:var(--tint-still);color:var(--color-still)}
+.st-failed,.st-timeout{background:var(--tint-fall);color:var(--color-fall)}
 #feed{max-height:340px;overflow-y:auto}
-#feed .item{gap:12px}
-#feed .t{color:var(--faint);font-size:11px;flex:none;font-family:Consolas,monospace}
-#feed .k{flex:none;width:8px;height:8px;border-radius:50%;margin-top:6px}
-.k-info{background:var(--dim)}.k-motion{background:var(--blue)}
-.k-shake{background:var(--amber)}.k-fall,.k-alert{background:var(--red)}
-.k-ask{background:var(--purple)}.k-cmd{background:var(--teal)}
-footer{max-width:1400px;margin:18px auto 0;color:var(--faint);font-size:11px;line-height:1.8}
-.empty{color:var(--faint);font-size:12px;padding:6px 0}
+#feed .t{color:var(--color-text-faint);font-size:11.5px;flex:none;font-family:var(--font-mono)}
+#feed .k{flex:none;width:7px;height:7px;border-radius:50%;margin-top:6px}
+.k-info{background:var(--color-text-faint)}
+.k-motion{background:var(--color-move)}
+.k-shake{background:var(--color-shake)}
+.k-fall,.k-alert{background:var(--color-fall)}
+.k-ask{background:var(--color-walk)}
+.k-cmd{background:var(--color-action-primary)}
 
-@media(max-width:1100px){
-  .grid{grid-template-columns:1fr 1fr}
-  .grid .hero{grid-column:1 / -1}
+/* ---- 曲线 ---- */
+#cv{width:100%;height:144px;display:block;border-radius:var(--radius-card)}
+.legend{display:flex;gap:var(--sp-6);font:400 11.5px/1 var(--font-mono);color:var(--color-text-faint);flex-wrap:wrap}
+.legend i{display:inline-block;width:12px;height:3px;border-radius:var(--radius-control);vertical-align:middle;margin-right:var(--sp-2)}
+
+/* ---- 摄像头 ---- */
+.camwrap{display:grid;grid-template-columns:minmax(0,1fr) 224px;gap:var(--sp-6)}
+.camview{
+  position:relative;aspect-ratio:4/3;max-height:340px;
+  display:flex;align-items:center;justify-content:center;
+  background:var(--video-bg);border:1px solid var(--color-line);
+  border-radius:var(--radius-card);overflow:hidden;
+}
+.camview img{width:100%;height:100%;object-fit:contain;display:block}
+.camview .nosig{color:var(--color-text-faint);font:400 var(--fs-meta)/1.7 var(--font-body);text-align:center;padding:var(--sp-6)}
+.camside{display:flex;flex-direction:column;gap:var(--sp-3);align-items:flex-start}
+.shot{
+  display:flex;align-items:center;gap:var(--sp-3);
+  padding:var(--sp-2);border-radius:var(--radius-control);
+  border:1px solid var(--color-line);background:var(--color-surface);
+}
+.shot img{width:56px;height:42px;object-fit:cover;border-radius:var(--radius-control);background:var(--video-bg);flex:none}
+.shot .nm{font:400 var(--fs-meta)/1.5 var(--font-mono);flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+/* ---- 存储占用圆环 ---- */
+.ringwrap{display:flex;align-items:center;gap:var(--sp-6);flex-wrap:wrap}
+.ring{
+  position:relative;width:104px;height:104px;flex:0 0 auto;cursor:pointer;
+  border-radius:50%;transition:transform .16s;
+}
+.ring:hover{transform:scale(1.03)}
+.ring:focus-visible{outline:2px solid var(--color-action-primary);outline-offset:2px}
+.ring svg{display:block;transform:rotate(-90deg)}
+.ring .ringtxt{
+  position:absolute;inset:0;display:flex;flex-direction:column;
+  align-items:center;justify-content:center;line-height:1.15;
+}
+.ring .ringtxt b{font:600 var(--fs-h3)/1 var(--font-mono)}
+.ring .ringtxt span{font:500 10.5px/1 var(--font-mono);letter-spacing:.14em;color:var(--color-text-faint)}
+.ringmeta{font:400 var(--fs-meta)/1.9 var(--font-mono);color:var(--color-text-muted)}
+.ringmeta .k{color:var(--color-text-faint)}
+
+footer{
+  border-top:1px solid var(--color-line);
+  padding-block:var(--sp-8);
+  color:var(--color-text-faint);font:400 11.5px/1.9 var(--font-mono);
+}
+
+/* ==========================================================================
+   弹窗：全站唯一用 14px 圆角的地方。用原生 <dialog>，
+   不用 window.confirm() —— 系统弹窗在深色界面上是一块白方块，
+   而且会阻塞整个页面（SSE 推送和 3D 渲染全停）。
+   ========================================================================== */
+dialog.modal{
+  width:min(448px,calc(100vw - 32px));
+  padding:0;border:1px solid var(--color-line-strong);
+  border-radius:var(--radius-modal);
+  background:var(--color-surface);color:var(--color-text);
+  box-shadow:var(--shadow-3), inset 0 1px 0 var(--sheen);
+}
+dialog.modal::backdrop{background:var(--modal-backdrop);backdrop-filter:blur(3px)}
+.modal-body{padding:var(--sp-8) var(--sp-8) var(--sp-6);display:grid;gap:var(--sp-3)}
+.modal-body h3{font:600 var(--fs-h2)/1.25 var(--font-display);letter-spacing:-.015em}
+.modal-body p{font-size:var(--fs-body);color:var(--color-text-muted)}
+.modal-foot{display:flex;justify-content:flex-end;gap:var(--sp-3);padding:0 var(--sp-8) var(--sp-8)}
+
+/* ==========================================================================
+   响应式：窄屏优先保证"读得到、点得到"，不追求信息量
+   ========================================================================== */
+@media(max-width:1280px){
+  .stage-grid{grid-template-columns:minmax(0,1fr) minmax(0,.86fr)}
+  .hero-ai{grid-column:1 / -1;margin-top:var(--sp-2)}
+  .reply{min-height:0}
+}
+@media(max-width:1024px){
+  .stage-grid{grid-template-columns:minmax(0,1fr)}
+  .camwrap{grid-template-columns:minmax(0,1fr)}
+  .cols>*,.cols>.lead{flex-basis:100%}
+  .region-sub{text-align:left}
 }
 @media(max-width:760px){
-  body{padding:14px 12px 30px}
-  .grid{grid-template-columns:1fr}
-  .gauge{max-width:180px}
-  #cv{height:170px}
+  .shell{padding-inline:var(--sp-4)}
+  .stage{padding-block:var(--sp-12)}
+  .region{padding-block:var(--sp-12)}
+  /* 设备行在窄屏折成三行：复选框+状态点 | 设备名 / 状态 / 活动，都落在第 3 列 */
+  .dev{grid-template-columns:18px 8px minmax(0,1fr);gap:var(--sp-2) var(--sp-3)}
+  .dev .did,.dev .meta{grid-column:3}
+  /* hero 字号在窄屏**不缩**：规则要求 hero ≥ 正文 × 3（15 × 3 = 45），
+     原来缩到 --fs-h2(24) 就是 1.6 倍 —— 直接违规（2026-09-26 补空状态断言时抓到）。
+     正解不是缩字号，是**改成上下堆叠**：圆环在上、标题在下，
+     48px 的标题就有整行宽度可用（最长 4 个汉字 = 192px < 288px，320px 屏也放得下）。 */
+  .hero-readout{grid-template-columns:minmax(0,1fr);justify-items:start;gap:var(--sp-4)}
+  .hero-ring{width:112px;height:112px}
+  /* 环变小了，里面的读数也要跟着小，否则 "0.00 g" 会顶到环的描边上 */
+  .ring-mid b{font-size:var(--fs-h3)}
+  .hero-metrics{gap:var(--sp-6)}
+  #cv{height:140px}
+  .card{padding:var(--sp-4)}
+  .appbar .shell{min-height:52px;gap:var(--sp-3)}
+  /* 手机上输入框小于 16px 时，iOS 聚焦会强制放大页面 —— 很难受 */
+  input[type=text],input[type=password],input[type=number],select{font-size:16px}
+}
+
+/* ==========================================================================
+   动效偏好：系统里开了"减少动态效果"就把所有动画/过渡压到几乎为 0。
+   这个页面有呼吸点、活动词淡入、曲线过渡、3D slerp —— 对前庭敏感的人是干扰。
+   只压缩**时长**，不删动画本身：布局和最终状态完全不变。
+   ========================================================================== */
+@media (prefers-reduced-motion: reduce){
+  *,*::before,*::after{
+    animation-duration:.01ms !important;
+    animation-iteration-count:1 !important;
+    transition-duration:.01ms !important;
+  }
 }
 </style>
 </head>
 <body>
 
-<header class="top">
-  <div class="brand">
-    <div class="logo"></div>
-    <div>
-      <h1>Ego Link · 实时仪表盘</h1>
-      <p class="sub">板载 IMU 100Hz 采样 → 本机服务器实时分类与 AI 分析 → 回传板端并推送到本页</p>
+<header class="appbar">
+  <div class="shell">
+    <div class="brand">
+      <span class="mark" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+          <path d="M12 2.5 20 7v10l-8 4.5L4 17V7z"></path><path d="M12 12v9.5M12 12 4 7M12 12l8-5"></path>
+        </svg>
+      </span>
+      <div>
+        <b>Ego Link</b>
+        <span>实时仪表盘</span>
+      </div>
     </div>
-  </div>
-  <div class="pills">
-    <span id="dev" class="pill off"><i></i>离线</span>
-    <span id="hzp" class="pill">— Hz</span>
-    <span id="postsp" class="pill">↑0 帧</span>
+    <div class="gap"></div>
+    <div class="status">
+      <span id="dev" class="pill off"><i></i>离线</span>
+      <span id="hzp" class="pill">— Hz</span>
+      <span id="postsp" class="pill">↑0 帧</span>
+      <button id="theme" class="icon" type="button" title="切换主题" aria-label="切换主题">
+        <svg class="i-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true">
+          <circle cx="12" cy="12" r="4.2"></circle>
+          <path d="M12 2.6v2.2M12 19.2v2.2M4.6 4.6l1.6 1.6M17.8 17.8l1.6 1.6M2.6 12h2.2M19.2 12h2.2M4.6 19.4l1.6-1.6M17.8 6.2l1.6-1.6"></path>
+        </svg>
+        <svg class="i-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true">
+          <path d="M20.5 14.6A8.6 8.6 0 0 1 9.4 3.5a8.6 8.6 0 1 0 11.1 11.1z"></path>
+        </svg>
+      </button>
+    </div>
   </div>
 </header>
 
-<section class="card wide" id="devcard" hidden>
-  <div class="card-head">
-    <h2>设备</h2>
-    <span class="src" id="devcount"></span>
-    <button id="devall" style="margin-left:auto">全选</button>
-  </div>
-  <div class="devlist" id="devs"></div>
-  <div class="hint" style="margin-top:6px">勾选多台后，下面的远程指令会**同时**下发给它们
-    （不勾 = 只发给当前查看的那台）</div>
-</section>
+<main class="shell">
+  <section class="region" id="devcard" hidden>
+    <div class="region-head">
+      <h2>设备</h2>
+      <div class="region-tools">
+        <span class="src" id="devcount"></span>
+        <button id="devall" class="sm">全选</button>
+      </div>
+    </div>
+    <div class="devlist" id="devs"></div>
+    <p class="hint" style="margin-top:var(--sp-3)">勾选多台后，远程指令会<b>同时</b>下发给它们；一台都不勾 = 只发给当前查看的那台。</p>
+  </section>
 
-<main class="grid">
-  <section class="card wide" id="card3d" hidden>
-    <div class="card-head"><h2>板子姿态 · 3D</h2>
-      <span class="src" style="display:flex;align-items:center;gap:8px">
-        <span id="d3src">—</span>
-        <span>刷新
+  <!-- ===================================================================
+       Hero 舞台。整页最重要的一块，也是唯一不在卡片里的内容。
+       =================================================================== -->
+  <section class="stage">
+    <div class="stage-head">
+      <span class="eyebrow">实时状态 · 最近 8 秒</span>
+      <span class="src">数据来源 <span id="src">—</span></span>
+    </div>
+
+    <div class="stage-grid">
+      <div class="hero-readout">
+        <div class="hero-ring">
+          <svg viewBox="0 0 140 140" aria-hidden="true">
+            <circle class="track" cx="70" cy="70" r="56"></circle>
+            <circle class="val" id="ring" cx="70" cy="70" r="56"></circle>
+          </svg>
+          <div class="ring-mid">
+            <b id="abs">0.00 g</b>
+            <span>合加速度</span>
+          </div>
+        </div>
+        <div>
+          <h1 class="hero-word" id="act">…</h1>
+          <dl class="hero-metrics">
+            <div><dt>步数 / 8s</dt><dd id="steps">0</dd></div>
+            <div><dt>晃动 / 8s</dt><dd id="shakes">0</dd></div>
+            <div><dt>AI 来源</dt><dd class="is-text" id="mode">规则AI</dd></div>
+          </dl>
+        </div>
+      </div>
+
+      <div class="hero-attitude">
+        <div class="panel-head">
+          <span class="panel-title">姿态</span>
+          <span class="src mono" id="tilt">倾角 —</span>
+        </div>
+        <div class="ball">
+          <div class="cross"></div>
+          <div class="cross2"></div>
+          <div class="ring2"></div>
+          <div class="dot" id="ball"></div>
+        </div>
+        <div class="bars">
+          <div class="bar"><em style="color:var(--color-fall)">X</em><div class="t"><i id="bx"></i></div><span class="v mono" id="vx">0.00</span></div>
+          <div class="bar"><em style="color:var(--color-still)">Y</em><div class="t"><i id="by"></i></div><span class="v mono" id="vy">0.00</span></div>
+          <div class="bar"><em style="color:var(--color-move)">Z</em><div class="t"><i id="bz"></i></div><span class="v mono" id="vz">0.00</span></div>
+        </div>
+      </div>
+
+      <div class="hero-ai">
+        <div class="reply" id="replybox">
+          <span class="tag">AI 回复</span>
+          <div class="txt" id="reply">还没有提问。</div>
+          <div class="reply-foot">
+            <span>按板子 BOOT 键提问</span>
+            <span>回复同时显示在板子屏幕上</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 主操作**放在曲线之前**：整条 hero 带子约 900px 高，
+         曲线是"细看"的内容，主操作是"要用的"内容 —— 放在最后会被
+         900px 高的笔记本切在折线以下（规则要求主操作必须跳出来）。 -->
+    <div class="stage-actions">
+      <span class="cmdbar" id="cmdbts"></span>
+      <span id="cmdhint" class="hint"></span>
+    </div>
+
+    <div class="stage-block">
+      <div class="panel-head">
+        <span class="panel-title">合加速度 |a|</span>
+        <span class="src">最近 8 秒 · 服务端降采样</span>
+      </div>
+      <canvas id="cv" role="img" aria-label="合加速度 |a| 最近 8 秒的曲线"></canvas>
+      <div class="legend">
+        <span><i style="background:var(--color-move)"></i>|a| 曲线</span>
+        <span><i style="background:var(--color-text-faint)"></i>1g 参考线</span>
+        <span><i style="background:var(--color-fall)"></i>失重阈值 0.35g（疑似跌落）</span>
+      </div>
+    </div>
+  </section>
+
+  <section class="region">
+    <div class="region-head">
+      <h2>远程操作</h2>
+      <p class="region-sub">指令搭在「下一帧遥测的响应」里下发，板子在再下一帧回传结果 —— 一次真实的硬件往返。</p>
+    </div>
+    <div class="cols">
+      <div class="card lead" id="cardcmd">
+        <div class="card-head">
+          <h3>指令记录</h3>
+          <span class="src">最近 8 条</span>
+        </div>
+        <div class="formrow">
+          <div class="field">
+            <label for="orientsel">方向档位 oN</label>
+            <select id="orientsel"></select>
+          </div>
+          <button id="orientapply">应用档位</button>
+          <span id="orientnow" class="hint"></span>
+        </div>
+        <div class="list" id="cmds"></div>
+      </div>
+
+      <div class="card" id="cardfeed">
+        <div class="card-head">
+          <h3>事件流</h3>
+          <span class="src" id="evcount"></span>
+        </div>
+        <div id="feed"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="region">
+    <div class="region-head">
+      <h2>设备与画面</h2>
+      <p class="region-sub">板子是 HTTP 客户端，没有自己的服务端，所以画面由板子推上来、网页从这里取。</p>
+    </div>
+    <div class="cols">
+      <div class="card lead" id="cardcam">
+        <div class="card-head">
+          <h3>摄像头</h3>
+          <span class="src" id="camwho">—</span>
+        </div>
+        <div class="camwrap">
+          <div class="camview">
+            <!-- 一开始就 hidden：没有 src 时浏览器会画一个"图片裂了"的破图标，
+                 比什么都不显示还难看。收到第一帧再让它出现。 -->
+            <img id="camimg" alt="" hidden>
+            <div class="nosig" id="camnosig">点右侧「开启实时画面」<br>
+              （板子离线 / 摄像头自检没过时不会有画面）</div>
+          </div>
+          <div class="camside">
+            <button id="camshot">拍照 → 存进板子 SD 卡</button>
+            <button id="camlive">开启实时画面</button>
+            <div class="field">
+              <label for="camfps">帧率</label>
+              <select id="camfps" title="板子推帧的速度，改这里会下发命令给板子。调低省 WiFi 带宽；调高更跟手。注意：板子一帧要「等帧 + 开一条 TCP + POST 27KB」，实测上限约 2 帧/秒 —— 选「极限」也不会超过它，那是链路上限，不是设置没生效。">
+                <option value="1">省流 · 最省带宽</option>
+                <option value="2" selected>标准</option>
+                <option value="4">流畅</option>
+                <option value="6">极限 · 板子能给的最快</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="camq">画质</label>
+              <select id="camq" title="JPEG 压缩质量。**这是唯一能改变帧大小的旋钮** —— OV3660 的 JPEG 分辨率固定 1280x720（传感器只有这一档），所以只能靠画质换速度：调低 → 每帧变小 → 上传更快、更省带宽。合法范围是驱动给的 1..63（默认 17）。">
+                <option value="15">省流 · 帧最小最快</option>
+                <option value="25">流畅</option>
+                <option value="40" selected>标准 · 清晰</option>
+                <option value="60">高清 · 最清晰也最慢</option>
+              </select>
+            </div>
+            <div class="hint">
+              实时画面是板子<b>推</b>上来的，帧率和画质都<b>由板子决定</b>（在上面选）。
+              实测上限约 2 帧/秒：一帧要等帧 + 开一条 TCP + POST 27KB。
+              分辨率由传感器固定为 1280x720（OV3660 的 JPEG 只有这一档），
+              所以"调分辨率"做不到 —— <b>画质</b>才是真正能换速度的旋钮。
+              关掉可省 WiFi 带宽。
+            </div>
+            <div class="hint" id="camstat">—</div>
+          </div>
+        </div>
+        <div class="card-head" style="margin-top:var(--sp-2)">
+          <h3 class="sm">本机照片存档</h3>
+          <span class="src" id="shotwho">—</span>
+        </div>
+        <div class="list" id="shotlist"></div>
+      </div>
+
+      <div class="card" id="card3d" hidden>
+        <div class="card-head">
+          <h3>板子姿态 · 3D</h3>
+          <span class="src" id="d3src">—</span>
+        </div>
+        <div class="field">
+          <label for="pollsel">页面取数频率</label>
           <select id="pollsel" title="页面从服务器取数的频率。想更跟手就选 60Hz —— 但前提是板端上报周期也调到 50ms（板子设置里的「灵敏度」），两个都够快才真跟手">
             <option value="16">60 Hz</option>
             <option value="33">30 Hz</option>
@@ -1586,156 +2395,87 @@ footer{max-width:1400px;margin:18px auto 0;color:var(--faint);font-size:11px;lin
             <option value="500">2 Hz</option>
             <option value="2000">0.5 Hz</option>
           </select>
-        </span>
-      </span></div>
-    <canvas id="board3d" style="width:100%;height:280px;display:block"></canvas>
-    <div class="hint" style="margin-top:6px">橙色小条 = 板子顶边（远的那条）；地面网格固定不动，板子跟着实时姿态转。
-      数据**多久来一次**由两处共同决定：这里的「刷新」+ 板端「灵敏度」（上报周期）—— 两个都够快才真跟手。
-      画面仍按 60Hz 平滑（中间做 slerp），所以取数慢一点也不会一跳一跳。</div>
-  </section>
-
-  <section class="card wide" id="cardcam">
-    <div class="card-head"><h2>摄像头</h2>
-      <span class="src" id="camwho">—</span></div>
-    <div class="camwrap">
-      <div class="camview"><img id="camimg" alt="摄像头画面">
-        <div class="nosig" id="camnosig">点右边「开启实时画面」<br>
-          （板子离线 / 摄像头自检没过时不会有画面）</div></div>
-      <div class="camside">
-        <button id="camshot">拍照 → 存进板子 SD 卡</button>
-        <button id="camlive">开启实时画面</button>
-        <div class="hint" style="margin-top:8px">
-          实时画面是板子<b>推</b>上来的（板子是 HTTP 客户端，网页连不到板子本身）。
-          开启后约 2 帧/秒，关掉可省 WiFi 带宽（OV3660 的 JPEG 是 1280x720，一帧约 27KB）。
         </div>
-        <div class="hint" id="camstat" style="margin-top:6px">—</div>
+        <canvas id="board3d" role="img" aria-label="板子姿态 3D 示意" style="width:100%;height:280px;display:block"></canvas>
+        <div class="hint">橙色小条 = 板子顶边（远的那条）；地面网格固定不动，板子跟着实时姿态转。
+          画面按 60Hz 平滑（中间做 slerp），所以取数慢一点也不会一跳一跳。</div>
       </div>
     </div>
-    <div class="card-head" style="margin-top:14px"><h3 style="margin:0;font-size:13px">本机照片存档</h3>
-      <span class="src" id="shotwho">—</span></div>
-    <div class="list" id="shotlist" style="margin-top:8px"></div>
   </section>
 
-  <section class="card wide" id="cardsd">
-    <div class="card-head"><h2>存储管理</h2>
-      <span class="src" id="sdwho">数据来自最近一次「读取存储信息」的回传</span></div>
-    <div class="row" style="flex-wrap:wrap;gap:8px;align-items:center">
-      <button id="sdrefresh">读取存储信息</button>
-      <span class="hint">命令发给「设备」卡片里勾选的那些（勾多台就一起读）</span>
+  <section class="region">
+    <div class="region-head">
+      <h2>板子管理</h2>
+      <p class="region-sub">改完通过「下一帧遥测的响应」下发到板子并写入 NVS；空着 = 不改那一项。</p>
     </div>
-    <div id="sdring" class="ringwrap"></div>
-    <div class="list" id="sdfiles" style="margin-top:8px"></div>
-  </section>
-
-  <section class="card wide" id="cardcfg">
-    <div class="card-head"><h2>板子设置</h2>
-      <span class="src">改完通过「下一帧遥测的响应」下发到板子并写入 NVS；空着 = 不改那一项</span></div>
-    <div class="row" style="flex-wrap:wrap;gap:8px;align-items:center;margin-top:6px">
-      <span class="src">WiFi 名称</span>
-      <input id="cfgssid" placeholder="不改就留空" autocomplete="off"
-             style="background:var(--card-hi);color:var(--text);border:1px solid var(--line);
-                    border-radius:8px;padding:5px 9px;min-width:150px">
-      <span class="src">密码</span>
-      <input id="cfgpass" type="password" placeholder="不改就留空" autocomplete="new-password"
-             style="background:var(--card-hi);color:var(--text);border:1px solid var(--line);
-                    border-radius:8px;padding:5px 9px;min-width:150px">
-    </div>
-    <div class="row" style="flex-wrap:wrap;gap:8px;align-items:center;margin-top:8px">
-      <span class="src">服务器地址</span>
-      <input id="cfgurl" placeholder="http://192.168.x.x:8000" autocomplete="off"
-             style="background:var(--card-hi);color:var(--text);border:1px solid var(--line);
-                    border-radius:8px;padding:5px 9px;min-width:210px">
-      <span class="src">上报周期 ms</span>
-      <input id="cfgper" type="number" min="50" max="2000" step="10" placeholder="50~2000"
-             style="background:var(--card-hi);color:var(--text);border:1px solid var(--line);
-                    border-radius:8px;padding:5px 9px;width:110px">
-      <button id="cfgapply">下发到板子</button>
-      <span id="cfghint" class="hint"></span>
-    </div>
-    <div class="hint" style="margin-top:6px">
-      <b>改 WiFi 会先试连、连上了才保存</b>（最多 8 秒）—— 密码填错不会把板子弄失联。
-      <b>上报周期就是「灵敏度」</b>：50ms=20Hz（最跟手）/ 100ms=10Hz / 500ms=2Hz（默认）。
-      越小越跟手，但 WiFi 压力越大；50ms 已接近单次往返的量级，跑不到也正常。
-    </div>
-  </section>
-
-  <section class="card hero">
-    <div class="card-head"><h2>当前活动</h2><span class="src" id="src">—</span></div>
-    <div class="gauge">
-      <svg viewBox="0 0 140 140" aria-hidden="true">
-        <circle class="track" cx="70" cy="70" r="56"></circle>
-        <circle class="val" id="ring" cx="70" cy="70" r="56"></circle>
-      </svg>
-      <div class="gauge-mid">
-        <div class="act" id="act">…</div>
-        <div class="abs mono" id="abs">0.00 g</div>
+    <div class="cols">
+      <div class="card lead" id="cardcfg">
+        <div class="card-head">
+          <h3>板子设置</h3>
+        </div>
+        <div class="formrow">
+          <div class="field">
+            <label for="cfgssid">WiFi 名称</label>
+            <input id="cfgssid" type="text" placeholder="不改就留空" autocomplete="off">
+          </div>
+          <div class="field">
+            <label for="cfgpass">密码</label>
+            <input id="cfgpass" type="password" placeholder="不改就留空" autocomplete="new-password">
+          </div>
+        </div>
+        <div class="formrow">
+          <div class="field" style="flex:1 1 240px">
+            <label for="cfgurl">服务器地址</label>
+            <input id="cfgurl" type="text" placeholder="http://192.168.x.x:8000" autocomplete="off">
+          </div>
+          <div class="field">
+            <label for="cfgper">上报周期 ms</label>
+            <input id="cfgper" type="number" min="50" max="2000" step="10" placeholder="50~2000" style="width:120px">
+          </div>
+        </div>
+        <div class="actions">
+          <button id="cfgapply">下发到板子</button>
+          <span id="cfghint" class="hint"></span>
+        </div>
+        <div class="hint">
+          <b>改 WiFi 会先试连、连上了才保存</b>（最多 8 秒）—— 密码填错不会把板子弄失联。
+          <b>上报周期就是「灵敏度」</b>：50ms=20Hz（最跟手）/ 100ms=10Hz / 500ms=2Hz（默认）。
+          越小越跟手，但 WiFi 压力越大；50ms 已接近单次往返的量级，跑不到也正常。
+        </div>
       </div>
-    </div>
-    <div class="stats">
-      <div><span>步数 / 8s</span><b id="steps">0</b></div>
-      <div><span>晃动 / 8s</span><b id="shakes">0</b></div>
-      <div><span>AI 来源</span><b id="mode" class="sm">规则AI</b></div>
-    </div>
-    <div class="reply" id="replybox">
-      <span class="tag">AI</span>
-      <div class="txt" id="reply">按板子 BOOT 键即可向服务器 AI 提问。</div>
-    </div>
-  </section>
 
-  <section class="card">
-    <div class="card-head"><h2>合加速度 |a|</h2><span class="src">最近 8 秒 · 服务端降采样</span></div>
-    <canvas id="cv"></canvas>
-    <div class="legend">
-      <span><i style="background:var(--blue)"></i>|a| 曲线</span>
-      <span><i style="background:var(--faint)"></i>1g 参考线</span>
-      <span><i style="background:var(--red)"></i>失重阈值 0.35g（疑似跌落）</span>
-    </div>
-  </section>
-
-  <section class="card">
-    <div class="card-head"><h2>姿态（屏幕坐标系）</h2><span class="src" id="tilt">倾角 —</span></div>
-    <div class="ball">
-      <div class="cross"></div>
-      <div class="cross2"></div>
-      <div class="ring2"></div>
-      <div class="dot" id="ball"></div>
-    </div>
-    <div class="bars">
-      <div class="bar"><em style="color:var(--red)">X</em><div class="t"><i id="bx"></i></div><span class="v mono" id="vx">0.00</span></div>
-      <div class="bar"><em style="color:var(--green)">Y</em><div class="t"><i id="by"></i></div><span class="v mono" id="vy">0.00</span></div>
-      <div class="bar"><em style="color:var(--blue)">Z</em><div class="t"><i id="bz"></i></div><span class="v mono" id="vz">0.00</span></div>
+      <div class="card" id="cardsd">
+        <div class="card-head">
+          <h3>存储管理</h3>
+          <span class="src" id="sdwho">—</span>
+        </div>
+        <div class="actions">
+          <button id="sdrefresh">读取存储信息</button>
+        </div>
+        <div id="sdring" class="ringwrap"></div>
+        <div class="list" id="sdfiles"></div>
+      </div>
     </div>
   </section>
 </main>
 
-<section class="card wide">
-  <div class="card-head">
-    <h2>远程指令</h2>
-    <span class="src">指令搭在「下一帧遥测的响应」里下发，板子在再下一帧回传结果 —— 一次真实的硬件往返；多台板时先在「设备」里点选目标</span>
-  </div>
-  <div class="row">
-    <span id="cmdbts"></span>
-    <span id="cmdhint" class="hint"></span>
-  </div>
-  <div class="row" style="margin-top:10px;align-items:center;gap:8px">
-    <span class="src">方向档位 oN</span>
-    <select id="orientsel" style="background:var(--card-hi);color:var(--text);
-      border:1px solid var(--line);border-radius:8px;padding:4px 8px"></select>
-    <button id="orientapply">应用档位</button>
-    <span id="orientnow" class="hint"></span>
-  </div>
-  <div class="list" id="cmds" style="margin-top:10px"></div>
-</section>
-
-<section class="card wide">
-  <div class="card-head"><h2>事件流</h2><span class="src" id="evcount"></span></div>
-  <div id="feed"></div>
-</section>
-
 <footer>
-  服务器 <span class="mono" id="host"></span> · <span id="logdir"></span> ·
-  页面只用标准库 SSE 推送，不依赖外网；指令白名单 <span class="mono" id="names"></span>
+  <div class="shell">
+    服务器 <span id="host"></span> · <span id="logdir"></span> ·
+    页面只用标准库 SSE 推送，不依赖外网；指令白名单 <span id="names"></span>
+  </div>
 </footer>
+
+<dialog class="modal" id="cfm">
+  <div class="modal-body">
+    <h3 id="cfm-title">确认操作</h3>
+    <p id="cfm-body"></p>
+  </div>
+  <div class="modal-foot">
+    <button id="cfm-cancel" type="button">取消</button>
+    <button id="cfm-ok" type="button" class="danger">确定</button>
+  </div>
+</dialog>
 
 <script>
 (function(){
@@ -1758,28 +2498,118 @@ function ago(sec){
   return Math.round(sec/3600) + " 小时前";
 }
 
-/* ---------------- 语义色（与 device/main/ui.c 同一套） ---------------- */
-var C = { green:"#3fb950", blue:"#58a6ff", amber:"#e3b341", red:"#f85149",
-          purple:"#a371f7", teal:"#2dd4bf", dim:"#8b949e", faint:"#5a6472" };
-/* 同一颜色的 RGB 分量，用来染 hero 卡片边框/光晕（CSS 变量 --act-rgb） */
-var CRGB = { green:"63,185,80", blue:"88,166,255", amber:"227,179,65", red:"248,81,73",
-             purple:"163,113,247", teal:"45,212,191", dim:"139,148,158", faint:"90,100,114" };
+/* ---------------- 确认弹窗 ----------------
+ * 用原生 <dialog>，不用 window.confirm()：系统弹窗在深色界面上是一块白方块，
+ * 而且会**阻塞整个页面**（SSE 推送、3D 渲染全停）。
+ * 这里是 Promise 风格，调用方写 .then(function(ok){...})。
+ * 浏览器不支持 showModal() 时退回 window.confirm —— 功能不能因为 UI 新特性而丢。 */
+var cfmDlg = $("cfm");
+function confirmDialog(title, body, okLabel){
+  if (!cfmDlg || typeof cfmDlg.showModal !== "function"){
+    return Promise.resolve(window.confirm(title + "：" + body));
+  }
+  $("cfm-title").textContent = title;
+  $("cfm-body").textContent = body;
+  $("cfm-ok").textContent = okLabel || "确定";
+  return new Promise(function(resolve){
+    var settled = false;
+    function finish(ok){
+      if (settled) return;
+      settled = true;
+      cfmDlg.removeEventListener("close", onClose);
+      $("cfm-ok").onclick = null;
+      $("cfm-cancel").onclick = null;
+      resolve(ok);
+    }
+    function onClose(){ finish(cfmDlg.returnValue === "ok"); }
+    cfmDlg.addEventListener("close", onClose);
+    /* 两个按钮**必须自己 close()**：它们不在 <form method="dialog"> 里，
+       浏览器不会替我们把弹窗关掉（第一版就是这样，点"取消"弹窗纹丝不动）。
+       用 close(value) 直接定 returnValue，Esc 关闭时它保持空 = 取消。 */
+    $("cfm-ok").onclick = function(){ cfmDlg.close("ok"); };
+    $("cfm-cancel").onclick = function(){ cfmDlg.close(""); };
+    cfmDlg.returnValue = "";
+    cfmDlg.showModal();
+  });
+}
+
+/* ---------------- 颜色：一律从 CSS 令牌取，不在 JS 里抄第二份 ----------------
+ * canvas 拿不到 CSS 变量，而页面有**两套主题**（浅色/深色）。
+ * 早先这里是一张写死的 hex 表 —— 加主题那一刻它就成了第二个真相来源，
+ * 迟早不同步（而且"看起来没坏"，只是某个主题下图表颜色不对）。
+ * 现在用 1x1 canvas 把任意 CSS 颜色落成一个像素读回来：
+ * oklch() / color() / rgba() 都能拿到确定的 sRGB 分量。
+ * 结果按「主题 + 变量名」缓存，避免每帧都做一次 getImageData。 */
+var _probeCtx = null, _varCache = {}, _varCacheTheme = "";
+function _themeName(){
+  return document.documentElement.getAttribute("data-theme") === "dark" ? "dark" : "light";
+}
+function _resolve(css){
+  if (!_probeCtx){
+    var pc = document.createElement("canvas"); pc.width = pc.height = 1;
+    _probeCtx = pc.getContext("2d", {willReadFrequently: true});
+  }
+  _probeCtx.fillStyle = "#000"; _probeCtx.fillRect(0, 0, 1, 1);
+  _probeCtx.fillStyle = css;    _probeCtx.fillRect(0, 0, 1, 1);
+  var d = _probeCtx.getImageData(0, 0, 1, 1).data;
+  return [d[0], d[1], d[2]];
+}
+function varRGB(name){
+  var th = _themeName();
+  if (th !== _varCacheTheme){ _varCache = {}; _varCacheTheme = th; }   /* 换主题自动失效 */
+  if (_varCache[name]) return _varCache[name];
+  var raw = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+  var rgb = raw ? _resolve(raw) : [128, 128, 128];
+  _varCache[name] = rgb;
+  return rgb;
+}
+function cssVar(name, alpha){
+  var c = varRGB(name);
+  return (alpha === undefined)
+    ? "rgb(" + c[0] + "," + c[1] + "," + c[2] + ")"
+    : "rgba(" + c[0] + "," + c[1] + "," + c[2] + "," + alpha + ")";
+}
+/* "r,g,b" 三元组：CSS 里用 rgb(var(--act-rgb) / .10) 染色时要用 */
+function varTriplet(name){ var c = varRGB(name); return c[0] + "," + c[1] + "," + c[2]; }
+
+/* ---------------- 主题 ----------------
+ * 默认明亮（写在 <html data-theme> 上），用户选过的存在 localStorage，
+ * head 里那段内联脚本会在首次绘制前应用 —— 所以这里不需要再管"初始值"。
+ * 切换后要**强制重画**：canvas 的像素是画上去的，CSS 换了它不会自己变。 */
+function applyTheme(t){
+  document.documentElement.setAttribute("data-theme", t === "dark" ? "dark" : "light");
+  /* 清掉"上次是什么"的缓存，否则 setRing/setBall/setTilt 会认为值没变而跳过重绘 */
+  lastRing = -1; lastAct = ""; lastBall = ""; lastBallColor = ""; lastTilt = "";
+  fitCanvas();
+  pull();
+  var btn = $("theme");
+  if (btn){
+    var toDark = t !== "dark";
+    btn.title = toDark ? "切换到深色主题" : "切换到明亮主题";
+    btn.setAttribute("aria-label", btn.title);
+  }
+}
 
 /* 服务器文案 → 活动词 + 颜色（与板端 classify() 同一套规则） */
+/* 服务器文案 → 活动词 + 颜色。这里存的是**CSS 变量名**而不是色值 ——
+   语义色的含义与板端 device/main/ui.c 的 UI_C_* 一致，具体色值由主题决定。 */
 var ACT = [
-  { k:["跌落","失重"], word:"跌落", color:C.red,   rgb:CRGB.red },
-  { k:["晃动"],        word:"晃动", color:C.amber, rgb:CRGB.amber },
-  { k:["步行"],        word:"步行", color:C.purple,rgb:CRGB.purple },
-  { k:["运动"],        word:"运动", color:C.blue,  rgb:CRGB.blue },
-  { k:["静置"],        word:"静置", color:C.green, rgb:CRGB.green }
+  { k:["跌落","失重"], word:"跌落", v:"--color-fall"  },
+  { k:["晃动"],        word:"晃动", v:"--color-shake" },
+  { k:["步行"],        word:"步行", v:"--color-walk"  },
+  { k:["运动"],        word:"运动", v:"--color-move"  },
+  { k:["静置"],        word:"静置", v:"--color-still" }
 ];
+function actColor(t){
+  return { word: t.word, color: cssVar(t.v), rgb: varTriplet(t.v) };
+}
 function classify(s){
   for (var i=0;i<ACT.length;i++){
     for (var j=0;j<ACT[i].k.length;j++){
-      if (s.indexOf(ACT[i].k[j]) >= 0) return ACT[i];
+      if (s.indexOf(ACT[i].k[j]) >= 0) return actColor(ACT[i]);
     }
   }
-  return { word: s ? s.slice(0,4) : "等待", color:C.faint, rgb:CRGB.faint };
+  return actColor({ word: s ? s.slice(0,4) : "等待", v:"--color-idle" });
 }
 
 /* 指令 → 按钮文案与参数（按钮从 /api/commands 的 names 动态生成，
@@ -1804,7 +2634,7 @@ var CMD_UI = {
 /* ---------------- 环形仪表（270°，与板端同款） ---------------- */
 var RING_R = 56, RING_C = 2*Math.PI*RING_R, RING_ARC = RING_C*0.75, ABS_FULL = 2.0;
 var lastRing = -1, lastAct = "", lastBall = "", lastBallColor = "", lastTilt = "";
-var lastActColor = "rgb(90,100,114)";      /* 曲线读数胶囊描边用，随活动色更新 */
+var lastActColor = cssVar("--color-idle");   /* 曲线读数胶囊描边用，随活动色更新 */
 
 function setRing(mag){
   var pct = Math.max(0, Math.min(1, mag/ABS_FULL));
@@ -1828,15 +2658,18 @@ function drawChart(){
   ctx.clearRect(0,0,W,H);
   if (W < 2 || H < 2) return;
 
-  var padL = 34*dpr, padR = 10*dpr, padT = 12*dpr, padB = 18*dpr;
+  var padL = 34*dpr, padR = 10*dpr, padT = 12*dpr, padB = 16*dpr;
   var plotW = W - padL - padR, plotH = H - padT - padB;
   var maxG = 2.4;
+  /* 颜色全部走令牌（见 cssVar）：两套主题下图表要跟着变 */
+  var cGrid = cssVar("--color-text-faint", .22), cFaint = cssVar("--color-text-faint"),
+      cMove = cssVar("--color-move"), cDim = cssVar("--color-text-muted");
 
   function yOf(g){ return padT + plotH - Math.min(g, maxG)/maxG*plotH; }
 
   /* 网格 + 刻度 */
-  ctx.strokeStyle = "#1b2230"; ctx.lineWidth = 1*dpr;
-  ctx.fillStyle = C.faint; ctx.font = (10*dpr)+"px Consolas,monospace";
+  ctx.strokeStyle = cGrid; ctx.lineWidth = 1*dpr;
+  ctx.fillStyle = cFaint; ctx.font = (10*dpr)+"px PlexMono,Consolas,monospace";
   ctx.textAlign = "right"; ctx.textBaseline = "middle";
   [0,0.5,1,1.5,2].forEach(function(g){
     var y = yOf(g);
@@ -1852,12 +2685,12 @@ function drawChart(){
     ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(W-padR, y); ctx.stroke();
     ctx.restore();
   }
-  hline(0.35, "rgba(248,81,73,.55)", [4,4]);
-  hline(1.0,  "rgba(139,148,158,.45)", [2,5]);
+  hline(0.35, cssVar("--color-fall", .55), [4,4]);
+  hline(1.0,  cssVar("--color-text-faint", .40), [2,5]);
 
   var n = samples.length;
   if (n < 2){
-    ctx.fillStyle = C.faint; ctx.textAlign = "left";
+    ctx.fillStyle = cFaint; ctx.textAlign = "left";
     ctx.fillText("等待开发板上报…", padL+6*dpr, padT+14*dpr);
     return;
   }
@@ -1869,8 +2702,8 @@ function drawChart(){
   });
 
   var grad = ctx.createLinearGradient(0, padT, 0, padT+plotH);
-  grad.addColorStop(0, "rgba(88,166,255,.42)");
-  grad.addColorStop(1, "rgba(88,166,255,.02)");
+  grad.addColorStop(0, cssVar("--color-move", .34));
+  grad.addColorStop(1, cssVar("--color-move", .02));
   ctx.beginPath(); ctx.moveTo(pts[0][0], padT+plotH);
   pts.forEach(function(p){ ctx.lineTo(p[0], p[1]); });
   ctx.lineTo(pts[n-1][0], padT+plotH); ctx.closePath();
@@ -1878,37 +2711,40 @@ function drawChart(){
 
   ctx.beginPath();
   pts.forEach(function(p, i){ i ? ctx.lineTo(p[0],p[1]) : ctx.moveTo(p[0],p[1]); });
-  ctx.strokeStyle = C.blue; ctx.lineWidth = 2*dpr;
+  ctx.strokeStyle = cMove; ctx.lineWidth = 2*dpr;
   ctx.lineJoin = "round"; ctx.stroke();
 
   /* 末端点 */
   var last = pts[n-1];
   ctx.beginPath(); ctx.arc(last[0], last[1], 4*dpr, 0, 6.2832);
-  ctx.fillStyle = C.blue; ctx.fill();
+  ctx.fillStyle = cMove; ctx.fill();
   ctx.beginPath(); ctx.arc(last[0], last[1], 8*dpr, 0, 6.2832);
-  ctx.fillStyle = "rgba(88,166,255,.22)"; ctx.fill();
+  ctx.fillStyle = cssVar("--color-move", .20); ctx.fill();
 
   /* 末端读数胶囊：半透明深色底 + 当前活动色描边，贴在末端点上方，不出右界 */
   var label = last[2].toFixed(2) + " g";
-  ctx.font = (11*dpr)+"px Consolas,monospace";
+  ctx.font = (11*dpr)+"px PlexMono,Consolas,monospace";
   var tw = ctx.measureText(label).width;
   var lx = Math.max(padL + 4*dpr, Math.min(last[0] - tw/2, W - padR - tw - 12*dpr));
   var ly = Math.max(padT, padT - 2*dpr);
   ctx.beginPath();
-  if (ctx.roundRect) ctx.roundRect(lx - 6*dpr, ly, tw + 12*dpr, 16*dpr, 8*dpr);
+  if (ctx.roundRect) ctx.roundRect(lx - 6*dpr, ly, tw + 12*dpr, 16*dpr, 6*dpr);
   else ctx.rect(lx - 6*dpr, ly, tw + 12*dpr, 16*dpr);
-  ctx.fillStyle = "rgba(13,18,25,.88)";
+  ctx.fillStyle = cssVar("--color-surface", .92);
   ctx.fill();
   ctx.lineWidth = 1*dpr;
   ctx.strokeStyle = lastActColor.replace(")", ",.45)").replace("rgb", "rgba");
   ctx.stroke();
-  ctx.fillStyle = C.dim; ctx.textAlign = "left"; ctx.textBaseline = "middle";
+  ctx.fillStyle = cDim; ctx.textAlign = "left"; ctx.textBaseline = "middle";
   ctx.fillText(label, lx, ly + 8*dpr);
 }
 addEventListener("resize", fitCanvas);
 
 /* ---------------- 姿态球与三轴条 ---------------- */
-var BUBBLE_MAX = 62;                     /* 1g 对应的像素偏移（相对球半径 50%） */
+/* 1g 对应的像素偏移。这个值**必须跟着球的大小走**：球半径 105px（max-width 210），
+   偏移 68px + 小球半径 10px = 78 < 105，小球永远压在球面之内；
+   比例沿用旧版的 65% 左右，所以"倾斜多少、球跑多远"的手感没变。 */
+var BUBBLE_MAX = 68;
 /* ---------------- 板子姿态 3D ----------------
  * 把板子做成一块小牌子，按加速度计实时转动 —— "板子现在什么姿态"一眼就懂，
  * 比数字和圆点直观得多（用户 2026-09-23 提的需求）。
@@ -1920,15 +2756,15 @@ var BUBBLE_MAX = 62;                     /* 1g 对应的像素偏移（相对球
 var d3 = null;
 function init3d(){
   if (typeof THREE === "undefined") return;
-  var cv = $("board3d");
-  if (!cv) return;
+  var cv3 = $("board3d");
+  if (!cv3) return;
   var renderer;
   try {
-    renderer = new THREE.WebGLRenderer({canvas: cv, antialias: true, alpha: true});
+    renderer = new THREE.WebGLRenderer({canvas: cv3, antialias: true, alpha: true});
   } catch (e) {
     return;                    /* 没有 WebGL 就不显示这张卡，别留个空白框 */
   }
-  var W = Math.max(200, cv.clientWidth || 320), H = 280;
+  var W = Math.max(200, cv3.clientWidth || 320), H = 280;
   renderer.setPixelRatio(Math.min(2, window.devicePixelRatio || 1));
   renderer.setSize(W, H, false);
 
@@ -1964,12 +2800,10 @@ function init3d(){
    * 于是整个模型是**镜像**的 —— 这才是立起来看到背面的真正根因。 */
   scr.position.z = -0.106;
   g.add(scr);
-  /* 顶边标记：和板端屏幕的橙色小条同一个约定（+y 是"下"，所以顶边在 -y） */
   /* 顶边标记：做成**跨在板子顶边上、两面都露出来的一条棱**，
    * 而不是贴在某一面上的薄片 —— 原来贴在 +z 面（z=0.09），从背面看被板子挡住。
    * 现在 z 方向做到 ±0.14（板厚 ±0.1），正反面都看得到；
-   * +y 是"下"（屏幕系），所以顶边在 -y。 */
-  /* 位置在 **-y**：屏幕系里 +y 是"下"，所以 -y 才是板子的**顶边**。
+   * +y 是"下"（屏幕系），所以顶边在 -y。
    * 这样两种摆法都对：
    *   平放（屏幕朝上）→ 顶边在**离你远的那条边**
    *   立起来          → 顶边在**上面**
@@ -2001,7 +2835,7 @@ function init3d(){
   })();
 
   window.addEventListener("resize", function(){
-    var w = Math.max(200, cv.clientWidth || 320);
+    var w = Math.max(200, cv3.clientWidth || 320);
     renderer.setSize(w, H, false);
     camera.aspect = w / H;
     camera.updateProjectionMatrix();
@@ -2077,19 +2911,16 @@ function update3d(x, y, z){
   d3.target.copy(best || base);
 }
 
-
-
-
 function setBall(x, y, mag){
   var bx = Math.max(-1, Math.min(1, x)) * BUBBLE_MAX;
   var by = Math.max(-1, Math.min(1, y)) * BUBBLE_MAX;
   var key = bx.toFixed(0)+","+by.toFixed(0);
   var horiz = Math.sqrt(x*x + y*y);
   /* 与板端同一套判据：mag<0.05 是还没有效读数（灰），<0.35 才是失重红 */
-  var color = (mag < 0.05) ? C.faint
-            : (mag < 0.35) ? C.red
-            : (horiz < 0.15) ? C.green
-            : (horiz < 0.7) ? C.amber : C.red;
+  var color = (mag < 0.05) ? cssVar("--color-idle")
+            : (mag < 0.35) ? cssVar("--color-fall")
+            : (horiz < 0.15) ? cssVar("--color-still")
+            : (horiz < 0.7) ? cssVar("--color-shake") : cssVar("--color-fall");
   if (key !== lastBall || color !== lastBallColor){
     lastBall = key;
     lastBallColor = color;
@@ -2102,8 +2933,8 @@ function setBall(x, y, mag){
 var lastDeg = null;
 function setTilt(z, mag){
   var t, color;
-  if (mag < 0.05){ t = "无读数"; color = C.faint; lastDeg = null; }
-  else if (mag < 0.35){ t = "失重"; color = C.red; lastDeg = null; }
+  if (mag < 0.05){ t = "无读数"; color = cssVar("--color-idle"); lastDeg = null; }
+  else if (mag < 0.35){ t = "失重"; color = cssVar("--color-fall"); lastDeg = null; }
   else {
     var c = Math.min(1, Math.abs(z)/mag);
     var raw = Math.acos(c)*180/Math.PI;
@@ -2112,7 +2943,7 @@ function setTilt(z, mag){
     lastDeg = (lastDeg === null) ? raw : (lastDeg + 0.4*(raw - lastDeg));
     var deg = Math.round(lastDeg);
     t = "倾角 " + deg + "°";
-    color = deg === 0 ? C.green : (deg < 40 ? C.amber : C.red);
+    color = deg === 0 ? cssVar("--color-still") : (deg < 40 ? cssVar("--color-shake") : cssVar("--color-fall"));
   }
   if (t !== lastTilt){
     lastTilt = t;
@@ -2126,7 +2957,7 @@ function setBar(i, v){
   var pct = Math.min(Math.abs(v), 2)/2*50;      /* 对称：从中点往两边长 */
   el.style.width = pct + "%";
   el.style.left = (v >= 0 ? 50 : 50-pct) + "%";
-  var ac = [C.red, C.green, C.blue][i];
+  var ac = [cssVar("--color-fall"), cssVar("--color-still"), cssVar("--color-move")][i];
   el.style.background = ac;
   vl.style.color = ac;                           /* 数值与 X/Y/Z 标签同色，与板端一致 */
   vl.textContent = (v >= 0 ? "+" : "") + v.toFixed(2);
@@ -2145,13 +2976,20 @@ function renderButtons(){
   var host = $("cmdbts");
   if (host.dataset.built === cmdNames.join(",")) { syncButtons(); return; }
   host.dataset.built = cmdNames.join(",");
-  host.innerHTML = cmdNames.filter(function(n){
-    return !(CMD_UI[n] || {}).hidden;          /* hidden：只走程序内部触发，不出按钮 */
-  }).map(function(n){
-    var ui = CMD_UI[n] || { label:n };
-    return '<button data-cmd="' + n + '"' + (ui.primary ? ' class="primary"' : '') + '>'
-         + ui.label + '</button>';
-  }).join(" ") || '<span class="empty">服务端没有开放任何远程指令</span>';
+  /* 分两组渲染：安全指令在左，**破坏性指令单独顶到最右**，中间用可伸缩间隔隔开。
+     原来它们按服务端给的顺序挨着排 —— 「格式化 SD 卡」紧邻「读取存储信息」，
+     误点一次就是整张卡的数据，而这两个按钮长得一模一样。 */
+  var safe = [], risky = [];
+  cmdNames.forEach(function(n){
+    var ui = CMD_UI[n] || {};
+    if (ui.hidden) return;                     /* hidden：只走程序内部触发，不出按钮 */
+    var html = '<button data-cmd="' + n + '"' + (ui.primary ? ' class="primary"' : '') + '>'
+             + (ui.label || n) + '</button>';
+    (ui.danger ? risky : safe).push(html);
+  });
+  host.innerHTML = (safe.length || risky.length)
+    ? safe.join("") + (risky.length ? '<span class="cmd-gap"></span>' + risky.join("") : "")
+    : '<span class="empty">服务端没有开放任何远程指令</span>';
   Array.prototype.forEach.call(host.querySelectorAll("button"), function(b){
     b.onclick = function(){ sendCmd(b.dataset.cmd, b); };
   });
@@ -2171,15 +3009,21 @@ function syncButtons(){
     }
   });
 }
+/* 破坏性指令（目前只有 sd_format）先弹确认 —— 一键清掉整张卡，点错了没有撤销。
+   confirmDialog 是异步的，所以真正的下发逻辑挪到 doSendCmd 里。 */
 function sendCmd(name, btn, overrideParams){
-  /* 破坏性指令（目前只有 sd_format）必须先确认 —— 一键清掉整张卡，
-     点错了没有撤销。 */
   var ui0 = CMD_UI[name] || {};
   if (ui0.danger){
-    /* 单行文案：**刻意不写 \n** —— 这段 JS 住在 Python 的三引号字符串里，
-       写一个反斜杠会被 Python 先吃成真换行，JS 就语法错误了。 */
-    if (!window.confirm("确定要格式化板子上的 SD 卡吗？卡里原有内容会全部丢失，无法恢复。")) return;
+    confirmDialog("格式化 SD 卡",
+                  "板子上的 SD 卡会被整张清空，卡里原有内容全部丢失，无法恢复。",
+                  "格式化").then(function(ok){
+      if (ok) doSendCmd(name, btn, overrideParams);
+    });
+    return;
   }
+  doSendCmd(name, btn, overrideParams);
+}
+function doSendCmd(name, btn, overrideParams){
   var ui = CMD_UI[name] || {};
   var params = overrideParams !== undefined ? overrideParams
              : (ui.toggle && name === "led_set" ? {on: !ledSteady} : (ui.params || {}));
@@ -2239,6 +3083,7 @@ function camFrame(){
   im.onload = function(){
     camFails = 0;
     camShow(true);
+    im.hidden = false;          /* 收到第一帧才让它出现，之前别露出"图片裂了"的图标 */
     var ns = $("camnosig");
     if (ns) ns.style.display = "none";
     var st = $("camstat");
@@ -2247,6 +3092,7 @@ function camFrame(){
   };
   im.onerror = function(){
     camFails++;
+    im.hidden = true;
     var ns = $("camnosig");
     if (ns) ns.style.display = "";
     /* 连续取不到就别一直重试了，提示一次即可 */
@@ -2256,22 +3102,50 @@ function camFrame(){
     }
   };
 }
+/* 当前选的帧率（1..10，和板端 CAM_STREAM_FPS_MAX 对齐）。 */
+function camFps(){
+  var el = $("camfps");
+  var n = el ? parseInt(el.value, 10) : 2;
+  return (isFinite(n) && n >= 1 && n <= 10) ? n : 2;
+}
+/* 当前选的画质（1..100，和板端 CAM_JPEG_QUALITY_* 对齐）。
+ * 这是**唯一**能改帧大小的旋钮 —— 分辨率由传感器固定 1280x720。 */
+function camQ(){
+  var el = $("camq");
+  var n = el ? parseInt(el.value, 10) : 40;
+  return (isFinite(n) && n >= CAM_JPEG_QUALITY_MIN && n <= CAM_JPEG_QUALITY_MAX) ? n : 40;
+}
 function camSetLive(on){
   camOn = on;
   if (camTimer) { clearInterval(camTimer); camTimer = null; }
   var btn = $("camlive");
+  var fps = camFps();
   if (on) {
     camFrame();
-    camTimer = setInterval(camFrame, 200);      /* 5 fps，和板端推送节奏对齐 */
+    /* 取帧间隔跟着**板端的推帧间隔**走 —— 板子只推 2 帧/秒时页面每 200ms 取一次
+     * 纯属白问（三次里两次拿到同一帧，白占连接）。下限 100ms 兜住离谱输入。 */
+    camTimer = setInterval(camFrame, Math.max(100, Math.round(1000 / fps)));
   }
   if (btn) btn.textContent = on ? "关闭实时画面" : "开启实时画面";
+  /* ⚠️ **必须把命令下发给板子**，光起本地定时器没用。
+   *
+   * 板子是 HTTP 客户端、只会"推"：它不推，服务端 FRAMES 里就没有帧，
+   * 页面每 200ms 轮询到的永远是 404，表现成"实时画面点了没反应、只有拍照才有图"
+   * —— 2026-09-28 用户反馈的正是这个。原来的实现只切了本地状态与定时器，
+   * 注释里写着"由这个按钮触发 cam_stream"，但**那一句 sendCmd 从来没写**。
+   * （当时从服务端看，点过按钮却收不到任何 cam_stream 命令，就是这个原因。）
+   *
+   * fps / quality 一起下发：省流还是丝滑是**板子**的事（真正决定占多少 WiFi
+   * 带宽、每帧多大的是它），页面只负责按同样的节奏取。
+   * quality 是**唯一**能改帧大小的旋钮（分辨率被传感器锁在 1280x720）。 */
+  sendCmd("cam_stream", null, {on: on, fps: fps, quality: camQ()});
 }
 function shotRow(dev, name, bytes, local){
   return '<div class="shot"><img src="' + (local ? local : "/api/shots/" +
       encodeURIComponent(dev) + "/" + encodeURIComponent(name)) + '" alt="">' +
     '<span class="nm">' + esc(name) + '<br><span class="hint">' +
     (bytes ? fmtBytes(bytes) : "") + (local ? " · 本机存档" : " · 板子/服务器") + '</span></span>' +
-    '<button data-shot="' + esc(name) + '" data-local="' + (local ? "1" : "") + '">删除</button></div>';
+    '<button class="sm" data-shot="' + esc(name) + '" data-local="' + (local ? "1" : "") + '">删除</button></div>';
 }
 function renderShots(){
   var host = $("shotlist");
@@ -2289,14 +3163,16 @@ function renderShots(){
       Array.prototype.forEach.call(host.querySelectorAll("[data-shot]"), function(btn){
         btn.onclick = function(){
           var nm = btn.getAttribute("data-shot");
-          if (!window.confirm("删除 " + nm + " ？无法恢复。")) return;
-          if (btn.getAttribute("data-local")) {
-            idbDel(nm, renderShots);
-          } else {
-            fetch("/api/shots/delete", {method: "POST",
-              headers: {"Content-Type": "application/json"},
-              body: JSON.stringify({device: dev, name: nm})}).then(renderShots);
-          }
+          confirmDialog("删除照片", "将永久删除 " + nm + "，无法恢复。", "删除").then(function(ok){
+            if (!ok) return;
+            if (btn.getAttribute("data-local")) {
+              idbDel(nm, renderShots);
+            } else {
+              fetch("/api/shots/delete", {method: "POST",
+                headers: {"Content-Type": "application/json"},
+                body: JSON.stringify({device: dev, name: nm})}).then(renderShots);
+            }
+          });
         };
       });
     });
@@ -2395,6 +3271,17 @@ function parseSdNote(note){
   });
   return out;
 }
+/* 只在内容真的变了才重写 DOM。
+   renderCmds / renderSd 都跟着 10Hz 轮询跑，而内容绝大多数时候没变 ——
+   无脑 `innerHTML =` 等于每秒把同一段 HTML 重写十遍：白干活，还会打断
+   键盘焦点、文本选中、以及正在跑的过渡动画（点存储圆环时那个高亮闪烁就中招）。
+   用元素上的一个私有属性记"上次写进去的 HTML"，比再养一堆模块级变量干净。 */
+function setHTML(el, html){
+  if (!el || el.__html === html) return;
+  el.__html = html;
+  el.innerHTML = html;
+}
+
 function renderSd(){
   var host = $("sdring"), list = $("sdfiles");   /* 容器 id 是 sdring（圆环） */
   if (!host || !list) return;
@@ -2404,25 +3291,25 @@ function renderSd(){
     if (c.name === "sd_ls" && c.state === "done" && c.result && c.result.note) last = c;
   });
   if (!last){
-    host.innerHTML = '<div class="hint">还没读过 —— 点上面的「读取存储信息」' +
-      '（板子离线时命令会排队，等它回来再执行）</div>';
-    list.innerHTML = "";
+    setHTML(host, '<div class="hint">还没读过 —— 点上面的「读取存储信息」' +
+      '（板子离线时命令会排队，等它回来再执行）</div>');
+    setHTML(list, "");
     return;
   }
   var d = parseSdNote(last.result.note);
   if (d.total === null){
-    host.innerHTML = '<div class="hint">板端没返回容量信息</div>';
+    setHTML(host, '<div class="hint">板端没返回容量信息</div>');
   } else {
     var used = Math.max(0, d.total - d.free);
     var pct = d.total ? (used / d.total * 100) : 0;
-    var bar = pct > 90 ? C.red : (pct > 75 ? C.amber : C.green);
+    var bar = pct > 90 ? cssVar("--color-fall") : (pct > 75 ? cssVar("--color-shake") : cssVar("--color-still"));
     /* 圆环：中间写百分比，比一条横条直观；**点它 = 进入文件管理** */
     var R = 44, CIRC = 2 * Math.PI * R;
     var off = (CIRC * (1 - Math.min(100, pct) / 100)).toFixed(1);
-    host.innerHTML =
-      '<div class="ring" id="sdringbtn" title="点击进入文件管理">' +
+    setHTML(host,
+      '<div class="ring" id="sdringbtn" role="button" tabindex="0" title="点击进入文件管理">' +
         '<svg width="104" height="104" viewBox="0 0 104 104">' +
-          '<circle cx="52" cy="52" r="' + R + '" fill="none" stroke="var(--track)" stroke-width="10"/>' +
+          '<circle cx="52" cy="52" r="' + R + '" fill="none" stroke="' + cssVar("--color-surface-3") + '" stroke-width="10"/>' +
           '<circle cx="52" cy="52" r="' + R + '" fill="none" stroke="' + bar + '" stroke-width="10" ' +
             'stroke-linecap="round" stroke-dasharray="' + CIRC.toFixed(1) + '" ' +
             'stroke-dashoffset="' + off + '"/>' +
@@ -2434,35 +3321,45 @@ function renderSd(){
         '<div><span class="k">已用</span> ' + fmtBytes(used) + '</div>' +
         '<div><span class="k">总共</span> ' + fmtBytes(d.total) + '</div>' +
         '<div><span class="k">剩余</span> ' + fmtBytes(d.free) + '</div>' +
-        '<div class="hint" style="margin-top:4px">点圆环进入文件管理 ↓</div>' +
-      '</div>';
+        '<div class="hint" style="margin-top:4px">点圆环跳到下面的文件列表 ↓</div>' +
+      '</div>');
     var rb = $("sdringbtn");
     if (rb) {
-      rb.onclick = function(){
-        var list = $("sdfiles");
-        if (list) {
-          list.scrollIntoView({behavior: "smooth", block: "center"});
-          list.style.transition = "box-shadow .3s";
-          list.style.boxShadow = "0 0 0 2px " + bar;
-          setTimeout(function(){ list.style.boxShadow = "none"; }, 1200);
+      var jump = function(){
+        var fl = $("sdfiles");
+        if (fl) {
+          fl.scrollIntoView({behavior: "smooth", block: "center"});
+          fl.style.transition = "box-shadow .3s";
+          fl.style.boxShadow = "0 0 0 2px " + bar;
+          setTimeout(function(){ fl.style.boxShadow = "none"; }, 1200);
+        }
+      };
+      rb.onclick = jump;
+      /* 圆环也是"可点的 div"，同样要补键盘可达性 */
+      rb.tabIndex = 0;
+      rb.setAttribute("role", "button");
+      rb.onkeydown = function(ev){
+        if (ev.key === "Enter" || ev.key === " " || ev.key === "Spacebar"){
+          ev.preventDefault();
+          jump();
         }
       };
     }
   }
   if (!d.files.length){
-    list.innerHTML = '<div class="empty">卡上没有文件。</div>';
+    setHTML(list, '<div class="empty">卡上没有文件。</div>');
     return;
   }
-  list.innerHTML = d.files.map(function(f){
+  setHTML(list, d.files.map(function(f){
     return '<div class="item"><span class="name">' + esc(f.name) + '</span>' +
-      '<span class="meta mono">' + fmtBytes(f.size) + '</span>' +
-      '<button data-rm="' + esc(f.name) + '" style="margin-left:auto">删除</button></div>';
-  }).join("") + (d.more ? '<div class="hint">（文件较多，只列了前 12 个）</div>' : "");
+      '<span class="meta">' + fmtBytes(f.size) + '</span>' +
+      '<button class="sm" data-rm="' + esc(f.name) + '" style="margin-left:auto">删除</button></div>';
+  }).join("") + (d.more ? '<div class="hint">（文件较多，只列了前 12 个）</div>' : ""));
   Array.prototype.forEach.call(list.querySelectorAll("[data-rm]"), function(b){
     b.onclick = function(){
       var fn = b.getAttribute("data-rm");
-      if (!window.confirm("确定删除板子上的 " + fn + " 吗？无法恢复。")) return;
-      sendCmd("sd_rm", null, {name: fn});
+      confirmDialog("删除板子上的文件", "将永久删除 SD 卡里的 " + fn + "，无法恢复。", "删除")
+        .then(function(ok){ if (ok) sendCmd("sd_rm", null, {name: fn}); });
     };
   });
 }
@@ -2491,24 +3388,27 @@ function syncOrient(){
 function renderCmds(cmds){
   cmdsSeen = cmds || [];
   var el = $("cmds");
-  if (!cmds || !cmds.length){ el.innerHTML = '<div class="empty">还没有下发过指令。</div>'; return; }
-  el.innerHTML = cmds.slice(0,8).map(function(c){
+  if (!cmds || !cmds.length){
+    setHTML(el, '<div class="empty">还没有下发过指令。</div>');
+    return;
+  }
+  setHTML(el, cmds.slice(0,8).map(function(c){
     var r = c.result || {}, extra = "";
     if (c.state === "done" && r.x !== undefined){
-      extra = '<span class="meta mono">x=' + (+r.x).toFixed(3) + ' y=' + (+r.y).toFixed(3)
+      extra = '<span class="meta">x=' + (+r.x).toFixed(3) + ' y=' + (+r.y).toFixed(3)
             + ' z=' + (+r.z).toFixed(3) + ' · ' + (r.n||0) + ' 样本 · '
             + Math.round(r.ms||0) + ' ms · σ=' + (+(r.std||0)).toFixed(4) + ' g</span>';
     } else if (c.state === "failed"){
-      extra = '<span class="meta mono">' + (r.err || "") + '</span>';
+      extra = '<span class="meta">' + esc(r.err || "") + '</span>';
     }
     var lat = (c.sent && c.done)
-      ? '<span class="meta mono">往返 ' + Math.round((c.done-c.sent)*1000) + ' ms</span>' : "";
+      ? '<span class="meta">往返 ' + Math.round((c.done-c.sent)*1000) + ' ms</span>' : "";
     var ps = (c.params && Object.keys(c.params).length)
-      ? '<span class="meta mono">' + JSON.stringify(c.params) + '</span>' : "";
-    return '<div class="item"><span class="st st-' + c.state + '">' + (STNAME[c.state]||c.state) + '</span>'
-         + '<span class="name">' + c.name + '</span>' + ps
-         + '<span class="meta mono">' + c.id + '</span>' + lat + extra + '</div>';
-  }).join("");
+      ? '<span class="meta">' + esc(JSON.stringify(c.params)) + '</span>' : "";
+    return '<div class="item"><span class="st st-' + esc(c.state) + '">' + esc(STNAME[c.state]||c.state) + '</span>'
+         + '<span class="name">' + esc(c.name) + '</span>' + ps
+         + '<span class="meta">' + esc(c.id) + '</span>' + lat + extra + '</div>';
+  }).join(""));
 
   busy = cmds.some(function(c){ return c.state === "queued" || c.state === "sent"; });
   renderSd();          /* 存储面板跟着最近一条 sd_ls 的结果走 */
@@ -2525,7 +3425,7 @@ function renderEvents(evts){
     var k = "k-" + (ev.kind || "info");
     var time = new Date(ev.ts*1000).toLocaleTimeString("zh-CN", {hour12:false});
     return '<div class="item"><span class="k ' + k + '"></span><span class="t">' + time + '</span>'
-         + '<span>' + ev.text + '</span></div>';
+         + '<span>' + esc(ev.text) + '</span></div>';
   }).join("");
   if (h !== evHTML){
     evHTML = h;
@@ -2545,7 +3445,12 @@ function devQuery(){
 
 function renderDevices(list, current){
   var card = $("devcard");
-  list = list || [];
+  /* 这一帧没带设备列表就**什么都别做**，尤其别动可见性。
+     曾经因为 `/api/latest` 不带 devices，这里被当成"0 台"处理 →
+     多板场景下这块区域以取数频率（100ms）反复藏/显，而且大部分时间不可见。
+     现在服务端两个通道都带 devices 了，这条只是**防御性兜底**：
+     以后再加新通道、忘了带 devices 时，页面不会再闪。 */
+  if (!Array.isArray(list)) return;
   /* 只有一台板时不显示这块 —— 单板课堂不该凭空多出一张卡片 */
   if (list.length <= 1){ card.hidden = true; devHTML = ""; return; }
   card.hidden = false;
@@ -2553,20 +3458,19 @@ function renderDevices(list, current){
   var online = 0;
   var h = list.map(function(d){
     if (d.online) online++;
-    var color = d.online ? C.green : C.red;
+    var color = d.online ? cssVar("--color-still") : cssVar("--color-fall");
     var title = d.activity || "";
     /* 记住每台的档位，供"方向档位"控件显示 */
     if (d.orient !== null && d.orient !== undefined) devOrient[d.id] = d.orient;
     var oTxt = (d.orient === null || d.orient === undefined) ? "" : (" · o" + d.orient);
     var checked = selDevices[d.id] ? " checked" : "";
     return '<div class="dev' + (d.id === current ? " sel" : "") + '" data-dev="' + esc(d.id) + '">'
-      + '<div class="row1">'
       + '<input type="checkbox" class="devchk" data-chk="' + esc(d.id) + '"' + checked + '>'
       + '<span class="dot' + (d.online ? "" : " off") + '" style="background:' + color + '"></span>'
-      + '<span class="did">' + esc(d.id) + '</span></div>'
-      + '<div class="meta">' + (d.online ? "在线" : "离线") + ' · ' + ago(d.age)
-      + (d.source && d.source !== "-" ? " · " + esc(d.source) : "") + esc(oTxt) + '</div>'
-      + '<div class="meta">' + esc(title) + '</div>'
+      + '<span class="did">' + esc(d.id) + '</span>'
+      + '<span class="meta">' + (d.online ? "在线" : "离线") + ' · ' + ago(d.age)
+      + (d.source && d.source !== "-" ? " · " + esc(d.source) : "") + esc(oTxt) + '</span>'
+      + '<span class="meta">' + esc(title) + '</span>'
       + '</div>';
   }).join("");
 
@@ -2580,6 +3484,16 @@ function renderDevices(list, current){
       /* 点复选框是"勾选下发目标"，不该顺带切换查看的设备 */
       if (ev.target && ev.target.classList && ev.target.classList.contains("devchk")) return;
       selectDevice(el.getAttribute("data-dev"));
+    };
+    /* 键盘可达：这一行是 div，不给 tabindex 的话键盘用户根本选不了设备。
+       Enter / 空格 都要能用（div 不像 <button> 会自己处理空格）。 */
+    el.tabIndex = 0;
+    el.setAttribute("role", "button");
+    el.onkeydown = function(ev){
+      if (ev.key === "Enter" || ev.key === " " || ev.key === "Spacebar"){
+        ev.preventDefault();
+        selectDevice(el.getAttribute("data-dev"));
+      }
     };
   });
   Array.prototype.forEach.call(host.querySelectorAll(".devchk"), function(cb){
@@ -2639,8 +3553,15 @@ function render(s){
 
   devOnline = !!s.device_online;
   var dev = $("dev");
-  dev.className = "pill " + (devOnline ? "on" : "off");
-  dev.innerHTML = "<i></i>" + (devOnline ? "在线" : "离线");
+  /* 只在"在线状态真的翻转"时才重写这个胶囊。
+     无脑 10Hz 重写会**每秒把里面的 <i> 重建十遍** ——
+     `.pill.off i` 的呼吸动画（breathe 1.7s）于是每次都被从头开始，
+     看起来完全不像在呼吸，像卡住了。 */
+  if (dev.__on !== devOnline){
+    dev.__on = devOnline;
+    dev.className = "pill " + (devOnline ? "on" : "off");
+    dev.innerHTML = "<i></i>" + (devOnline ? "在线" : "离线");
+  }
   if (selDevice) dev.title = selDevice;
   /* **必须在这里也刷一次按钮**：`b.disabled = busy || !devOnline` 只在
    * syncButtons() 里算，而 syncButtons() 原来只在"按钮构建时"和 renderCmds()
@@ -2662,21 +3583,25 @@ function render(s){
     e.textContent = a.word;
     e.style.color = a.color;
     $("ring").style.stroke = a.color;
-    /* hero 卡片边框/光晕染成活动色（CSS 变量联动），活动词淡入一次 */
-    document.querySelector(".card.hero").style.setProperty("--act-rgb", a.rgb);
+    /* hero 舞台的底色与活动色联动（CSS 变量），活动词淡入一次 */
+    var stage = document.querySelector(".stage");
+    if (stage) {
+      stage.style.setProperty("--act-rgb", a.rgb);
+      stage.style.setProperty("--act-color", a.color);
+    }
     lastActColor = "rgb(" + a.rgb + ")";
     e.classList.remove("pop");
     void e.offsetWidth;
     e.classList.add("pop");
   }
 
-  /* 有真回复才用琥珀色并加 has；空回复回到引导语（dim），与板端一致 */
+  /* 有真回复才高亮并加 has；空回复回到引导语（dim），与板端一致 */
   if (s.ai_reply && s.ai_reply !== aiReply){
     aiReply = s.ai_reply;
     $("reply").textContent = aiReply;
   } else if (!s.ai_reply && aiReply !== ""){
     aiReply = "";
-    $("reply").textContent = "按板子 BOOT 键即可向服务器 AI 提问。";
+    $("reply").textContent = "还没有提问。";
   }
   var rbox = $("replybox");
   rbox.className = "reply" + (s.ai_pending ? " pending" : "") + (s.ai_reply ? " has" : "");
@@ -2721,6 +3646,14 @@ function stream(){
 
 /* ---------------- 启动 ---------------- */
 $("host").textContent = location.host;
+/* 主题：初始值已由 head 里那段内联脚本在首次绘制前定好（默认明亮）。
+   这里只负责把按钮文案对齐、以及接上点击切换。 */
+applyTheme(_themeName());
+if ($("theme")) $("theme").onclick = function(){
+  var next = _themeName() === "dark" ? "light" : "dark";
+  try { localStorage.setItem("rw1-theme", next); } catch (e) { /* 存不了也照样切换 */ }
+  applyTheme(next);
+};
 fitCanvas();
 fetch("/api/logs").then(function(r){ return r.json(); }).then(function(l){
   if (l && l.dir) $("logdir").textContent = "落盘 " + l.dir;
@@ -2735,6 +3668,12 @@ fetch("/api/commands" + devQuery()).then(function(r){ return r.json(); }).then(f
   try {
     if ($("camshot")) $("camshot").onclick = camShot;
     if ($("camlive")) $("camlive").onclick = function(){ camSetLive(!camOn); };
+    /* 正在推流时改帧率 → 立刻重发一次命令，不用先关再开。
+     * 没在推流就什么都不做：等用户点「开启实时画面」时会带上新帧率。 */
+    if ($("camfps")) $("camfps").onchange = function(){ if (camOn) camSetLive(true); };
+    /* 画质同理：板端 camera_set_quality() 对**已打开**的设备立刻生效，
+     * 所以推流中改画质能马上看到帧变大变小。 */
+    if ($("camq")) $("camq").onchange = function(){ if (camOn) camSetLive(true); };
     renderShots();
   } catch (e) {
     if (window.console) console.warn("摄像头初始化失败（不影响其它功能）: " + e);
@@ -2823,7 +3762,33 @@ def main():
     LOGGER = JsonlLogger(args.data_dir, retain_days=args.retain_days,
                          log_telemetry=not args.no_log_telemetry, log_hz=args.log_hz)
 
-    srv = ThreadingHTTPServer((args.host, args.port), Handler)
+    if port_already_serving(args.host, args.port):
+        print("!! 端口 %d 上已经有一个服务在应答了，不重复启动。" % args.port)
+        print("   多半是上次没关干净的进程。先关掉它，或换个端口：--port 8001")
+        print("   （Windows 允许两个进程绑同一端口，硬起会静默抢请求，非常难查。）")
+        return 2
+
+    try:
+        srv = DashboardServer((args.host, args.port), Handler)
+    except (PermissionError, OSError) as e:
+        # WinError 10013：**端口号被别的程序当成了某条出站连接的本地端口**（详见
+        # .agents/TROUBLESHOOTING.md T54）。这种情况 netstat 里**看不到 LISTENING**，
+        # 所以上面的 port_already_serving() 探不出来，只有一串 traceback 抛出来 ——
+        # 2026-09-28 我照着"端口冲突"的方向查了保留段、防火墙、代码，全查错方向。
+        # 把话说清楚，别让下一个人再走一遍。
+        print("!! 绑不上端口 %d：%s" % (args.port, e))
+        print("   ⚠️ 这**不一定**是「端口被监听占用」—— Windows 上很常见的是")
+        print("   **别的程序把 %d 当成了某条出站连接的本地端口**（实测占用者是" % args.port)
+        print("   wpscloudsvr.exe，连腾讯云），那条连接卡在 CLOSE_WAIT 不释放。")
+        print("   查法（★ **不要加 LISTENING 过滤**，加了就看不到）：")
+        print("       netstat -ano | grep \":%d\"" % args.port)
+        print("   拿到 PID 后 taskkill //PID <pid> //F；若杀完仍绑不上（socket 会在")
+        print("   内核里滞留一会儿），**重启电脑**最干净。")
+        print("   ★ 也可以**不重启**：绑 0.0.0.0 才冲突，绑具体地址是好的 ——")
+        print("     实测 0.0.0.0 失败(10048) 而 127.0.0.1 / 本机 LAN IP 都能绑成功。")
+        print("     所以用 `--host <本机无线网卡 IP>`（板子要连的那个）即可绕过。")
+        print("   不要轻易换端口：板子 NVS 里配的就是这个端口，换端口要重新配网。")
+        return 2
 
     # 后台心跳：设备超时判定离线 + 命令超时看护
     def watchdog():

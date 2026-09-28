@@ -186,8 +186,13 @@ def feed(port, scenario, seconds, ask_at=None, expect_steps=None):
     return p.returncode, p.stdout + p.stderr
 
 
-def latest(port):
-    return get_json("http://127.0.0.1:%d/api/latest" % port)
+def latest(port, device=None):
+    """取快照。**多板场景下一定要带上 device** ——
+    不带就是"最近上报的那台"，同时有别的板子在跑时，谁后上报就查谁，
+    断言会随上报时序随机失败（2026-09-26 踩到：命令明明发给了 r12_dev，
+    却去查另一台的事件流，报"命令事件进了事件流"失败，单独复跑又全绿）。"""
+    q = "?device=" + urllib.parse.quote(device) if device else ""
+    return get_json("http://127.0.0.1:%d/api/latest%s" % (port, q))
 
 
 def main():
@@ -459,7 +464,8 @@ def main():
         else:
             check("回传里带着同一个 request_id", False, "没有 result")
         check("命令事件进了事件流",
-              any("capture_once" in (e.get("text") or "") for e in latest(port).get("events", [])))
+              any("capture_once" in (e.get("text") or "")
+                  for e in latest(port, r12_dev).get("events", [])))
 
         # ---- 13. 指令超时看护 ---------------------------------------------
         print("\n[13] 指令超时（板子故意不执行）")

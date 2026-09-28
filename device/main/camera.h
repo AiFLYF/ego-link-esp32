@@ -1,17 +1,18 @@
 /*
  * SPDX-License-Identifier: MIT
  *
- * 板载摄像头（ESP32-S3-EYE 上的 OV2640，8-bit DVP 并口）取帧封装。
+ * 板载摄像头（ESP32-S3-EYE 上的 **OV3660**，8-bit DVP 并口）取帧封装。
  *
  * ⚠️ 这块板的摄像头走的是 esp_video —— 一套 Linux V4L2 风格的接口
  * （open("/dev/video2") + ioctl + mmap），**不是**老的 esp_camera 组件。
  * 网上大部分 ESP32 摄像头教程用的是 esp_camera（esp_camera_init / esp_camera_fb_get），
  * 在这块板上照抄会连头文件都找不到。
  *
- * 要用起来必须先开两个 Kconfig（已写进 sdkconfig.bsp.esp32_s3_eye）：
- *   CONFIG_CAMERA_OV2640=y                          —— 传感器驱动，不开就根本探测不到
- *   CONFIG_CAMERA_OV2640_DVP_JPEG_320X240_50FPS=y   —— JPEG 档位，默认全是 n
- * 只开前者的话唯一可用的格式是 YUYV 640x480（一帧 614KB），走 WiFi 传不动。
+ * 传感器型号是**实测**出来的（2026-09-24）：`ov3660: Detected Camera sensor PID=0x3660`。
+ * 早期文档按 OV2640 写是错的 —— 所以 Kconfig 里三个驱动全开着，让板子自己认：
+ *   CONFIG_CAMERA_OV2640 / OV3660 / GC2145 =y，且各自 DVP + AUTO_DETECT 都开
+ * 另外**别写死分辨率**：不同型号的档位不一样（OV3660 的 JPEG 只有 1280x720），
+ * 要先 G_FMT 问驱动（见 camera.c 里 ② 那段）。
  *
  * 语义与 LED / SD 卡一致：**可选外设**。摄像头不可用只该少一路数据，
  * 绝不能拦住开机，所以调用方一律用 ESP_ERROR_CHECK_WITHOUT_ABORT 接返回值。
@@ -60,6 +61,28 @@ void camera_release(const camera_frame_t *frame);
 
 /** 停止出图、释放缓冲、关闭设备。可重复调用。 */
 void camera_deinit(void);
+
+/**
+ * @brief 是否让摄像头一直开着。**默认关（用完就关）**。
+ *
+ * 只有"实时画面"开着时才该置 true —— 那时本来就每秒要取两帧，反复开关更亏。
+ * 传 false 会**立刻** deinit，不等下一次取帧。
+ *
+ * 为什么默认要关：DVP 一旦出图就会持续往 PSRAM 写帧，和 LVGL 显存、IMU 采样、
+ * WiFi 抢内存带宽。实测（2026-09-27）拍过一次照之后板子屏幕就永久变卡、重启才恢复，
+ * 就是因为 fd 和 STREAMON 一直留着。
+ */
+void camera_set_keep_open(bool on);
+
+/**
+ * @brief 设置 JPEG 画质（1..100，越大越清晰、帧越大）。
+ *
+ * **这是唯一能改变帧大小的旋钮** —— OV3660 的 JPEG 分辨率只有 1280x720 一档
+ * （驱动格式表里 JPEG 仅此一档），所以"调分辨率"做不到，只能调画质。
+ * 调低会让每帧字节数变少，上传耗时与带宽同步下降 —— 帧率和流量一起受益。
+ * 已打开的设备会**立刻生效**，不必等下一次 init。
+ */
+void camera_set_quality(int q);
 
 /**
  * @brief 开机自检：拍一帧，把分辨率/字节数/耗时/JPEG 合法性打进串口日志，然后完全关闭。
