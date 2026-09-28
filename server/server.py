@@ -3768,7 +3768,24 @@ def main():
         print("   （Windows 允许两个进程绑同一端口，硬起会静默抢请求，非常难查。）")
         return 2
 
-    srv = DashboardServer((args.host, args.port), Handler)
+    try:
+        srv = DashboardServer((args.host, args.port), Handler)
+    except (PermissionError, OSError) as e:
+        # WinError 10013：**端口号被别的程序当成了某条出站连接的本地端口**（详见
+        # .agents/TROUBLESHOOTING.md T54）。这种情况 netstat 里**看不到 LISTENING**，
+        # 所以上面的 port_already_serving() 探不出来，只有一串 traceback 抛出来 ——
+        # 2026-09-28 我照着"端口冲突"的方向查了保留段、防火墙、代码，全查错方向。
+        # 把话说清楚，别让下一个人再走一遍。
+        print("!! 绑不上端口 %d：%s" % (args.port, e))
+        print("   ⚠️ 这**不一定**是「端口被监听占用」—— Windows 上很常见的是")
+        print("   **别的程序把 %d 当成了某条出站连接的本地端口**（实测占用者是" % args.port)
+        print("   wpscloudsvr.exe，连腾讯云），那条连接卡在 CLOSE_WAIT 不释放。")
+        print("   查法（★ **不要加 LISTENING 过滤**，加了就看不到）：")
+        print("       netstat -ano | grep \":%d\"" % args.port)
+        print("   拿到 PID 后 taskkill //PID <pid> //F；若杀完仍绑不上（socket 会在")
+        print("   内核里滞留一会儿），**重启电脑**最干净。")
+        print("   不要轻易换端口：板子 NVS 里配的就是这个端口，换端口要重新配网。")
+        return 2
 
     # 后台心跳：设备超时判定离线 + 命令超时看护
     def watchdog():
