@@ -45,6 +45,8 @@ function start(args, tag) {
   const fd = fs.openSync(logPath, 'w');
   logs.push(logPath);
   const p = spawn(PY, args, { cwd: ROOT, env, stdio: ['ignore', fd, fd] });
+  /* 父进程这一份 fd 必须关掉：副本已经给子进程了，自己留着是泄漏（2026-09-29 修）。 */
+  try { fs.closeSync(fd); } catch (e) { /* 已关 */ }
   procs.push(p);
   return p;
 }
@@ -52,6 +54,23 @@ function cleanup() {
   for (const p of procs) { try { p.kill(); } catch (e) { /* 已经没了 */ } }
 }
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+/* 关浏览器可能挂住：仪表盘有 SSE 长连接，Chrome 关不掉时 browser.close() 会一直等。
+   跑完断言却卡在收尾，在 CI 里等于永不结束，所以给它一个上限。 */
+async function closeBrowser(b) {
+  try { await Promise.race([b.close(), sleep(8000)]); } catch (e) { /* 已经关了 */ }
+}
+
+/* 显式退出：playwright + spawn 的子进程会留下活跃 handle，事件循环不空，
+   node 自己就永远不退（实测跑完断言后仍挂着，被 timeout 杀掉、退出码 124）。
+   flush 用 race 兜底：Windows 下 write('') 空写不触发回调，等它就会卡死。 */
+async function exitNow(code) {
+  await Promise.race([
+    new Promise(r => { try { process.stdout.write('\n', () => r()); } catch (e) { r(); } }),
+    sleep(1500),
+  ]);
+  process.exit(code);
+}
 
 /* 等 HTTP 真的能应答再往下走。
    固定 `sleep(2500)` 是**不可靠的**：机器忙一点、服务端晚 1 秒绑定端口，
@@ -315,7 +334,7 @@ async function step(name, fn) {
 
   const shot = process.env.E2E_SHOT;
   if (shot) await page.screenshot({ path: shot, fullPage: true });
-  await browser.close();
+  await closeBrowser(browser);
   cleanup();
 
   console.log('\n结果: ' + passed + ' 通过' + (problems.length ? ', ' + problems.length + ' 处问题' : ', 无问题'));
@@ -328,9 +347,9 @@ async function step(name, fn) {
         if (t) console.log('\n--- ' + path.basename(p) + ' ---\n' + t.split('\n').slice(-20).join('\n'));
       } catch (e) { /* 没日志 */ }
     }
-    process.exitCode = 1;
   }
-})().catch(e => {
+  await exitNow(problems.length ? 1 : 0);
+})().catch(async e => {
   console.log('FATAL: ' + (e && e.message));
   const fs = require('fs');
   for (const p of logs) {
@@ -340,5 +359,5 @@ async function step(name, fn) {
     } catch (err) { /* 没日志 */ }
   }
   cleanup();
-  process.exit(1);
+  await exitNow(1);
 });
