@@ -952,7 +952,7 @@ static void ui_timer_cb(lv_timer_t *timer)
         s_page_tick = 0;
 
         bool has_reply = st.reply[0] != '\0';
-        const char *text = has_reply ? st.reply : "按 BOOT 键向电脑服务器的 AI 提问";
+        const char *text = has_reply ? st.reply : "单击 BOOT 提问 · 三击说话";
         char pagebuf[128];
         s_page_total = reply_page(text, 0, pagebuf, sizeof(pagebuf));
         lv_label_set_text(s_lbl_reply, pagebuf);
@@ -1213,7 +1213,7 @@ static void build_reply_card(lv_obj_t *scr)
     /* 初始是引导语不是回复，用弱化灰；timer 收到真回复后才换成琥珀色 */
     s_lbl_reply = make_label(card, UI_REPLY_X, UI_REPLY_Y, UI_REPLY_W, UI_REPLY_H,
                              cjk_font(14), UI_C_FAINT, LV_TEXT_ALIGN_LEFT);
-    lv_label_set_text(s_lbl_reply, "按 BOOT 键向电脑服务器的 AI 提问");
+    lv_label_set_text(s_lbl_reply, "单击 BOOT 提问 · 三击说话");
 }
 
 /* 配网覆盖层：整屏盖住仪表盘，把"怎么连"讲清楚。
