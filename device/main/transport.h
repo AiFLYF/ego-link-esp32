@@ -47,6 +47,13 @@ typedef enum {
     TRANSPORT_CMD_FAILED,       /*!< the last command failed (timeout/OOM/...) */
 } transport_cmd_state_t;
 
+/** 语音链路当前在哪一步（第 4 周，给 UI 显示进度用）。 */
+typedef enum {
+    TRANSPORT_VOICE_IDLE = 0,   /*!< 没在录 */
+    TRANSPORT_VOICE_RECORDING,  /*!< 正在录（约 3 秒） */
+    TRANSPORT_VOICE_UPLOADING,  /*!< 录完了，正在上传给服务器 */
+} transport_voice_state_t;
+
 typedef struct {
     bool  server_ok;                                   /*!< last POST succeeded */
     int   fail_streak;                                 /*!< consecutive failures */
@@ -61,6 +68,7 @@ typedef struct {
     uint8_t  cmd_state;                                /*!< transport_cmd_state_t */
     uint16_t cmd_count;                                /*!< commands executed since boot */
     char  cmd_id[TRANSPORT_CMD_ID_LEN];                /*!< last command's request_id */
+    uint8_t  voice_state;                              /*!< transport_voice_state_t */
 } transport_status_t;
 
 /** Start the telemetry task (waits for WiFi internally). */
@@ -74,6 +82,13 @@ void transport_reload_config(void);
 
 /** Ask the server's AI a question on the next telemetry frame. */
 void transport_request_ask(const char *question);
+
+/**
+ * 录一段话并上传给服务器识别（第 4 周）。
+ * **立即返回** —— 录音（约 3 秒）和上传都在独立任务里做，
+ * 不会阻塞按钮回调、采样循环或界面刷新。识别结果由后续遥测帧带回。
+ */
+void transport_request_voice(void);
 
 /** Snapshot of the link + last server answer (thread-safe). */
 void transport_get_status(transport_status_t *out);

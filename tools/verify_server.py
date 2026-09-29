@@ -72,6 +72,15 @@ def post_raw(url, raw, timeout=8):
         return json.loads(r.read().decode("utf-8"))
 
 
+def post_bytes(url, data, timeout=25):
+    """POST 原始字节（语音上传用：PCM 里必然有 0x00，不能走字符串那条路）。
+    响应仍按 JSON 解析。"""
+    req = urllib.request.Request(url, data=data,
+                                 headers={"Content-Type": "application/octet-stream"})
+    with OPENER.open(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
 def _expect_400(url, payload):
     """POST 一个应当被拒绝的载荷，返回 True 表示确实拿到了 HTTP 400。"""
     try:
@@ -154,13 +163,33 @@ def firmware_body(samples, source="SC7A20", ask=False, question=None, device="rw
 class MockLLM(BaseHTTPRequestHandler):
     delay = 6.0
     calls = []
+    seen = []          # 收到的请求体（用来验证"多轮历史真的带进了请求"）
+    asr_text = "板子现在怎么样"
 
     def log_message(self, *a):
         pass
 
     def do_POST(self):
         n = int(self.headers.get("Content-Length") or 0)
-        self.rfile.read(n)
+        raw = self.rfile.read(n)
+        path = self.path.split("?")[0]
+
+        # 语音识别：走同一个假上游，但**格式完全不同**（{"text": ...}）。
+        # 不区分路径的话，ASR 会拿到大模型的 choices 结构、解析出空文本。
+        if path.endswith("/audio/transcriptions"):
+            MockLLM.calls.append(time.time())
+            body = json.dumps({"text": MockLLM.asr_text}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        try:
+            MockLLM.seen.append(json.loads(raw.decode("utf-8")))
+        except ValueError:
+            MockLLM.seen.append({})
         MockLLM.calls.append(time.time())
         time.sleep(MockLLM.delay)
         body = json.dumps({"choices": [{"message": {"content": "这是慢速假大模型的回答。"}}]}).encode()
@@ -305,6 +334,11 @@ def main():
         env2["RW1_LLM_API_KEY"] = "sk-test"
         env2["RW1_LLM_BASE_URL"] = "http://127.0.0.1:%d/v1" % llm_port
         env2["RW1_LLM_MODEL"] = "mock"
+        # 语音识别指向**同一个假上游**（它按路径区分返回格式）。
+        # 不配的话，语音那一段只能测到"没配 ASR 的回退"，测不到真实链路。
+        env2["RW1_ASR_API_KEY"] = "sk-test"
+        env2["RW1_ASR_BASE_URL"] = "http://127.0.0.1:%d/v1" % llm_port
+        env2["RW1_ASR_MODEL"] = "mock-asr"
         srv = subprocess.Popen([PY, "-u", SERVER_PY, "--port", str(port),
                                 "--data-dir", data_dir, "--retain-days", "0",
                                 "--cmd-timeout", "5"],
@@ -874,6 +908,56 @@ def main():
               and "batch" not in rs,
               "实际 keys: %s" % sorted(rs.keys()))
 
+        # ---- 22. 语音链路（第 4 周）----------------------------------------
+        print("\n[20] 语音：音频 → 识别 → 大模型")
+        vdev = "voice-01"
+        vurl = "http://127.0.0.1:%d/api/audio?device=%s" % (port, vdev)
+
+        # 边界：空 / 过短 / 超长都要被拒。**关键是客户端能读到 400**，
+        # 而不是拿到连接被重置（服务端不读 body 就回绝时会发生，见手册 T58）。
+        for payload, label in ((b"", "空载荷"), (b"\x00" * 32, "过短"),
+                               (b"\x00" * (600 * 1024), "超长")):
+            try:
+                post_bytes(vurl, payload)
+                check("音频%s被拒" % label, False, "竟然接受了")
+            except urllib.error.HTTPError as e:
+                check("音频%s被拒（400 可读）" % label, e.code == 400, "HTTP %d" % e.code)
+            except Exception as e:  # noqa: BLE001
+                check("音频%s被拒" % label, False, "%s: %s" % (type(e).__name__, e))
+
+        out = post_bytes(vurl, b"\x01\x02" * 16000)     # 1 秒假 PCM
+        check("音频被接收", out.get("ok") is True and out.get("bytes") == 32000,
+              "实际: %s" % out)
+
+        deadline = time.time() + MockLLM.delay + 12
+        snap = {}
+        while time.time() < deadline:
+            snap = latest(port, vdev)
+            if "慢速假大模型" in snap.get("ai_reply", ""):
+                break
+            time.sleep(0.5)
+        check("识别出的文字落进了状态", snap.get("voice_text") == MockLLM.asr_text,
+              "实际: %r" % snap.get("voice_text"))
+        check("识别结果被当成提问交给了大模型",
+              "慢速假大模型" in snap.get("ai_reply", ""),
+              "实际: %r" % (snap.get("ai_reply") or "")[:40])
+        check("语音状态回到 idle", snap.get("voice_state") == "idle",
+              "实际: %s" % snap.get("voice_state"))
+        check("没有残留错误", not snap.get("voice_err"), "实际: %r" % snap.get("voice_err"))
+
+        # 澄清：第二次提问应该把上一轮问答带进大模型请求
+        before = len(MockLLM.seen)
+        post_bytes(vurl, b"\x01\x02" * 16000)
+        deadline = time.time() + MockLLM.delay + 12
+        while time.time() < deadline and len(MockLLM.seen) <= before:
+            time.sleep(0.5)
+        roles = [m.get("role") for m in (MockLLM.seen[-1].get("messages") or [])]
+        check("追问带上了上一轮问答（澄清）",
+              roles.count("assistant") >= 1 and roles.count("user") >= 2, str(roles))
+
+        # 停止
+        rc = post_json("http://127.0.0.1:%d/api/ask/cancel?device=%s" % (port, vdev), {})
+        check("取消接口可用（停止）", rc.get("ok") is True, "实际: %s" % rc)
 
     finally:
         for p in (srv,):

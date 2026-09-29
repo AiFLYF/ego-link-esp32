@@ -30,11 +30,13 @@ AI 交互课 · PC 服务器（无需 VPS，自己的电脑即服务器）
 
 import argparse
 import datetime
+import io
 import json
 import math
 import os
 import queue
 import socket
+import struct
 import sys
 import threading
 import time
@@ -52,6 +54,18 @@ MOTION_WINDOW_S = 0.6     # 瞬时运动分类（晃动/跌落）用的短窗（
 
 DEVICE_TIMEOUT = 5.0      # 超过该秒数没有新遥测则视为离线
 LLM_TIMEOUT = 25.0        # 大模型请求超时（后台线程里等，不影响板端）
+
+# ---- 语音（第 4 周：按键说话 → 识别 → 大模型 → 屏显回复）---------------------
+# 识别两条路**自动选**：配了云端 key 走云端，没配就用本地 whisper；
+# 两条都没有时明确回一句可读的原因，而不是静默失败 ——
+# 和「不配大模型也能完整跑通」是同一个路子。
+AUDIO_MAX_BYTES = 512 * 1024   # 单次上传上限（3 s @16 kHz/16 bit 单声道 ≈ 96 KB，留足余量）
+AUDIO_RATE = 16000             # 板端录音采样率；云端与本地都按这个解
+AUDIO_DIR = None               # 录音留档目录（main() 里按 --data-dir 设）
+AUDIO_KEEP = 50                # 每台设备最多留多少条录音
+ASR_TIMEOUT = 30.0             # 云端识别超时（后台线程里等，不阻塞板端）
+VOICE_TEXT_MAX = 200           # 识别出的文字长度上限（与 ask 的 q 一致）
+CHAT_HISTORY = 6               # 多轮上下文保留的问答轮数（澄清类追问要用）
 
 MAX_BATCH = 400           # 单次 POST 最多接受的样本数（防止畸形/恶意负载）
 BOARD_REPLY_MAX = 512     # 回传板端的回复字节上限（UTF-8 安全截断）
@@ -130,7 +144,7 @@ class Device:
     """
 
     __slots__ = ("id", "samples", "shake_times", "events", "commands",
-                 "queue", "seq", "st")
+                 "queue", "seq", "chat", "st")
 
     def __init__(self, did):
         self.id = did
@@ -140,6 +154,9 @@ class Device:
         self.commands = {}                        # request_id -> 命令记录
         self.queue = deque()                      # 待下发的 request_id（FIFO）
         self.seq = 0                              # 生成可读 request_id 的递增序号
+        # 对话历史（第 4 周「澄清」）：存 (role, content)，user/assistant 交替。
+        # 按设备隔离 —— A 板的追问绝不能串到 B 板，课堂里 20 块板共用一台服务器。
+        self.chat = deque(maxlen=CHAT_HISTORY * 2)
         self.st = {
             "device": did,
             "device_online": False,
@@ -154,6 +171,14 @@ class Device:
             "ai_reply": "",
             "ai_pending": False,
             "ai_mode": "规则AI",
+            # 「停止」用：每次取消都 +1，后台线程回来时发现令牌变了就丢弃结果。
+            # 比"设个 flag 再清掉"可靠 —— 不依赖 worker 有没有及时看到 flag。
+            "ai_cancel": 0,
+            # 语音链路（第 4 周）。idle / recording / uploading / transcribing，
+            # 网页和板端屏幕都照这个显示进度，不需要各猜各的。
+            "voice_state": "idle",
+            "voice_text": "",                     # 最近一次识别出的文字
+            "voice_err": "",                      # 最近一次失败原因（给人看的）
             "sample_hz": 0.0,                     # 实测采样率（由批量大小与到达间隔推算）
             "dt_trusted": 0.0,                    # 最近一次可信的采样间隔（P1-6：晚到帧不参与）
             "fall_active": False,
@@ -807,23 +832,157 @@ def ai_summary(dev):
     return base
 
 
+# --------------------------------------------------------------------------
+# 语音识别（第 4 周）—— 云端优先，本地 whisper 兜底
+# --------------------------------------------------------------------------
+def _pcm_to_wav(pcm, rate=AUDIO_RATE, channels=1, bits=16):
+    """给裸 PCM 套一个 WAV 头。
+
+    板子没有文件系统，也不想在 MCU 上拼 RIFF，所以直接推裸 PCM；
+    而两端的识别接口都只吃容器格式，缺的那一层在这里补。
+    """
+    byte_rate = rate * channels * bits // 8
+    hdr = b"RIFF" + struct.pack("<I", 36 + len(pcm)) + b"WAVE"
+    hdr += b"fmt " + struct.pack("<IHHIIHH", 16, 1, channels, rate,
+                                 byte_rate, channels * bits // 8, bits)
+    hdr += b"data" + struct.pack("<I", len(pcm))
+    return hdr + pcm
+
+
+def _asr_cloud_cfg():
+    """云端识别配置；没配 key 返回 None。"""
+    key = os.environ.get("RW1_ASR_API_KEY")
+    if not key:
+        return None
+    return {
+        "key": key,
+        "base": os.environ.get("RW1_ASR_BASE_URL",
+                               "https://api.openai.com/v1").rstrip("/"),
+        "model": os.environ.get("RW1_ASR_MODEL", "whisper-1"),
+    }
+
+
+_WHISPER = None            # 本地模型句柄；首次真正要用时才加载（加载要几秒）
+_WHISPER_TRIED = False     # 只尝试加载一次，失败不要每次请求都重试
+
+
+def _asr_local_model():
+    """本地 whisper 模型；没装 faster-whisper 就返回 None。
+
+    懒加载：不配语音的场景不该为它付启动时间。失败也**只试一次** ——
+    否则每个请求都会重新 import 一遍再失败，日志会刷屏。
+    """
+    global _WHISPER, _WHISPER_TRIED
+    if _WHISPER_TRIED:
+        return _WHISPER
+    _WHISPER_TRIED = True
+    if os.environ.get("RW1_WHISPER_DISABLE"):
+        return None
+    name = os.environ.get("RW1_WHISPER_MODEL", "base")
+    try:
+        from faster_whisper import WhisperModel
+        _WHISPER = WhisperModel(name, device="cpu", compute_type="int8")
+        print("  本地 whisper 已加载：%s" % name)
+    except Exception as exc:  # noqa: BLE001 —— 没装就是"没有本地识别"，不是错误
+        print("  本地 whisper 不可用（%s）。需要离线识别请 pip install faster-whisper"
+              % exc.__class__.__name__)
+        _WHISPER = None
+    return _WHISPER
+
+
+def asr_backend():
+    """当前会走哪条识别路：'cloud' / 'local' / None。"""
+    if _asr_cloud_cfg():
+        return "cloud"
+    return "local" if _asr_local_model() is not None else None
+
+
+def _transcribe_cloud(cfg, wav):
+    """调 OpenAI 兼容的 /audio/transcriptions。返回 (text, err)。
+
+    multipart 是手搓的 —— 项目至今只用标准库，不想为一个上传引入 requests。
+    分隔串带随机数，避免音频字节里恰好出现分隔符把报文切坏。
+    """
+    boundary = "----rw1asr" + os.urandom(8).hex()
+    body = b"".join([
+        ("--%s\r\n" % boundary).encode(),
+        b'Content-Disposition: form-data; name="model"\r\n\r\n',
+        cfg["model"].encode() + b"\r\n",
+        ("--%s\r\n" % boundary).encode(),
+        b'Content-Disposition: form-data; name="language"\r\n\r\nzh\r\n',
+        ("--%s\r\n" % boundary).encode(),
+        b'Content-Disposition: form-data; name="file"; filename="a.wav"\r\n',
+        b"Content-Type: audio/wav\r\n\r\n",
+        wav + b"\r\n",
+        ("--%s--\r\n" % boundary).encode(),
+    ])
+    req = urllib.request.Request(
+        cfg["base"] + "/audio/transcriptions", data=body,
+        headers={"Content-Type": "multipart/form-data; boundary=" + boundary,
+                 "Authorization": "Bearer " + cfg["key"]},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=ASR_TIMEOUT) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        return (str(data.get("text") or "").strip() or None), ""
+    except Exception as exc:  # noqa: BLE001
+        return None, "云端识别失败(%s)" % exc.__class__.__name__
+
+
+def transcribe(audio_bytes):
+    """语音转文字。返回 (text, err)；成功时 err 为空字符串。
+
+    **云端优先**：不占本机 CPU、延迟稳定。本地作为离线兜底 ——
+    教室没外网时它就是唯一能用的那条路。两条都没有时，明确说清缺什么，
+    而不是让板端对着一个空回复干等。
+    """
+    if not audio_bytes:
+        return None, "录音是空的"
+    wav = audio_bytes if audio_bytes[:4] == b"RIFF" else _pcm_to_wav(audio_bytes)
+
+    cfg = _asr_cloud_cfg()
+    if cfg:
+        text, err = _transcribe_cloud(cfg, wav)
+        if text:
+            return text, ""
+        # 云端失败**不立刻放弃**：本地能用就顶上，别把断网当致命错
+        if _asr_local_model() is None:
+            return None, err
+
+    model = _asr_local_model()
+    if model is None:
+        return None, ("没配语音识别：设 RW1_ASR_API_KEY 走云端，"
+                      "或 pip install faster-whisper 用本地")
+    try:
+        segs, _info = model.transcribe(io.BytesIO(wav), language="zh")
+        return (("".join(s.text for s in segs)).strip() or None), ""
+    except Exception as exc:  # noqa: BLE001
+        return None, "本地识别失败(%s)" % exc.__class__.__name__
+
+
 def ask_llm(dev, question):
-    """可选：调用 OpenAI 兼容大模型。未配置/失败返回 None → 回退本地模板。"""
+    """可选：调用 OpenAI 兼容大模型。未配置/失败返回 None → 回退本地模板。
+
+    第 4 周「澄清」：带上该设备最近的对话历史，这样"再详细点""那刚才呢"
+    这类追问能被理解。历史**按设备隔离**（课堂 20 块板共用一台服务器），
+    而且只放问答文本 —— 每轮都重塞一遍遥测摘要既费 token 又会把
+    上下文淹没在重复内容里。
+    """
     key = os.environ.get("RW1_LLM_API_KEY")
     if not key:
         return None
     base = os.environ.get("RW1_LLM_BASE_URL", "https://api.openai.com/v1").rstrip("/")
     model = os.environ.get("RW1_LLM_MODEL", "gpt-4o-mini")
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system",
-             "content": "你是嵌入式课堂助手。回答要简短（120 字以内），口语化，用中文，"
-                        "不要用 Markdown 标题或列表。"},
-            {"role": "user", "content": "开发板传感器情况：%s\n同学想问：%s" % (ai_summary(dev), question)},
-        ],
-        "max_tokens": 300,
-    }
+    with LOCK:
+        history = list(dev.chat)
+    # ai_summary() 内部要取 LOCK，必须在 with LOCK 之外调用（否则自锁）
+    messages = [{"role": "system",
+                 "content": "你是嵌入式课堂助手。回答要简短（120 字以内），口语化，用中文，"
+                            "不要用 Markdown 标题或列表。"}]
+    messages.extend({"role": r, "content": c} for r, c in history)
+    messages.append({"role": "user",
+                     "content": "开发板传感器情况：%s\n同学想问：%s" % (ai_summary(dev), question)})
+    payload = {"model": model, "messages": messages, "max_tokens": 300}
     req = urllib.request.Request(
         base + "/chat/completions",
         data=json.dumps(payload).encode("utf-8"),
@@ -838,19 +997,29 @@ def ask_llm(dev, question):
         return None
 
 
-def _llm_worker(dev, question):
+def _llm_worker(dev, question, token):
     """后台线程：调大模型，完成后把结果写回该设备的状态。
 
     注意 ai_summary() 内部会取 LOCK，必须在进入 with LOCK 之前调用，否则自锁。
+
+    `token` 是发起这次请求时的取消令牌。回来时若令牌已变（用户按了「停止」），
+    结果就**直接丢弃** —— 而不是先写进去再被清掉，那样屏幕上会闪一下旧答案。
     """
     reply = ask_llm(dev, question)
     mode = "大模型" if reply else "规则AI"
     if not reply:
         reply = ai_summary(dev)
     with LOCK:
+        if dev.st["ai_cancel"] != token:
+            dev.st["voice_state"] = "idle"    # 被停止：别把板端留在"思考中"
+            return                       # 已被取消：这次结果作废
         dev.st["ai_pending"] = False
         dev.st["ai_reply"] = reply
         dev.st["ai_mode"] = mode
+        dev.st["voice_state"] = "idle"
+        # 记进对话历史（第 4 周「澄清」的原料）
+        dev.chat.append(("user", question))
+        dev.chat.append(("assistant", reply))
     push_event(dev, "ai" if mode == "大模型" else "warn",
                "%s回复：%s" % (mode, reply[:60]))
 
@@ -870,8 +1039,9 @@ def request_ai(dev, question):
             dev.st["ai_pending"] = True
             dev.st["ai_reply"] = "正在思考…"
             dev.st["ai_mode"] = "大模型"
+            token = dev.st["ai_cancel"]      # 记下本次的令牌
         push_event(dev, "ask", "板端提问「%s」→ 已转交大模型" % question)
-        threading.Thread(target=_llm_worker, args=(dev, question), daemon=True,
+        threading.Thread(target=_llm_worker, args=(dev, question, token), daemon=True,
                          name="llm").start()
         return "正在思考…"
 
@@ -879,8 +1049,56 @@ def request_ai(dev, question):
     with LOCK:
         dev.st["ai_reply"] = reply
         dev.st["ai_mode"] = "规则AI"
+        dev.chat.append(("user", question))
+        dev.chat.append(("assistant", reply))
     push_event(dev, "ask", "板端提问「%s」→ %s" % (question, reply[:40]))
     return reply
+
+
+def cancel_ai(dev):
+    """「停止」：作废正在生成的那次回答。返回是否真的停掉了什么。
+
+    只递增令牌，不依赖 worker 有没有及时看到某个 flag —— 无论它什么时候回来，
+    对不上令牌就自己丢弃。这样"停止"在慢网络/慢模型下也是确定的。
+    """
+    with LOCK:
+        was = dev.st["ai_pending"]
+        dev.st["ai_cancel"] += 1
+        dev.st["ai_pending"] = False
+        if was:
+            dev.st["ai_reply"] = "已停止"
+            dev.st["ai_mode"] = "规则AI"
+    if was:
+        push_event(dev, "warn", "已停止正在生成的回复")
+    return was
+
+
+def _voice_worker(dev, data, saved):
+    """后台线程：识别 → 交给大模型 → 结果由后续遥测帧带回板端。
+
+    识别失败**必须**把 voice_state 复位并留下原因 —— 否则板端会永远停在
+    「识别中」，用户只会觉得板子死了。
+    """
+    text, err = transcribe(data)
+    if not text:
+        with LOCK:
+            dev.st["voice_state"] = "idle"
+            dev.st["voice_err"] = err or "没听清"
+            # 屏幕上不能一直停在「正在识别…」—— 那看起来就像板子死了
+            dev.st["ai_reply"] = "没听清，再说一次？"
+        push_event(dev, "warn", "语音识别失败：%s" % (err or "没听清"))
+        return
+    with LOCK:
+        dev.st["voice_text"] = text
+        dev.st["voice_err"] = ""
+        dev.st["voice_state"] = "thinking"
+    push_event(dev, "ask", "识别到「%s」%s" % (text, ("（%s）" % saved) if saved else ""))
+    request_ai(dev, text)
+    # 规则 AI 是同步返回的，这会儿已经出结果了；大模型还要等后台线程，
+    # 那种情况下 voice_state 留在 "thinking"，等 _llm_worker 收尾时自然回落。
+    with LOCK:
+        if not dev.st["ai_pending"]:
+            dev.st["voice_state"] = "idle"
 
 
 # --------------------------------------------------------------------------
@@ -1017,6 +1235,20 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, UnicodeDecodeError):
             return {}
 
+    def _drain(self, n):
+        """把请求体读掉再回绝。
+
+        不读就直接响应、又带 `Connection: close`，客户端拿到的常常是
+        **连接被重置（WinError 10054）而不是我们精心写的那个 400** ——
+        因为服务端关连接时内核还有未读数据，会发 RST 把响应丢掉。
+        拒绝也要把话说完整。上限 4 倍是防止一个超大 body 把我们拖在这里。
+        """
+        if 0 < n <= 4 * AUDIO_MAX_BYTES:
+            try:
+                self.rfile.read(n)
+            except OSError:
+                pass
+
     # ---- routing ---------------------------------------------------------
     def do_OPTIONS(self):                       # CORS 预检
         self._send(204, b"")
@@ -1100,6 +1332,10 @@ class Handler(BaseHTTPRequestHandler):
             self._command()
         elif path == "/api/frame":
             self._frame(query)
+        elif path == "/api/audio":
+            self._audio(query)
+        elif path == "/api/ask/cancel":
+            self._ask_cancel(query)
         elif path == "/api/shots/delete":
             self._shot_delete()
         else:
@@ -1115,6 +1351,7 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             n = 0
         if n <= 0 or n > FRAME_MAX_BYTES:
+            self._drain(n)          # 同上：不读掉 body 客户端会收到 RST 而非 400
             self._send(400, json.dumps({"ok": False, "error": "bad frame size"},
                                        ensure_ascii=False))
             return
@@ -1201,6 +1438,80 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, json.dumps({"ok": True}, ensure_ascii=False))
         except OSError as e:
             self._send(404, json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False))
+
+    # ---- voice (板 → 服务器 → 识别 → 大模型 → 板/网页) ----------------------
+    def _audio(self, query):
+        """板子 POST 上来的一段录音（裸 PCM，或已经带头部的 WAV）。
+
+        `?device=X`。识别丢到**后台线程**做 —— 云端识别要好几秒，
+        绝不能让板端等（这正是当初大模型踩过的坑：板端 3s 超时 vs 服务端 8s 等待）。
+        板端拿到的是"收到了"，真正的文字与回复由后续遥测帧带回。
+        """
+        dev_id = clean_device_id(query_param(query, "device"))
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            n = 0
+        if n <= 0 or n > AUDIO_MAX_BYTES:
+            self._drain(n)
+            self._send(400, json.dumps({"ok": False, "error": "bad audio size"},
+                                       ensure_ascii=False))
+            return
+        data = self.rfile.read(n)
+        # 太短的不可能是人话（16 kHz 下 64 字节 = 2 ms），直接拒掉省一次识别
+        if len(data) < 64:
+            self._send(400, json.dumps({"ok": False, "error": "audio too short"},
+                                       ensure_ascii=False))
+            return
+        with LOCK:
+            dev = get_device(dev_id)
+            if dev.st["voice_state"] in ("transcribing", "thinking"):
+                self._send(429, json.dumps(
+                    {"ok": False, "error": "上一段还在处理"}, ensure_ascii=False))
+                return
+            dev.st["voice_state"] = "transcribing"
+            dev.st["voice_err"] = ""
+            # 板端立刻有反馈：识别要几秒（云端更久），这段时间屏幕不该一动不动。
+            # 但如果上一轮大模型还在生成，就别把它挤掉 —— 那会把快出结果的那次弄丢。
+            if not dev.st["ai_pending"]:
+                dev.st["ai_reply"] = "正在识别…"
+        saved = self._audio_save(dev, data)
+        push_event(dev, "ask", "收到 %d 字节录音，开始识别" % len(data))
+        threading.Thread(target=_voice_worker, args=(dev, data, saved),
+                         daemon=True, name="asr").start()
+        self._send(200, json.dumps({"ok": True, "bytes": len(data), "saved": saved},
+                                   ensure_ascii=False))
+
+    def _audio_save(self, dev, data):
+        """录音留档成 .wav，返回文件名（失败 None）。"""
+        if not AUDIO_DIR:
+            return None
+        try:
+            d = os.path.join(AUDIO_DIR, safe_name(dev.id))
+            os.makedirs(d, exist_ok=True)
+            name = time.strftime("%Y%m%d-%H%M%S") + "-%03d.wav" % (int(time.time() * 1000) % 1000)
+            wav = data if data[:4] == b"RIFF" else _pcm_to_wav(data)
+            with open(os.path.join(d, name), "wb") as fh:
+                fh.write(wav)
+            files = sorted(f for f in os.listdir(d) if f.endswith(".wav"))
+            for f in files[:-AUDIO_KEEP]:
+                try:
+                    os.remove(os.path.join(d, f))
+                except OSError:
+                    pass
+            return name
+        except OSError as e:
+            print("  录音存盘失败: %s" % e)
+            return None
+
+    def _ask_cancel(self, query):
+        """「停止」：作废正在生成的那次回答（板端手势或网页按钮都能调）。"""
+        want = query_param(query, "device")
+        with LOCK:
+            dev = pick_device(clean_device_id(want) if want else None)
+        stopped = cancel_ai(dev)
+        self._send(200, json.dumps({"ok": True, "stopped": stopped, "device": dev.id},
+                                   ensure_ascii=False))
 
     # ---- command (网页 → 服务器 → 板 → 服务器 → 网页) -----------------------
     def _command(self):
@@ -3735,8 +4046,10 @@ def main():
     args = ap.parse_args()
 
     CMD_TIMEOUT_S = max(1.0, args.cmd_timeout)
-    global SHOTS_DIR
+    global SHOTS_DIR, AUDIO_DIR
     SHOTS_DIR = os.path.join(args.data_dir, "shots")
+    # 录音留档：和照片一样按设备分目录、超出上限删最旧（第 4 周语音链路）
+    AUDIO_DIR = os.path.join(args.data_dir, "audio")
     LOGGER = JsonlLogger(args.data_dir, retain_days=args.retain_days,
                          log_telemetry=not args.no_log_telemetry, log_hz=args.log_hz)
 

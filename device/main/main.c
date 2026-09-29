@@ -30,6 +30,7 @@
 #include "nvs_flash.h"
 
 #include "accel_input.h"
+#include "audio.h"
 #include "camera.h"
 #include "led_feedback.h"
 #include "net_config.h"
@@ -83,6 +84,19 @@ static void on_ask_click(void *btn, void *arg)
     transport_request_ask("我现在的运动状态怎么样？");
 }
 
+/* 第 4 周「按键说话」：BOOT 三击 = 录一段话上传识别。
+ *
+ * 为什么是"三击"而不是更直觉的"按住说话"：板子**只有这一个键**，
+ * 单击（提问）、长按（校准）、双击（配网）已经把常见手势占满了。
+ * 三击是唯一不与它们冲突、且 iot_button 原生支持的手势。
+ * 按下瞬间只排个队 —— 录音要 3 秒，绝不能占着按钮任务。 */
+static void on_voice_triple_click(void *btn, void *arg)
+{
+    (void)btn;
+    (void)arg;
+    transport_request_voice();
+}
+
 /* If the reported tilt direction runs the wrong way, long-press BOOT until the
  * screen and the dashboard agree. The choice is stored in NVS and is also
  * applied to the telemetry, so the server's labels stay consistent with it. */
@@ -115,7 +129,13 @@ static void setup_ask_button(void)
     iot_button_register_cb(ask_btn, BUTTON_SINGLE_CLICK, NULL, on_ask_click, NULL);
     iot_button_register_cb(ask_btn, BUTTON_LONG_PRESS_START, NULL, on_orient_long_press, NULL);
     iot_button_register_cb(ask_btn, BUTTON_DOUBLE_CLICK, NULL, on_prov_double_click, NULL);
-    ESP_LOGI(TAG, "BOOT: click -> ask, long-press -> cycle tilt, double-click -> 重新配网");
+    /* 三击 = 语音提问。事件参数要活到回调触发之后，所以用 static（放栈上会在
+     * 注册函数返回后失效）。 */
+    static button_event_args_t s_triple = { .multiple_clicks = { .clicks = 3 } };
+    iot_button_register_cb(ask_btn, BUTTON_MULTIPLE_CLICK, &s_triple,
+                           on_voice_triple_click, NULL);
+    ESP_LOGI(TAG, "BOOT: click -> ask, long-press -> cycle tilt, "
+                  "double-click -> 重新配网, triple-click -> 语音提问");
 }
 
 void app_main(void)
@@ -136,6 +156,10 @@ void app_main(void)
     ESP_ERROR_CHECK_WITHOUT_ABORT(accel_input_init());
     /* LED 反馈是锦上添花，没有灯也不该拦住主流程 */
     ESP_ERROR_CHECK_WITHOUT_ABORT(led_feedback_init());
+
+    /* 麦克风（第 4 周语音链路）：同样是可选输入 —— 初始化失败只是少了
+     * 「三击说话」，采集/上报/界面一概不受影响。 */
+    ESP_ERROR_CHECK_WITHOUT_ABORT(audio_init());
 
     /* 摄像头自检：拍一张，把分辨率/字节数/JPEG 合法性打进串口日志，然后关闭。
      * 目的是证明硬件和 Kconfig 都对 —— 摄像头不可用只该少一路数据，不拦开机。
