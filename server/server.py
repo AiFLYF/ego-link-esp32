@@ -2570,8 +2570,9 @@ dialog.modal::backdrop{background:var(--modal-backdrop);backdrop-filter:blur(3px
           <span class="tag">AI 回复</span>
           <div class="txt" id="reply">还没有提问。</div>
           <div class="reply-foot">
-            <span>按板子 BOOT 键提问</span>
-            <span>回复同时显示在板子屏幕上</span>
+            <span>按板子 BOOT 键提问，<b>三击</b>说话</span>
+            <span id="voicehint">回复同时显示在板子屏幕上</span>
+            <button id="aicancel" class="sm" hidden>停止</button>
           </div>
         </div>
       </div>
@@ -3898,6 +3899,24 @@ function render(s){
   var rbox = $("replybox");
   rbox.className = "reply" + (s.ai_pending ? " pending" : "") + (s.ai_reply ? " has" : "");
 
+  /* 语音链路的状态提示（第 4 周）。服务端只知道「识别中」这一步；
+     「录音 / 上传」发生在板子本地，网页看不到 —— 那两态由板子屏幕显示。 */
+  var vs = s.voice_state || "idle";
+  var vh = $("voicehint");
+  if (vs === "transcribing"){
+    vh.textContent = "正在识别语音…";
+  } else if (vs === "thinking"){
+    vh.textContent = "识别到「" + (s.voice_text || "") + "」，正在想…";
+  } else if (s.voice_err){
+    vh.textContent = s.voice_err;
+  } else if (s.voice_text){
+    vh.textContent = "识别到「" + s.voice_text + "」";
+  } else {
+    vh.textContent = "回复同时显示在板子屏幕上";
+  }
+  /* 「停止」只在真的有事可停时出现 —— 常驻一个灰按钮只是噪音 */
+  $("aicancel").hidden = !s.ai_pending;
+
   if (s.latest){
     var x = s.latest[1], y = s.latest[2], z = s.latest[3];
     var mag = Math.sqrt(x*x + y*y + z*z);
@@ -3992,6 +4011,15 @@ fetch("/api/commands" + devQuery()).then(function(r){ return r.json(); }).then(f
     var v = parseInt($("orientsel").value, 10);
     if (isNaN(v)) return;
     sendCmd("set_orient", this, {o: v});
+  };
+  /* 「停止」：打断正在生成的大模型回复（第 4 周）。服务端用令牌作废那次回答，
+     板端下一帧就会看到「已停止」—— 这里发一次请求即可，不用等返回。 */
+  if ($("aicancel")) $("aicancel").onclick = function(){
+    var btn = this;
+    btn.disabled = true;
+    fetch("/api/ask/cancel" + devQuery(), {method:"POST"})
+      .then(function(){ btn.disabled = false; })
+      .catch(function(){ btn.disabled = false; });
   };
   syncOrient();
   $("names").textContent = cmdNames.join(" / ");
