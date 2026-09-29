@@ -10,6 +10,7 @@ idf_component_register(
     SRCS
         "main.c"
         "accel_input.c"
+        "audio.c"
         "wifi_link.c"
         "net_config.c"
         "prov_form.c"

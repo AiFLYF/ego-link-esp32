@@ -762,12 +762,21 @@ static void ui_timer_cb(lv_timer_t *timer)
     snprintf(buf, sizeof(buf), "↑%u", (unsigned)st.posts_ok);
     lv_label_set_text(s_lbl_posts, buf);
 
-    /* ---------- 远程指令徽标（出现时临时顶替上报数，二者互斥） ---------- */
+    /* ---------- 远程指令徽标 / 语音状态（互斥，出现时临时顶替上报数） ----------
+     * 语音**优先于**远程指令：用户刚按完键，"它在听"是此刻最该看到的信息。
+     * 值 4/5 是语音态，直接接在 cmd_state 的 0..3 之后，共用一个徽标控件 ——
+     * 不为它新开一个 UI 元素，屏幕上本来就没几处空白。 */
     int badge = (st.cmd_state <= TRANSPORT_CMD_FAILED) ? (int)st.cmd_state : 0;
+    if (st.voice_state == TRANSPORT_VOICE_RECORDING) {
+        badge = 4;
+    } else if (st.voice_state == TRANSPORT_VOICE_UPLOADING) {
+        badge = 5;
+    }
     if (badge != s_last_badge) {
         s_last_badge = badge;
-        static const char *const badge_text[4] = {"", "...", "OK", "NG"};
-        static const uint32_t badge_color[4] = {0, UI_C_AMBER, UI_C_GREEN, UI_C_RED};
+        static const char *const badge_text[6] = {"", "...", "OK", "NG", "录音", "上传"};
+        static const uint32_t badge_color[6] = {0, UI_C_AMBER, UI_C_GREEN, UI_C_RED,
+                                                UI_C_TEAL, UI_C_BLUE};
 
         if (badge == TRANSPORT_CMD_IDLE) {
             lv_obj_set_hidden(s_badge, true);
