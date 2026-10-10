@@ -174,7 +174,21 @@ class Device:
             "ai_mode": "规则AI",
             # 「停止」用：每次取消都 +1，后台线程回来时发现令牌变了就丢弃结果。
             # 比"设个 flag 再清掉"可靠 —— 不依赖 worker 有没有及时看到 flag。
+            #
+            # 第 6 周起它同时是**回合令牌**（第 6 周「迟到结果隔离」）：每开始一轮
+            # 新的 AI 交互就 +1，任何异步产物（大模型回答、自然语言指令的执行结果、
+            # 语音识别）回来时都要对一次令牌 —— 对不上说明用户早就改口了，直接丢弃。
+            # 否则「先说拍张照 → 再问一个问题」时，那条指令的旧结果会把新答案盖掉。
             "ai_cancel": 0,
+            # 计时（第 6 周）。板端屏幕只显示 ai_reply，看不到"等了多久"，
+            # 所以耗时在网页上给：识别多久、生成多久、整个语音任务多久。
+            # `voice_t0` 是**本轮语音任务**的起点（收到录音那一刻），回复落地时清 0；
+            # 为 0 表示当前这轮不是语音发起的（比如网页打字）。
+            "voice_t0": 0.0,
+            "ai_t0": 0.0,
+            "voice_ms": 0,                        # 识别耗时
+            "ai_ms": 0,                           # 生成耗时（提问 → 回答就绪）
+            "total_ms": 0,                        # 端到端（录音 → 最终回复就绪）
             # 语音链路（第 4 周）。idle / recording / uploading / transcribing，
             # 网页和板端屏幕都照这个显示进度，不需要各猜各的。
             "voice_state": "idle",
@@ -426,12 +440,30 @@ def _mark(rec, state, ts=None):
     rec["history"].append([state, ts if ts is not None else time.time()])
 
 
-def new_command(dev, name, params=None, source="web"):
+def _finish_turn(dev, now=None):
+    """一轮**语音任务**收尾：算出端到端耗时并清掉起点。**调用方必须已持有 LOCK。**
+
+    只在 `voice_t0 > 0`（本轮是语音发起的）时才算 —— 网页打字没有"录音时刻"，
+    硬算会把上一个语音任务的起点拿来用，数字是错的。
+    """
+    now = time.time() if now is None else now
+    t0 = dev.st.get("voice_t0") or 0.0
+    if t0 > 0:
+        dev.st["total_ms"] = int(max(0.0, now - t0) * 1000)
+        dev.st["voice_t0"] = 0.0
+    return dev.st.get("total_ms", 0)
+
+
+def new_command(dev, name, params=None, source="web", turn=None):
     """给某台设备建一条待下发的命令，返回 request_id。
 
     `source` 记录这条命令是谁下的：`web`（网页按钮）或 `nl`（自然语言请求）。
     **自然语言那条执行完要把结果回显到板端屏幕**（见 apply_command_result）——
     用户是对着板子说的，眼睛也在板子上，结果只出现在网页上等于没说。
+
+    `turn` 是下发这条命令时的**回合令牌**（第 6 周「迟到结果隔离」）。结果回显时
+    要对一次：对不上就说明用户在这条命令跑完之前已经开始了新一轮交互（又问了句话、
+    或说了别的指令），这条**迟到的结果不该再往屏幕上写** —— 那会把新的回答盖掉。
     """
     with LOCK:
         dev.seq += 1
@@ -441,6 +473,7 @@ def new_command(dev, name, params=None, source="web"):
             "name": name,
             "params": sanitize_params(name, params),
             "source": source,
+            "nl_turn": turn,        # 只有 source=="nl" 才有意义；回显前要核对
             "state": "queued",      # queued / sent / done / failed / timeout
             "history": [["queued", time.time()]],
             "created": time.time(),
@@ -516,9 +549,18 @@ def apply_command_result(dev, res):
             text = "[%s] 命令 %s 执行失败：%s" % (dev.id, name, r.get("err", "未说明"))
         # 自然语言请求：把结果回显到板端屏幕 —— 用户是对着板子说的，眼睛也在板子上，
         # 结果只出现在网页上等于没说。
+        #
+        # 第 6 周「迟到结果隔离」：**只有令牌还对上才写**。用户在这条指令跑完之前
+        # 已经又问了句话 / 说了别的指令的话，这条迟到的结果属于上一轮，
+        # 写上去只会把新的回答盖掉（屏幕上会莫名其妙跳回一个旧结果）。
         if rec.get("source") == "nl":
-            dev.st["ai_reply"] = _nl_result_reply(name, rec["state"] == "done", r)
-            dev.st["ai_mode"] = "指令"
+            if rec.get("nl_turn") == dev.st["ai_cancel"]:
+                dev.st["ai_reply"] = _nl_result_reply(name, rec["state"] == "done", r)
+                dev.st["ai_mode"] = "指令"
+                _finish_turn(dev)            # 语音任务的话，这就是它的终点
+            else:
+                push_event(dev, "warn", "指令 %s 的结果来晚了，已丢弃（用户已开始新一轮）"
+                           % name)
     return text
 
 
@@ -545,8 +587,11 @@ def expire_commands():
                     _mark(rec, "timeout", now)
                     if rec.get("source") == "nl":
                         # 自然语言触发的命令超时：板端屏幕别一直停在"好，让板子…"
-                        dev.st["ai_reply"] = "板子没回话（%s 超时）" % rec["name"]
-                        dev.st["ai_mode"] = "指令"
+                        # 同样要核对令牌 —— 用户早就改口的话，这条超时提示也是过期的。
+                        if rec.get("nl_turn") == dev.st["ai_cancel"]:
+                            dev.st["ai_reply"] = "板子没回话（%s 超时）" % rec["name"]
+                            dev.st["ai_mode"] = "指令"
+                            _finish_turn(dev)
                     expired.append((dev, rec["name"]))
     return expired
 
@@ -1029,10 +1074,15 @@ def _llm_worker(dev, question, token):
         if dev.st["ai_cancel"] != token:
             dev.st["voice_state"] = "idle"    # 被停止：别把板端留在"思考中"
             return                       # 已被取消：这次结果作废
+        now = time.time()
         dev.st["ai_pending"] = False
         dev.st["ai_reply"] = reply
         dev.st["ai_mode"] = mode
         dev.st["voice_state"] = "idle"
+        t0 = dev.st["ai_t0"] or now          # 计时：生成本身花了多久
+        dev.st["ai_ms"] = int(max(0.0, now - t0) * 1000)
+        dev.st["ai_t0"] = 0.0
+        _finish_turn(dev, now)               # 语音任务的话，再补一个端到端耗时
         # 记进对话历史（第 4 周「澄清」的原料）
         dev.chat.append(("user", question))
         dev.chat.append(("assistant", reply))
@@ -1204,17 +1254,22 @@ def run_intent(dev, question, intent):
         # 指令结果先写到屏幕上、几秒后被那次**旧回答**盖掉 —— 用户看到的是
         # "这是刚才那个问题的答案"，而他明明已经改口了。
         dev.st["ai_cancel"] += 1
+        turn = dev.st["ai_cancel"]            # 本轮令牌：这条指令的结果必须带着它回来
         dev.st["ai_pending"] = False          # 不走大模型，别让板端一直转圈
         dev.st["ai_reply"] = spoken
         dev.st["ai_mode"] = "指令"
+        dev.st["ai_ms"] = 0                   # 规则解析，没有"生成"这一步
+        dev.st["ai_t0"] = 0.0
         dev.chat.append(("user", question))
         dev.chat.append(("assistant", spoken))
     if name == "__refuse__":
         push_event(dev, "warn", "自然语言请求「%s」被拒：%s 不接自然语言（危险动作）"
                    % (question, params))
+        with LOCK:
+            _finish_turn(dev)                 # 没有后续指令了，这一轮到此为止
         return spoken
     # new_command 内部要取 LOCK，必须在上面的 with 之外调用
-    cid = new_command(dev, name, params, source="nl")
+    cid = new_command(dev, name, params, source="nl", turn=turn)
     push_event(dev, "cmd", "自然语言请求「%s」→ 指令 %s（%s）" % (question, name, cid))
     return spoken
 
@@ -1238,10 +1293,15 @@ def request_ai(dev, question):
         with LOCK:
             if dev.st["ai_pending"]:
                 return dev.st["ai_reply"] or "我还在想上一个问题，稍等一下…"
+            # 新一轮开始：令牌 +1，让所有"上一轮"的异步产物作废
+            # （迟到的指令结果、迟到的语音识别都靠它对不上号而自行丢弃）。
+            dev.st["ai_cancel"] += 1
+            token = dev.st["ai_cancel"]      # 记下本次的令牌
             dev.st["ai_pending"] = True
             dev.st["ai_reply"] = "正在思考…"
             dev.st["ai_mode"] = "大模型"
-            token = dev.st["ai_cancel"]      # 记下本次的令牌
+            dev.st["ai_t0"] = time.time()    # 计时：生成从这一刻算起
+            dev.st["ai_ms"] = 0
         push_event(dev, "ask", "板端提问「%s」→ 已转交大模型" % question)
         threading.Thread(target=_llm_worker, args=(dev, question, token), daemon=True,
                          name="llm").start()
@@ -1251,6 +1311,9 @@ def request_ai(dev, question):
     with LOCK:
         dev.st["ai_reply"] = reply
         dev.st["ai_mode"] = "规则AI"
+        dev.st["ai_ms"] = 0                  # 规则AI 是本地模板，没有"生成"耗时
+        dev.st["ai_t0"] = 0.0
+        _finish_turn(dev)                    # 本轮到此结束，记下端到端耗时
         dev.chat.append(("user", question))
         dev.chat.append(("assistant", reply))
     push_event(dev, "ask", "板端提问「%s」→ %s" % (question, reply[:40]))
@@ -1262,32 +1325,65 @@ def cancel_ai(dev):
 
     只递增令牌，不依赖 worker 有没有及时看到某个 flag —— 无论它什么时候回来，
     对不上令牌就自己丢弃。这样"停止"在慢网络/慢模型下也是确定的。
+
+    第 6 周补上：**还没回话的自然语言指令也算"有事可停"**。用户对着板子说
+    「拍张照」，板子还在拍的时候按停止，屏幕不该一直停在「好，拍张照…」——
+    递增令牌会让那条指令的结果回来时被丢弃，屏幕上就停在「已停止」。
     """
     with LOCK:
         was = dev.st["ai_pending"]
+        inflight = any(r.get("source") == "nl"
+                       and r.get("nl_turn") == dev.st["ai_cancel"]
+                       and r["state"] in ("queued", "sent")
+                       for r in dev.commands.values())
         dev.st["ai_cancel"] += 1
         dev.st["ai_pending"] = False
-        if was:
+        if was or inflight:
             dev.st["ai_reply"] = "已停止"
             dev.st["ai_mode"] = "规则AI"
-    if was:
+            dev.st["voice_state"] = "idle"
+            dev.st["ai_t0"] = 0.0
+            _finish_turn(dev)
+    if was or inflight:
         push_event(dev, "warn", "已停止正在生成的回复")
-    return was
+    return was or inflight
 
 
-def _voice_worker(dev, data, saved):
+def _voice_worker(dev, data, saved, turn=None):
     """后台线程：识别 → 交给大模型 → 结果由后续遥测帧带回板端。
 
     识别失败**必须**把 voice_state 复位并留下原因 —— 否则板端会永远停在
     「识别中」，用户只会觉得板子死了。
+
+    `turn` 是收到这段录音时的回合令牌（第 6 周「迟到结果隔离」）。识别要几秒
+    （云端更久），这期间用户完全可能已经在网页上打字问了别的问题 ——
+    那种情况下这段**迟到的识别结果属于上一轮**，不能再拿它去调 request_ai，
+    否则会用一个旧问题顶掉用户刚得到的新答案。
     """
+    t0 = dev.st.get("voice_t0") or 0.0
     text, err = transcribe(data)
+    now = time.time()
+    with LOCK:
+        if turn is not None and dev.st["ai_cancel"] != turn:
+            # 用户已经改口了：这段识别结果作废，但状态要复位，别让板端卡在「识别中」
+            dev.st["voice_state"] = "idle"
+            dev.st["voice_err"] = "已忽略（这期间你又问了别的）"
+            dev.st["voice_ms"] = int(max(0.0, now - t0) * 1000) if t0 > 0 else 0
+            dev.st["voice_t0"] = 0.0
+            late = True
+        else:
+            late = False
+            dev.st["voice_ms"] = int(max(0.0, now - t0) * 1000) if t0 > 0 else 0
+    if late:
+        push_event(dev, "warn", "语音识别结果来晚了（用户已开始新一轮），已丢弃")
+        return
     if not text:
         with LOCK:
             dev.st["voice_state"] = "idle"
             dev.st["voice_err"] = err or "没听清"
             # 屏幕上不能一直停在「正在识别…」—— 那看起来就像板子死了
             dev.st["ai_reply"] = "没听清，再说一次？"
+            _finish_turn(dev, now)
         push_event(dev, "warn", "语音识别失败：%s" % (err or "没听清"))
         return
     with LOCK:
@@ -1675,13 +1771,20 @@ class Handler(BaseHTTPRequestHandler):
                 return
             dev.st["voice_state"] = "transcribing"
             dev.st["voice_err"] = ""
+            # 计时（第 6 周）：这一轮语音任务从"收到录音"这一刻算起。
+            dev.st["voice_t0"] = time.time()
+            dev.st["voice_ms"] = 0
+            dev.st["total_ms"] = 0
+            # 记下此刻的回合令牌：识别期间用户要是又问了一句，令牌会变，
+            # 这段迟到的识别结果就该丢弃（第 6 周「迟到结果隔离」）。
+            turn = dev.st["ai_cancel"]
             # 板端立刻有反馈：识别要几秒（云端更久），这段时间屏幕不该一动不动。
             # 但如果上一轮大模型还在生成，就别把它挤掉 —— 那会把快出结果的那次弄丢。
             if not dev.st["ai_pending"]:
                 dev.st["ai_reply"] = "正在识别…"
         saved = self._audio_save(dev, data)
         push_event(dev, "ask", "收到 %d 字节录音，开始识别" % len(data))
-        threading.Thread(target=_voice_worker, args=(dev, data, saved),
+        threading.Thread(target=_voice_worker, args=(dev, data, saved, turn),
                          daemon=True, name="asr").start()
         self._send(200, json.dumps({"ok": True, "bytes": len(data), "saved": saved},
                                    ensure_ascii=False))
@@ -1729,11 +1832,16 @@ class Handler(BaseHTTPRequestHandler):
         want = query_param(query, "device") or msg.get("device")
         with LOCK:
             dev = pick_device(clean_device_id(want) if want else None)
+            # 打字进来的这一轮不是"语音任务"，没有录音起点 —— 清掉，
+            # 免得待会儿拿上一个语音任务的起点去算端到端耗时（数字会是错的）。
+            dev.st["voice_t0"] = 0.0
         # request_ai 内部会取 LOCK，必须在 with 之外调用
         reply = request_ai(dev, text)
         with LOCK:
             out = {"ok": True, "device": dev.id, "reply": reply,
-                   "mode": dev.st["ai_mode"], "pending": dev.st["ai_pending"]}
+                   "mode": dev.st["ai_mode"], "pending": dev.st["ai_pending"],
+                   "voice_ms": dev.st["voice_ms"], "ai_ms": dev.st["ai_ms"],
+                   "total_ms": dev.st["total_ms"]}
         self._send(200, json.dumps(out, ensure_ascii=False))
 
     def _ask_cancel(self, query):
@@ -2809,6 +2917,9 @@ dialog.modal::backdrop{background:var(--modal-backdrop);backdrop-filter:blur(3px
           <div class="reply-foot">
             <span>按板子 BOOT 键提问，<b>三击</b>说话</span>
             <span id="voicehint">回复同时显示在板子屏幕上</span>
+            <!-- 计时（第 6 周）：板端屏幕只显示回复正文，看不到"等了多久"，
+                 所以耗时在这里给。没有数据时整个元素收起来，不占位。 -->
+            <span id="timing" hidden></span>
             <button id="aicancel" class="sm" hidden>停止</button>
           </div>
           <div class="askrow">
@@ -4082,6 +4193,37 @@ function selectDevice(id){
 
 /* ---------------- 主刷新 ---------------- */
 var aiReply = "";
+/* ---------------- 计时（第 6 周） ----------------
+   课程第 6 周要求语音任务能「澄清、停止、迟到结果隔离、**计时**」。
+   板子屏幕上只有回复正文，看不到"等了多久"——识别慢还是模型慢，用户没法判断，
+   也没法解释"为什么板子半天没反应"。所以把三段耗时摆到网页上：
+   识别多久、生成多久、整个语音任务端到端多久。 */
+function fmtMs(ms){
+  ms = Number(ms) || 0;
+  if (ms <= 0) return "";
+  /* 900 ms 比 0.9 s 直观，3.4 s 比 3400 ms 好读 —— 分界点放在 1 秒 */
+  if (ms < 1000) return Math.round(ms) + " ms";
+  return (ms / 1000).toFixed(1) + " s";
+}
+
+function renderTiming(s){
+  var el = $("timing");
+  if (!el) return;
+  var parts = [];
+  var v = fmtMs(s.voice_ms), a = fmtMs(s.ai_ms), t = fmtMs(s.total_ms);
+  if (v) parts.push("识别 " + v);
+  if (a) parts.push("生成 " + a);
+  if (t) parts.push("共 " + t);
+  if (!parts.length){
+    /* 没有数据（比如只按了 BOOT 键、走的是规则AI）就把整块收起来，不占位 */
+    el.hidden = true;
+    el.textContent = "";
+    return;
+  }
+  el.textContent = parts.join(" · ");
+  el.hidden = false;
+}
+
 function render(s){
   /* 服务端实际给的是哪台：若和我们选的不一致（选中的被淘汰/改名了），跟着它走，
      免得页面一直停在一个已经不存在的设备上。 */
@@ -4164,6 +4306,7 @@ function render(s){
   }
   /* 「停止」只在真的有事可停时出现 —— 常驻一个灰按钮只是噪音 */
   $("aicancel").hidden = !s.ai_pending;
+  renderTiming(s);                       /* 第 6 周：识别 / 生成 / 端到端耗时 */
 
   if (s.latest){
     var x = s.latest[1], y = s.latest[2], z = s.latest[3];

@@ -36,6 +36,26 @@ PY = sys.executable
 # 沙箱/本机可能有全局 http_proxy，会把 127.0.0.1 的请求也劫走
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
+# ⚠️ **不只是测试进程自己**（上面那个 OPENER）：**每个子进程也必须**拿到这份环境。
+# `fake_board.py` 是往 127.0.0.1 发遥测的 —— 一旦它继承了环境里的代理，
+# POST 全被代理劫走返回 502，板子就"永远注册不上"：第 12/13/14 节整片红，
+# 第 5 节跌落的采样数忽多忽少（有多少 POST 侥幸绕过去，就采到多少个状态）。
+#
+# 2026-10-10 查实：8 处 subprocess 调用里有 **6 处漏传 env=**，全都继承了代理。
+# 这就是手册 T59（假板子起不来）和 T62（跌落偶发失败）的**同一个真因** ——
+# 它们根本不是"偶发"，是"有多少子进程被代理吃掉"的必然结果。
+CHILD_ENV = dict(os.environ)
+CHILD_ENV["no_proxy"] = CHILD_ENV["NO_PROXY"] = "127.0.0.1,localhost"
+for _k in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY",
+           "all_proxy", "ALL_PROXY"):
+    CHILD_ENV.pop(_k, None)
+
+# 等板子"在册"要等多久（× 0.25 秒）。**别用 10 秒** ——
+# 实测这个沙箱里**空的 `python -c pass` 就要 2.0~2.7 秒**（进程创建被套了一层壳），
+# `fake_board.py` 起来要 3 秒左右，起来之后还要等第一个遥测周期才会上报。
+# 原来只给 10 秒，余量太薄，机器一忙就"板子没上报" —— 被误判成产品 bug（手册 T59）。
+BOARD_WAIT_STEPS = 160          # 160 × 0.25s = 40 秒
+
 RESULTS = []
 
 
@@ -162,6 +182,7 @@ def firmware_body(samples, source="SC7A20", ask=False, question=None, device="rw
 # --------------------------------------------------------------------------
 class MockLLM(BaseHTTPRequestHandler):
     delay = 6.0
+    asr_delay = 0.0    # 识别也支持人为放慢 —— 用来测"迟到的识别结果被丢弃"（第 6 周）
     calls = []
     seen = []          # 收到的请求体（用来验证"多轮历史真的带进了请求"）
     asr_text = "板子现在怎么样"
@@ -178,6 +199,8 @@ class MockLLM(BaseHTTPRequestHandler):
         # 不区分路径的话，ASR 会拿到大模型的 choices 结构、解析出空文本。
         if path.endswith("/audio/transcriptions"):
             MockLLM.calls.append(time.time())
+            if MockLLM.asr_delay:
+                time.sleep(MockLLM.asr_delay)
             body = json.dumps({"text": MockLLM.asr_text}).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -211,7 +234,7 @@ def feed(port, scenario, seconds, ask_at=None, expect_steps=None):
         cmd += ["--ask-at", str(a)]
     if expect_steps is not None:
         cmd += ["--expect-steps", str(expect_steps)]
-    p = subprocess.run(cmd, capture_output=True, text=True)
+    p = subprocess.run(cmd, capture_output=True, text=True, env=CHILD_ENV)
     return p.returncode, p.stdout + p.stderr
 
 
@@ -233,10 +256,9 @@ def main():
     data_dir = os.path.join(tmp, "data")
     port = free_port()
     llm_port = free_port()
-    env = dict(os.environ)
-    # 让 server 子进程访问 127.0.0.1 上的假大模型时绕开全局代理
-    env["no_proxy"] = "127.0.0.1,localhost"
-    env["NO_PROXY"] = "127.0.0.1,localhost"
+    # 子进程统一用 CHILD_ENV（已绕开代理，见文件顶部的说明）——
+    # 别再各自 `dict(os.environ)`：那正是 T59/T62 的成因。
+    env = CHILD_ENV
 
     print("=" * 70)
     print("服务端回归测试   端口=%d  数据目录=%s" % (port, data_dir))
@@ -298,7 +320,7 @@ def main():
         proc = subprocess.Popen(
             [PY, os.path.join(HERE, "fake_board.py"), "--url", "http://127.0.0.1:%d" % port,
              "--scenario", "fall", "--seconds", "9", "--quiet"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=CHILD_ENV)
         while proc.poll() is None:
             try:
                 seen.append(latest(port)["activity"])
@@ -331,7 +353,7 @@ def main():
         print("\n[7] 慢速大模型（%d 秒）不阻塞板端" % MockLLM.delay)
         srv.kill()
         srv.wait()
-        env2 = dict(env)
+        env2 = dict(CHILD_ENV)
         env2["RW1_LLM_API_KEY"] = "sk-test"
         env2["RW1_LLM_BASE_URL"] = "http://127.0.0.1:%d/v1" % llm_port
         env2["RW1_LLM_MODEL"] = "mock"
@@ -453,12 +475,12 @@ def main():
             [PY, os.path.join(HERE, "fake_board.py"),
              "--url", "http://127.0.0.1:%d" % port, "--device", r12_dev,
              "--scenario", "tilt", "--seconds", "14", "--quiet"],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=CHILD_ENV)
         # **等它真的在册**再下发，别用固定 sleep：板子还没报上第一帧时，
         # 服务端的 pick_device 会回退到"最近上报的那台"，命令就发给了别人 ——
         # 响应里 device_online 还是 True（那是别人的），断言却全在等自己的命令，
         # 表现为"稳定失败但手工复现完全正常"（2026-09-23 踩过）。
-        for _ in range(40):
+        for _ in range(BOARD_WAIT_STEPS):
             live = [d["id"] for d in get_json(
                 "http://127.0.0.1:%d/api/devices" % port).get("devices", [])]
             if r12_dev in live:
@@ -509,8 +531,8 @@ def main():
             [PY, os.path.join(HERE, "fake_board.py"),
              "--url", "http://127.0.0.1:%d" % port, "--device", r13_dev,
              "--scenario", "idle", "--seconds", "14", "--no-cmd", "--quiet"],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        for _ in range(40):
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=CHILD_ENV)
+        for _ in range(BOARD_WAIT_STEPS):
             live = [d["id"] for d in get_json(
                 "http://127.0.0.1:%d/api/devices" % port).get("devices", [])]
             if r13_dev in live:
@@ -548,8 +570,8 @@ def main():
             [PY, os.path.join(HERE, "fake_board.py"),
              "--url", "http://127.0.0.1:%d" % port, "--device", r14_dev,
              "--scenario", "idle", "--seconds", "20", "--quiet"],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        for _ in range(40):
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=CHILD_ENV)
+        for _ in range(BOARD_WAIT_STEPS):
             live = [d["id"] for d in get_json(
                 "http://127.0.0.1:%d/api/devices" % port).get("devices", [])]
             if r14_dev in live:
@@ -946,6 +968,17 @@ def main():
               "实际: %s" % snap.get("voice_state"))
         check("没有残留错误", not snap.get("voice_err"), "实际: %r" % snap.get("voice_err"))
 
+        # 计时（第 6 周）：课程要求语音任务能"计时"。板端屏幕只有回复正文，
+        # 看不出"是识别慢还是模型慢"，所以三段耗时都要有数、而且要合理。
+        check("语音任务有识别耗时（voice_ms > 0）", (snap.get("voice_ms") or 0) > 0,
+              "实际: %s" % snap.get("voice_ms"))
+        check("语音任务有生成耗时（ai_ms ≈ 假模型 %.0f 秒）" % MockLLM.delay,
+              (snap.get("ai_ms") or 0) >= MockLLM.delay * 1000 * 0.5,
+              "实际: %s ms" % snap.get("ai_ms"))
+        check("语音任务有端到端耗时，且不小于生成那一段（total_ms ≥ ai_ms > 0）",
+              0 < (snap.get("ai_ms") or 0) <= (snap.get("total_ms") or 0),
+              "实际: total=%s ai=%s" % (snap.get("total_ms"), snap.get("ai_ms")))
+
         # 澄清：第二次提问应该把上一轮问答带进大模型请求
         before = len(MockLLM.seen)
         post_bytes(vurl, b"\x01\x02" * 16000)
@@ -970,8 +1003,8 @@ def main():
             [PY, os.path.join(HERE, "fake_board.py"),
              "--url", nbase, "--device", nl_dev, "--scenario", "idle",
              "--period", "0.25", "--seconds", "60", "--quiet"],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        for _ in range(40):
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=CHILD_ENV)
+        for _ in range(BOARD_WAIT_STEPS):
             if nl_dev in [d["id"] for d in get_json(nbase + "/api/devices").get("devices", [])]:
                 break
             time.sleep(0.25)
@@ -1101,6 +1134,97 @@ def main():
               rec_txt.get("name") == "led_blink" and rec_txt.get("source") == "nl",
               "实际: %s / %s" % (rec_txt.get("name"), rec_txt.get("source")))
         check("空文字被拒（400）", _expect_400(nbase + "/api/ask", {"text": "   "}))
+
+        # ---- 26. 迟到结果隔离（第 6 周）-------------------------------------
+        # 课程第 6 周：「让语音任务可以澄清与停止（含停止播报、**迟到结果隔离**、计时）」。
+        #
+        # 典型场景：用户说「拍张照」，板子还在拍，他已经改口了（按了停止）。
+        # 那条指令的结果回来时属于**上一轮**，不能再往屏幕上写 ——
+        # 否则用户会看到一个自己已经不要了的旧结果，把当前的回答盖掉。
+        print("\n[23] 迟到结果隔离：旧结果不许盖掉新回答（第 6 周）")
+        # 专门起一块**故意不执行指令**的板子（--no-cmd）：指令会一直停在队列里，
+        # 直到被判超时 —— 那条"超时"就是我们要的**迟到结果**。
+        # 这样不用"抢在板子取走命令之前取消"（那种窗口只有几毫秒，是在赌运气），
+        # 场景是确定性的：无论机器快慢，指令都不会提前完成。
+        slow_dev = "nl-slow"
+        slowboard = subprocess.Popen(
+            [PY, os.path.join(HERE, "fake_board.py"),
+             "--url", nbase, "--device", slow_dev, "--scenario", "idle",
+             "--period", "0.25", "--seconds", "60", "--no-cmd", "--quiet"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=CHILD_ENV)
+        for _ in range(BOARD_WAIT_STEPS):
+            if slow_dev in [d["id"] for d in get_json(nbase + "/api/devices").get("devices", [])]:
+                break
+            time.sleep(0.25)
+
+        def ask_on(dev_id, text):
+            return post_raw(nbase + "/api/telemetry",
+                            firmware_body([(0.0, 0.0, 1.0)] * 5, ask=True,
+                                          question=text, device=dev_id))
+
+        def cmds_on(dev_id):
+            return get_json(nbase + "/api/commands?device=" + urllib.parse.quote(dev_id)) \
+                   .get("commands", [])
+
+        ask_on(slow_dev, "拍张照")
+        time.sleep(0.4)
+        cid_late = (cmds_on(slow_dev) or [{}])[0].get("id")
+        # 用户改口了：按停止。此刻这条指令**还没回话**（板子故意不执行），
+        # 所以"停止"必须把它也认成有事可停。
+        rc_stop = post_json(nbase + "/api/ask/cancel?device=" + urllib.parse.quote(slow_dev), {})
+        check("停止对「还没回话的自然语言指令」也生效（不是只停大模型）",
+              rc_stop.get("ok") is True and rc_stop.get("stopped") is True,
+              "实际: %s" % rc_stop)
+        check("按下停止时屏幕立刻变成「已停止」",
+              (latest(port, slow_dev).get("ai_reply") or "").strip() == "已停止",
+              "实际: %r" % latest(port, slow_dev).get("ai_reply"))
+
+        # 板子终于把结果回传了 —— 可这一轮早就结束了。这条走的是**主路径**
+        # （apply_command_result），不是超时那条。body 用 firmware_body 再拼上
+        # result 字段，跟真板子发回来的形状一致。
+        raw_body = firmware_body([(0.0, 0.0, 1.0)] * 5, device=slow_dev)
+        assert raw_body.endswith("}"), raw_body[-40:]
+        post_raw(nbase + "/api/telemetry",
+                 raw_body[:-1] + ',"result":{"id":"%s","ok":true,"note":"拍好了"}}' % cid_late)
+        time.sleep(0.8)
+        rec_late = _wait_cmd(port, cid_late, 8, device=slow_dev)
+        reply_late = (latest(port, slow_dev).get("ai_reply") or "").strip()
+        check("那条指令确实执行完了（迟到的结果真的产生了）",
+              rec_late is not None and rec_late["state"] == "done",
+              "实际: %s" % (rec_late and rec_late["state"]))
+        check("迟到的结果被丢弃，屏幕仍停在「已停止」",
+              reply_late == "已停止", "实际: %r" % reply_late)
+        check("丢弃这件事在事件流里留了痕（不是静默吞掉）",
+              any("来晚了" in (e.get("text") or "")
+                  for e in latest(port, slow_dev).get("events", [])),
+              "实际: %s" % [e.get("text") for e in latest(port, slow_dev).get("events", [])[:3]])
+        try:
+            slowboard.kill()
+            slowboard.wait(timeout=5)
+        except Exception:  # noqa: BLE001
+            pass
+
+        # ---- 27. 迟到的语音识别同样要丢弃（第 6 周）-------------------------
+        # 识别要几秒（云端更久）。这期间用户完全可能在网页上问了别的问题 ——
+        # 那段识别结果属于上一轮，不能再拿它去调模型，否则会用一个旧问题顶掉新答案。
+        print("\n[24] 迟到的语音识别被丢弃（第 6 周）")
+        MockLLM.asr_delay = 2.5             # 把识别放慢，制造"识别期间用户改口"
+        try:
+            post_bytes(vurl, b"\x01\x02" * 16000)
+            time.sleep(0.3)
+            # 识别还在跑：这时在**同一台设备**上问一句 —— 回合令牌就变了
+            post_json(nbase + "/api/ask?device=" + urllib.parse.quote(vdev),
+                      {"text": "今天天气怎么样"})
+            time.sleep(3.5)                 # 等那段迟到的识别回来
+            snap_late_v = latest(port, vdev)
+            check("迟到的识别结果被丢弃（没拿旧问题去调模型）",
+                  "已忽略" in (snap_late_v.get("voice_err") or ""),
+                  "实际: %r" % snap_late_v.get("voice_err"))
+            check("丢弃后语音状态复位，板端不会卡在「识别中」",
+                  snap_late_v.get("voice_state") == "idle",
+                  "实际: %s" % snap_late_v.get("voice_state"))
+        finally:
+            MockLLM.asr_delay = 0.0
 
         try:
             nlboard.kill()
