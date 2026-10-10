@@ -35,6 +35,7 @@ import json
 import math
 import os
 import queue
+import re
 import socket
 import struct
 import sys
@@ -425,8 +426,13 @@ def _mark(rec, state, ts=None):
     rec["history"].append([state, ts if ts is not None else time.time()])
 
 
-def new_command(dev, name, params=None):
-    """给某台设备建一条待下发的命令，返回 request_id。"""
+def new_command(dev, name, params=None, source="web"):
+    """给某台设备建一条待下发的命令，返回 request_id。
+
+    `source` 记录这条命令是谁下的：`web`（网页按钮）或 `nl`（自然语言请求）。
+    **自然语言那条执行完要把结果回显到板端屏幕**（见 apply_command_result）——
+    用户是对着板子说的，眼睛也在板子上，结果只出现在网页上等于没说。
+    """
     with LOCK:
         dev.seq += 1
         cid = "c-%d-%d" % (int(time.time()), dev.seq)
@@ -434,6 +440,7 @@ def new_command(dev, name, params=None):
             "id": cid,
             "name": name,
             "params": sanitize_params(name, params),
+            "source": source,
             "state": "queued",      # queued / sent / done / failed / timeout
             "history": [["queued", time.time()]],
             "created": time.time(),
@@ -507,6 +514,11 @@ def apply_command_result(dev, res):
                 text = "[%s] 命令 %s 完成（往返 %.0f ms）" % (dev.id, name, latency * 1000)
         else:
             text = "[%s] 命令 %s 执行失败：%s" % (dev.id, name, r.get("err", "未说明"))
+        # 自然语言请求：把结果回显到板端屏幕 —— 用户是对着板子说的，眼睛也在板子上，
+        # 结果只出现在网页上等于没说。
+        if rec.get("source") == "nl":
+            dev.st["ai_reply"] = _nl_result_reply(name, rec["state"] == "done", r)
+            dev.st["ai_mode"] = "指令"
     return text
 
 
@@ -531,6 +543,10 @@ def expire_commands():
                 if (now - base) > CMD_TIMEOUT_S:
                     rec["done"] = now
                     _mark(rec, "timeout", now)
+                    if rec.get("source") == "nl":
+                        # 自然语言触发的命令超时：板端屏幕别一直停在"好，让板子…"
+                        dev.st["ai_reply"] = "板子没回话（%s 超时）" % rec["name"]
+                        dev.st["ai_mode"] = "指令"
                     expired.append((dev, rec["name"]))
     return expired
 
@@ -1024,6 +1040,185 @@ def _llm_worker(dev, question, token):
                "%s回复：%s" % (mode, reply[:60]))
 
 
+# --------------------------------------------------------------------------
+# 自然语言「请求」（第 4 周）
+#
+# 课程第 4 周原文：「用自然语言查询与请求采集」——把自然语言分别映射为
+# **读取已有记录** 或 **请求一次新采集**，并把自建接口封装成**受限工具**。
+# 「查询」那一半第 4 周就做了（提问 → 大模型/规则AI → 屏显回答）；
+# 这里补的是「请求」那一半：用户说一句祈使句，服务端把它翻成一条**已有**的
+# 远程指令（第 2/3 周那套 request_id 机制），板子真的去执行，结果回显到屏幕上。
+#
+# 为什么用规则而不是大模型做意图识别：
+#   1. 教室可能没外网、也没配 key —— 而"让它拍张照"恰恰最该离线可用；
+#   2. 规则是确定的：同一句话永远解析成同一条指令，"它怎么听懂的"讲得清；
+#   3. 为一句"拍张照"付一次 API 往返，反而更慢。
+#
+# **安全边界（硬约束）**：自然语言只开放"安全、可逆、看得见"的指令。
+# 格式化 SD 卡、改 WiFi、清配置、重启这些破坏性或会让板子失联的动作**一律不接**
+# —— 语音识别错一个字就可能把卡格了，代价不对等。
+# --------------------------------------------------------------------------
+NL_MAX_LEN = 40            # 超过这个长度的话不当作设备请求（多半是在聊天）
+# 自然语言可触发的指令白名单。**必须都在 CMD_NAMES 里**（tools/verify_server.py 会验）。
+NL_SAFE_COMMANDS = ("capture_once", "cam_capture", "cam_stream",
+                    "led_blink", "led_set", "set_orient", "sd_ls")
+# 明确拒绝的危险动作：给一句"去哪儿做"的指路，而不是假装没听懂。
+NL_DANGEROUS = (
+    ("sd_format",    ("格式化", "格卡", "清空卡", "清空存储", "清一下卡")),
+    ("set_config",   ("wifi", "wi-fi", "ssid", "无线网", "改密码", "换密码",
+                      "改服务器", "服务器地址", "连别的网")),
+    ("clear_config", ("清除配置", "清配置", "恢复出厂", "重置配置", "清空配置")),
+    ("reboot",       ("重启", "重新启动", "重启板", "重启设备")),
+)
+_NL_CN_DIGITS = {"零": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4,
+                 "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
+
+
+def _nl_number(text, lo, hi, dflt):
+    """从一句话里取一个数字：阿拉伯数字优先，其次中文数字（支持 0–99）。"""
+    m = re.search(r"\d+", text)
+    if m:
+        return max(lo, min(hi, int(m.group())))
+    s = text
+    for i, ch in enumerate(s):
+        if ch not in _NL_CN_DIGITS:
+            continue
+        if ch == "十":                                  # 十 / 十二
+            nxt = _NL_CN_DIGITS.get(s[i + 1]) if i + 1 < len(s) else None
+            v = 10 + (nxt if nxt is not None and nxt < 10 else 0)
+            return max(lo, min(hi, v))
+        v = _NL_CN_DIGITS[ch]
+        if i + 1 < len(s) and s[i + 1] == "十":         # 二十 / 二十三
+            v *= 10
+            nxt = _NL_CN_DIGITS.get(s[i + 2]) if i + 2 < len(s) else None
+            if nxt is not None and nxt < 10:
+                v += nxt
+        return max(lo, min(hi, v))
+    return dflt
+
+
+def parse_intent(text):
+    """把一句话解析成 (指令名, 参数, 回话)；不是设备请求就返回 None。
+
+    `回话` 会直接写进 ai_reply —— 板子屏幕上显示的就是它，所以要短、口语化。
+    危险动作返回指令名 `__refuse__`：调用方只回话、不下发。
+
+    规则是"宁可漏判、不可错判"的顺序：先拦危险动作，再按"最不可能被别的词
+    顺带命中"的顺序匹配（画面 → 拍照 → 采集 → 存储 → 灯 → 档位）。
+    """
+    q = (text or "").strip()
+    if not q or len(q) > NL_MAX_LEN:
+        return None
+    # 去空格与常见标点：语音识别出来的句子标点位置不固定，匹配前先抹平
+    low = q.lower().replace(" ", "").replace("，", "").replace("。", "") \
+           .replace("！", "").replace("？", "").replace(",", "")
+
+    # 0) 危险动作先拦：宁可"多拒绝一句正常话"，也不能让语音把卡格了
+    for name, words in NL_DANGEROUS:
+        if any(w in low for w in words):
+            return ("__refuse__", name, "这个动作太危险，请到网页的指令区手动操作")
+
+    # 1) 实时画面开关（先于"拍照"：「开实时画面」和「拍张照」都可能带"画面/照"）
+    if any(w in low for w in ("实时画面", "画面", "推流", "视频", "直播", "监控")):
+        if any(w in low for w in ("关", "停", "别", "不要", "闭", "撤")):
+            return ("cam_stream", {"on": False}, "好，关掉实时画面")
+        if any(w in low for w in ("开", "启", "看", "要", "来")):
+            return ("cam_stream", {"on": True}, "好，打开实时画面")
+
+    # 2) 拍照
+    if any(w in low for w in ("拍照", "拍张照", "拍一张", "拍个照", "拍一下",
+                              "照一张", "照个相", "照相", "拍张相")):
+        return ("cam_capture", {}, "好，让板子拍一张照…")
+
+    # 3) 采集一次。**必须区分"重新采集"和"查看上次数据"** —— 这是课程第 4 周
+    #    的当堂验证项：同一份旧数据，前者要等一个**新结果**，后者要保留**旧时间**。
+    #    分不清的话，「上次采的数据是多少」会被当成新采集请求，屏幕回一句
+    #    「让板子采集一次…」，而用户其实只想看已有记录（该走查询路径）。
+    if any(w in low for w in ("采集", "测一下", "量一下", "测一测",
+                              "量一量", "采一次", "采个数")):
+        look_back = any(w in low for w in ("上次", "之前", "刚才", "历史",
+                                           "已有", "原来", "旧的"))
+        fresh = any(w in low for w in ("重新", "再", "新", "重"))
+        if look_back and not fresh:
+            return None          # 交给查询路径（带着已有数据回答，不产生新采集）
+        return ("capture_once", {}, "好，让板子采集一次…")
+
+    # 4) 看存储卡
+    if any(w in low for w in ("卡里", "存储", "sd卡", "文件列表", "存了")):
+        if any(w in low for w in ("看", "列", "查", "有", "多少", "什么", "读")):
+            return ("sd_ls", {}, "好，看一下存储卡…")
+
+    # 5) 灯：闪 / 开 / 关
+    if "闪" in low:
+        n = _nl_number(q, 1, LED_MAX_BLINKS, 3)
+        return ("led_blink", {"n": n, "pattern": "ack"}, "好，让板子闪 %d 下" % n)
+    if "灯" in low:
+        if any(w in low for w in ("关", "灭", "熄")):
+            return ("led_set", {"on": False}, "好，把灯关掉")
+        if any(w in low for w in ("开", "亮", "点")):
+            return ("led_set", {"on": True}, "好，把灯点亮")
+
+    # 6) 方向档位
+    if any(w in low for w in ("档", "校准", "方向")):
+        if any(w in low for w in ("切", "调", "换", "设", "改", "第", "到")):
+            o = _nl_number(q, 0, 15, None)
+            if o is not None:
+                return ("set_orient", {"o": o}, "好，把方向档位切到 %d" % o)
+
+    return None
+
+
+def _nl_result_reply(name, ok, res):
+    """指令执行完后，回给板端屏幕的一句人话。"""
+    if not ok:
+        return "指令没做成：%s" % (res.get("err") or "未说明")
+    if name == "cam_capture":
+        return "拍好了，存进存储卡了"
+    if name == "capture_once":
+        return "采好了：x=%+.2f y=%+.2f z=%+.2f" % (res.get("x", 0.0), res.get("y", 0.0),
+                                                   res.get("z", 0.0))
+    if name == "sd_ls":
+        n = max(0, res.get("note", "").count(";") - 1)
+        return "存储卡里有 %d 个文件" % n
+    if name == "led_blink":
+        return "闪好了"
+    if name == "led_set":
+        return "灯已切换"
+    if name == "cam_stream":
+        return "实时画面已切换"
+    if name == "set_orient":
+        return "档位已切好"
+    return "指令完成"
+
+
+def run_intent(dev, question, intent):
+    """执行一条自然语言请求：下发指令，并**立刻**回一句"正在做…"。
+
+    立刻回话很重要 —— 指令要走两个遥测周期才回来（默认 1 秒），
+    这期间板端屏幕不该停在上一句回答上，用户会以为没听懂。
+    """
+    name, params, spoken = intent
+    with LOCK:
+        # **作废可能还在后台跑的那次大模型生成**（与「停止」用同一个令牌机制）。
+        # 不作废的话：用户刚问完一个问题（模型要几秒），紧接着说「拍张照」，
+        # 指令结果先写到屏幕上、几秒后被那次**旧回答**盖掉 —— 用户看到的是
+        # "这是刚才那个问题的答案"，而他明明已经改口了。
+        dev.st["ai_cancel"] += 1
+        dev.st["ai_pending"] = False          # 不走大模型，别让板端一直转圈
+        dev.st["ai_reply"] = spoken
+        dev.st["ai_mode"] = "指令"
+        dev.chat.append(("user", question))
+        dev.chat.append(("assistant", spoken))
+    if name == "__refuse__":
+        push_event(dev, "warn", "自然语言请求「%s」被拒：%s 不接自然语言（危险动作）"
+                   % (question, params))
+        return spoken
+    # new_command 内部要取 LOCK，必须在上面的 with 之外调用
+    cid = new_command(dev, name, params, source="nl")
+    push_event(dev, "cmd", "自然语言请求「%s」→ 指令 %s（%s）" % (question, name, cid))
+    return spoken
+
+
 def request_ai(dev, question):
     """处理一次板端提问，**立即**返回文本；大模型在后台生成，稍后自动生效。
 
@@ -1031,7 +1226,14 @@ def request_ai(dev, question):
     不需要板端等待，也就彻底消除了"板端 3s 超时 vs 服务端 8s 等待"的死结。
 
     `ai_pending` 是**按设备**的：A 板在等大模型不该让 B 板的提问被吞掉。
+
+    第 4 周（「请求」那一半）：**先看这是不是一句"设备请求"**（「拍张照」「开实时画面」…）。
+    是的话直接翻成远程指令下发，不走大模型 —— 快、离线可用、结果确定。
     """
+    intent = parse_intent(question)
+    if intent is not None:
+        return run_intent(dev, question, intent)
+
     if os.environ.get("RW1_LLM_API_KEY"):
         with LOCK:
             if dev.st["ai_pending"]:
@@ -3698,8 +3900,11 @@ function renderCmds(cmds){
       ? '<span class="meta">往返 ' + Math.round((c.done-c.sent)*1000) + ' ms</span>' : "";
     var ps = (c.params && Object.keys(c.params).length)
       ? '<span class="meta">' + esc(JSON.stringify(c.params)) + '</span>' : "";
+    /* 第 4 周：标出这条指令是不是"说话触发的" —— 网页上点的和板子前说的
+       混在同一个列表里，不标就分不清"刚才那句『拍张照』到底执行了没有"。 */
+    var src = (c.source === "nl") ? '<span class="meta">语音</span>' : "";
     return '<div class="item"><span class="st st-' + esc(c.state) + '">' + esc(STNAME[c.state]||c.state) + '</span>'
-         + '<span class="name">' + esc(c.name) + '</span>' + ps
+         + '<span class="name">' + esc(c.name) + '</span>' + ps + src
          + '<span class="meta">' + esc(c.id) + '</span>' + lat + extra + '</div>';
   }).join(""));
 
