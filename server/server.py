@@ -1536,6 +1536,8 @@ class Handler(BaseHTTPRequestHandler):
             self._frame(query)
         elif path == "/api/audio":
             self._audio(query)
+        elif path == "/api/ask":
+            self._ask(query)
         elif path == "/api/ask/cancel":
             self._ask_cancel(query)
         elif path == "/api/shots/delete":
@@ -1705,6 +1707,34 @@ class Handler(BaseHTTPRequestHandler):
         except OSError as e:
             print("  录音存盘失败: %s" % e)
             return None
+
+    def _ask(self, query):
+        """文字入口（第 5 周）：网页上打字，走**和说话完全相同**的那条链路。
+
+        课程第 5 周要求「用同一句任务对照文字和语音入口」—— 对照的前提是两条入口
+        真的走同一套处理，而不是各写一份。所以这里只做一件事：把文字交给
+        `request_ai()`，剩下的（意图解析 / 大模型 / 指令下发 / 结果回显）与
+        `_voice_worker` 里一字不差。改一处，两条入口一起变。
+
+        大模型那条路是异步的：这里返回的 `reply` 只是「正在思考…」，
+        真正的回答会通过后续 SSE 推送过来（网页不用轮询）。
+        """
+        msg = self._read_json()
+        text = str(msg.get("text", "")).strip()[:200]
+        if not text:
+            self._send(400, json.dumps({"ok": False, "error": "empty text"},
+                                       ensure_ascii=False))
+            return
+        # 设备可以走 query（与 /api/ask/cancel 一致，网页直接复用 devQuery()）
+        want = query_param(query, "device") or msg.get("device")
+        with LOCK:
+            dev = pick_device(clean_device_id(want) if want else None)
+        # request_ai 内部会取 LOCK，必须在 with 之外调用
+        reply = request_ai(dev, text)
+        with LOCK:
+            out = {"ok": True, "device": dev.id, "reply": reply,
+                   "mode": dev.st["ai_mode"], "pending": dev.st["ai_pending"]}
+        self._send(200, json.dumps(out, ensure_ascii=False))
 
     def _ask_cancel(self, query):
         """「停止」：作废正在生成的那次回答（板端手势或网页按钮都能调）。"""
@@ -2354,6 +2384,11 @@ h1,h2,h3{font-family:var(--font-display);text-wrap:balance}
 .reply.has{border-left-color:var(--color-shake)}
 .reply.has .tag{color:var(--color-shake)}
 .reply.has .txt{color:var(--color-text)}
+/* 第 5 周：文字入口 —— 和「三击说话」走**同一条链路**（同一个 request_ai），
+   课程要求"用同一句任务对照文字和语音入口"。发送按钮走"退下去"那一档，
+   不加第二个实心主操作（设计系统：全页只允许 1 个 primary）。 */
+.askrow{display:flex;align-items:center;gap:var(--sp-2);flex-wrap:wrap;margin-top:var(--sp-3)}
+.askrow input{flex:1 1 200px;min-width:0}
 .reply-foot{
   margin-top:auto;display:flex;justify-content:space-between;gap:var(--sp-4);flex-wrap:wrap;
   font:400 11.5px/1.5 var(--font-mono);color:var(--color-text-faint);
@@ -2775,6 +2810,13 @@ dialog.modal::backdrop{background:var(--modal-backdrop);backdrop-filter:blur(3px
             <span>按板子 BOOT 键提问，<b>三击</b>说话</span>
             <span id="voicehint">回复同时显示在板子屏幕上</span>
             <button id="aicancel" class="sm" hidden>停止</button>
+          </div>
+          <div class="askrow">
+            <input id="asktext" type="text" maxlength="200"
+                   placeholder="也可以打字下达任务 —— 和说话走同一条链路"
+                   aria-label="打字下达任务">
+            <button id="asksend" class="sm" type="button">发送</button>
+            <button id="ttsbtn" class="sm" type="button" aria-pressed="true">播报 开</button>
           </div>
         </div>
       </div>
@@ -4097,6 +4139,7 @@ function render(s){
   if (s.ai_reply && s.ai_reply !== aiReply){
     aiReply = s.ai_reply;
     $("reply").textContent = aiReply;
+    speakReply(aiReply);            /* 第 5 周：让它把回答"说"出来 */
   } else if (!s.ai_reply && aiReply !== ""){
     aiReply = "";
     $("reply").textContent = "还没有提问。";
@@ -4130,6 +4173,59 @@ function render(s){
   }
   renderCmds(s.commands);
   renderEvents(s.events);
+}
+
+/* ---------------- 语音播报（第 5 周） ----------------
+   板子**没有喇叭**（BSP_CAPS_AUDIO_SPEAKER=0），所以"听到回答"这一步放在
+   浏览器里做（Web Speech API）：零依赖、不用 API key、离线也能用 ——
+   正好对上课程说的"设备音频未就绪时使用电脑音频，但明确运行位置"。
+   运行位置是**这台电脑的浏览器**，不是板子，网页上要写清楚。 */
+var ttsOn = true;          /* 默认开：课程要的是"从说到听"的完整闭环 */
+var spokenText = "";       /* 上次念过的内容，避免每帧重复念同一句 */
+
+function speakable(t){
+  /* 占位文案不念 —— 念出来只是"正在思考…"这种噪音 */
+  return !!t && t !== "正在思考…" && t !== "已停止"
+         && t.indexOf("我还在想上一个问题") !== 0;
+}
+
+function speakReply(t){
+  if (!ttsOn || !speakable(t) || t === spokenText) return;
+  if (!window.speechSynthesis) return;     /* 浏览器不支持就安静降级，不报错 */
+  spokenText = t;
+  try{
+    speechSynthesis.cancel();              /* 新回答来了，旧的那句立刻掐掉 */
+    var u = new SpeechSynthesisUtterance(t);
+    u.lang = "zh-CN";
+    u.rate = 1.05;
+    speechSynthesis.speak(u);
+  }catch(e){}
+}
+
+function stopSpeaking(){
+  try{ if (window.speechSynthesis) speechSynthesis.cancel(); }catch(e){}
+  spokenText = "";
+}
+
+/* 文字入口：**同一句任务，两条入口** —— 这里发文字，板子上三击发音频，
+   服务端都是同一个 request_ai()，所以解析和行为完全一致（课程第 5 周要求）。 */
+function sendAsk(){
+  var el = $("asktext");
+  var t = el ? String(el.value || "").trim() : "";
+  if (!t) return;
+  el.value = "";
+  fetch("/api/ask" + devQuery(), {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({text: t})
+  }).then(function(r){ return r.json(); }).then(function(d){
+    if (d && d.reply){
+      aiReply = d.reply;                   /* 直接生效，不等下一次轮询 */
+      $("reply").textContent = d.reply;
+      speakReply(d.reply);
+    }
+    pull();
+  }).catch(function(){});
 }
 
 function pull(){
@@ -4218,13 +4314,26 @@ fetch("/api/commands" + devQuery()).then(function(r){ return r.json(); }).then(f
     sendCmd("set_orient", this, {o: v});
   };
   /* 「停止」：打断正在生成的大模型回复（第 4 周）。服务端用令牌作废那次回答，
-     板端下一帧就会看到「已停止」—— 这里发一次请求即可，不用等返回。 */
+     板端下一帧就会看到「已停止」—— 这里发一次请求即可，不用等返回。
+     第 6 周补上「停止播报」：光让服务端停下、喇叭里还在念，用户会觉得没停。 */
   if ($("aicancel")) $("aicancel").onclick = function(){
     var btn = this;
     btn.disabled = true;
+    stopSpeaking();
     fetch("/api/ask/cancel" + devQuery(), {method:"POST"})
       .then(function(){ btn.disabled = false; })
       .catch(function(){ btn.disabled = false; });
+  };
+  /* 第 5 周：文字入口 + 播报开关 */
+  if ($("asksend")) $("asksend").onclick = sendAsk;
+  if ($("asktext")) $("asktext").onkeydown = function(e){
+    if (e.key === "Enter"){ e.preventDefault(); sendAsk(); }
+  };
+  if ($("ttsbtn")) $("ttsbtn").onclick = function(){
+    ttsOn = !ttsOn;
+    this.textContent = "播报 " + (ttsOn ? "开" : "关");
+    this.setAttribute("aria-pressed", ttsOn ? "true" : "false");
+    if (!ttsOn) stopSpeaking();
   };
   syncOrient();
   $("names").textContent = cmdNames.join(" / ");

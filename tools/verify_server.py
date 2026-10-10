@@ -1086,6 +1086,22 @@ def main():
         check("新指令作废了上一轮还在生成的大模型回答（回显不被旧回答盖掉）",
               "闪好了" in (latest(port, nl_dev).get("ai_reply") or ""),
               "实际: %r" % (latest(port, nl_dev).get("ai_reply")))
+
+        # ---- 25. 文字入口（第 5 周）-----------------------------------------
+        # 课程第 5 周要求「用同一句任务对照文字和语音入口」。对照的前提是两条入口
+        # 真的走同一套处理 —— 所以这里断言：同一句话，打字和说话**结果一致**。
+        print("\n[22] 文字入口：打字下达任务（第 5 周）")
+        q = "?device=" + urllib.parse.quote(nl_dev)
+        out = post_json(nbase + "/api/ask" + q, {"text": "闪三下"})
+        check("文字入口可用，且立刻回一句", out.get("ok") is True and bool(out.get("reply")),
+              "实际: %s" % out)
+        time.sleep(0.4)
+        rec_txt = (cmds_of() or [{}])[0]
+        check("打字和说话解析成同一条指令（同一套 request_ai）",
+              rec_txt.get("name") == "led_blink" and rec_txt.get("source") == "nl",
+              "实际: %s / %s" % (rec_txt.get("name"), rec_txt.get("source")))
+        check("空文字被拒（400）", _expect_400(nbase + "/api/ask", {"text": "   "}))
+
         try:
             nlboard.kill()
             nlboard.wait(timeout=5)
