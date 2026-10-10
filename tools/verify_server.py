@@ -251,6 +251,7 @@ def main():
     threading.Thread(target=mock.serve_forever, daemon=True).start()
 
     rc = 0
+    nlboard = None          # 第 4 周的自然语言测试里才起；提前定义，finally 才能安全收尾
     try:
         # 等服务器起来
         for _ in range(50):
@@ -959,8 +960,142 @@ def main():
         rc = post_json("http://127.0.0.1:%d/api/ask/cancel?device=%s" % (port, vdev), {})
         check("取消接口可用（停止）", rc.get("ok") is True, "实际: %s" % rc)
 
+        # ---- 24. 自然语言请求（第 4 周）-------------------------------------
+        print("\n[21] 自然语言请求：说话 → 指令（第 4 周）")
+        nl_dev = "nl-01"
+        nbase = "http://127.0.0.1:%d" % port
+        # **必须真的起一块板子**：自然语言下发的指令得有人执行，"结果回显到屏幕"
+        # 那一条才有东西可断言。不跑板子的话指令只会停在 queued 直到超时。
+        nlboard = subprocess.Popen(
+            [PY, os.path.join(HERE, "fake_board.py"),
+             "--url", nbase, "--device", nl_dev, "--scenario", "idle",
+             "--period", "0.25", "--seconds", "60", "--quiet"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        for _ in range(40):
+            if nl_dev in [d["id"] for d in get_json(nbase + "/api/devices").get("devices", [])]:
+                break
+            time.sleep(0.25)
+
+        def ask_nl(text):
+            """把一句话当成"板端提问"发上去 —— 板端就是这么发的（ask=1 + q=文字）。"""
+            return post_raw(nbase + "/api/telemetry",
+                            firmware_body([(0.0, 0.0, 1.0)] * 5, ask=True,
+                                          question=text, device=nl_dev))
+
+        def cmds_of():
+            return get_json(nbase + "/api/commands?device=" + urllib.parse.quote(nl_dev)) \
+                   .get("commands", [])
+
+        names_ok = set(get_json(nbase + "/api/commands").get("names", []))
+        # 每句话 → 期望翻成的指令与参数。**故意用不同说法**：学生不会照着按钮文案念。
+        nl_cases = (
+            ("拍张照",          "cam_capture",  {}),
+            ("采集一次",        "capture_once", {}),
+            ("开一下实时画面",   "cam_stream",   {"on": True}),
+            ("把实时画面关掉",   "cam_stream",   {"on": False}),
+            ("卡里有什么文件",   "sd_ls",        {}),
+            ("闪五下",          "led_blink",    {"n": 5}),
+            ("把灯关掉",        "led_set",      {"on": False}),
+            ("切到第3档",       "set_orient",   {"o": 3}),
+        )
+        misses, spoken_ok = [], True
+        for text, want, params in nl_cases:
+            prev = (cmds_of() or [{}])[0].get("id")
+            out = ask_nl(text)
+            time.sleep(0.3)
+            rec = (cmds_of() or [{}])[0]
+            if (rec.get("name") != want or rec.get("id") == prev
+                    or want not in names_ok):
+                misses.append("%s→%s" % (text, rec.get("name")))
+                if rec.get("id"):
+                    _wait_cmd(port, rec["id"], 8, device=nl_dev)
+                continue
+            for k, v in params.items():
+                if (rec.get("params") or {}).get(k) != v:
+                    misses.append("%s 参数 %s=%r" % (text, k, v))
+            # 回话要短、口语化（"好，让板子拍一张照…"），不是大模型那种长回答
+            if not (out.get("reply") or "").startswith("好"):
+                spoken_ok = False
+                misses.append("%s 回话=%r" % (text, out.get("reply")))
+            # **等这条真的走完再发下一条**：板子一次只执行一条，队列堆起来后
+            # 后面的会撞上 5 秒超时（queued 以 created 计时），回显被"超时"覆盖 ——
+            # 那不是产品缺陷，是测试自己在制造拥塞。
+            _wait_cmd(port, rec["id"], 8, device=nl_dev)
+        check("8 句自然语言都翻成了对应指令（名字 + 参数）", not misses,
+              "问题: %s" % misses)
+        check("板端立刻收到'好的…'而不是去等大模型", spoken_ok)
+        check("自然语言下发的指令标了 source=nl（网页能看出是语音来的）",
+              all(c.get("source") == "nl" for c in cmds_of()[:4]),
+              "实际: %s" % [c.get("source") for c in cmds_of()[:4]])
+
+        # 课程第 4 周的**当堂验证项**：同一份旧数据，「查看上次数据」和「重新采集」
+        # 必须走不同路径 —— 前者不产生新指令（走查询、保留旧时间），后者要等新结果。
+        prev_id = (cmds_of() or [{}])[0].get("id")
+        ask_nl("上次采集的数据是多少")
+        time.sleep(0.4)
+        check("「查看上次数据」不被当成新采集请求（没有新指令产生）",
+              (cmds_of() or [{}])[0].get("id") == prev_id,
+              "实际: 最新指令 %s → %s" % (prev_id, (cmds_of() or [{}])[0].get("id")))
+        ask_nl("重新采集一次")
+        time.sleep(0.4)
+        rec_fresh = (cmds_of() or [{}])[0]
+        check("「重新采集」确实产生一条新的采集指令",
+              rec_fresh.get("name") == "capture_once" and rec_fresh.get("source") == "nl"
+              and rec_fresh.get("id") != prev_id,
+              "实际: %s / %s" % (rec_fresh.get("name"), rec_fresh.get("source")))
+
+        # 危险动作：**必须**只回话、不下发 —— 语音识别错一个字就可能把卡格了
+        n_before = len(cmds_of())
+        out = ask_nl("格式化存储卡")
+        time.sleep(0.4)
+        check("危险动作（格式化）被拒：不下发指令，只回一句指路",
+              len(cmds_of()) == n_before and "危险" in (out.get("reply") or ""),
+              "实际: %r / 指令数 %d→%d" % (out.get("reply"), n_before, len(cmds_of())))
+
+        # 普通问题不能被意图规则"抢"走 —— 该问大模型的还是问大模型。
+        # **放最后**：它会拉起一次 6 秒的假大模型生成，放前面会干扰后面的回显断言。
+        before_calls = len(MockLLM.seen)
+        out = ask_nl("今天天气怎么样")
+        time.sleep(0.5)
+        check("普通问题不被误判成设备请求（仍走大模型）",
+              len(MockLLM.seen) > before_calls or "天气" in (out.get("reply") or ""),
+              "实际: %r" % out.get("reply"))
+
+        # 执行完 → 结果写回板端屏幕（用户是对着板子说的，眼睛也在板子上）
+        ask_nl("采集一次")
+        time.sleep(0.4)
+        cid_nl = (cmds_of() or [{}])[0].get("id")
+        done_nl = _wait_cmd(port, cid_nl, 15, device=nl_dev)
+        time.sleep(0.8)                     # 等回显落到 ai_reply
+        snap_nl = latest(port, nl_dev)
+        check("指令执行完，结果回显到板端屏幕",
+              done_nl is not None and done_nl["state"] == "done"
+              and "采好了" in (snap_nl.get("ai_reply") or ""),
+              "实际: %s / %r" % (done_nl and done_nl["state"], snap_nl.get("ai_reply")))
+        check("自然语言请求进了事件流（说了什么 → 什么指令）",
+              any("自然语言请求" in (e.get("text") or "")
+                  for e in snap_nl.get("events", [])))
+
+        # 新指令必须**作废**还在后台跑的那次生成 —— 否则几秒后旧回答会盖掉指令回显，
+        # 用户看到的是"刚才那个问题的答案"，而他明明已经改口了。
+        ask_nl("闪三下")
+        time.sleep(0.4)
+        cid_cancel = (cmds_of() or [{}])[0].get("id")
+        _wait_cmd(port, cid_cancel, 8, device=nl_dev)
+        time.sleep(MockLLM.delay + 2)       # 等那次被作废的生成真的回来
+        check("新指令作废了上一轮还在生成的大模型回答（回显不被旧回答盖掉）",
+              "闪好了" in (latest(port, nl_dev).get("ai_reply") or ""),
+              "实际: %r" % (latest(port, nl_dev).get("ai_reply")))
+        try:
+            nlboard.kill()
+            nlboard.wait(timeout=5)
+        except Exception:  # noqa: BLE001
+            pass
+
     finally:
-        for p in (srv,):
+        for p in (srv, nlboard):
+            if p is None:
+                continue
             try:
                 p.kill()
                 p.wait(timeout=5)
