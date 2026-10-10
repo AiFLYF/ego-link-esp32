@@ -26,6 +26,7 @@
 #include "freertos/task.h"
 
 #include "accel_input.h"
+#include "audio.h"
 #include "led_feedback.h"
 #include <dirent.h>
 #include <sys/stat.h>
@@ -42,6 +43,12 @@
 static const char *TAG = "transport";
 
 #define TX_PATH "/api/telemetry"
+
+/* 语音上传（第 4 周）：录完一段单独发一次，**不搭遥测的车** ——
+ * 遥测是高频小包（2 Hz、几百字节），塞 96 KB 音频进去会把上报节奏整个拖垮。
+ * 所以另开一条路，并且给它更宽的超时：96 KB 在教室 WiFi 上比一次遥测慢得多。 */
+#define VOICE_PATH "/api/audio"
+#define TX_VOICE_TIMEOUT_MS 8000
 
 /* 上报现在跑在独立的 upload_task 里（见下面 tx_job_t 那段注释），**不再阻塞界面**，
  * 所以这个超时只决定"这一批数据什么时候被放弃"，可以收得很短：
@@ -116,6 +123,9 @@ static char s_url[NET_URL_MAX];/* 上报地址：来自 net_config（运行期�
 static char s_device[NET_DEV_MAX];
 static uint32_t s_poll_fail;   /* 连续 accel_input_poll 失败次数（真实源读失败） */
 static char s_last_reply[TRANSPORT_REPLY_LEN];   /* 上一次看到过的服务器回复 */
+/* 语音任务：按钮一按就唤醒它去录音。**必须是独立任务** —— 录音要阻塞 3 秒，
+ * 放在采样或上报任务里会直接把 100 Hz 采样和界面刷新按停。 */
+static SemaphoreHandle_t s_voice_wake;
 
 /* [(x,y,z)] in screen frame, filled by the sampling loop. */
 static float s_batch[TX_BATCH_MAX][3];
@@ -1156,6 +1166,92 @@ static bool post_batch(const tx_job_t *job)
     return false;
 }
 
+/* ---------------- 语音上传（第 4 周）----------------------------------------
+ *
+ * 录一段 PCM -> POST /api/audio -> 服务端识别 + 问大模型 -> 回复随下一帧遥测回来。
+ * 板端**不等**识别结果：识别要好几秒（走云端更久），等它就把界面和采样按死了 ——
+ * 这和当初"板端 3 s 超时 vs 服务端 8 s 等待"是同一个坑，不要再踩第二次。
+ */
+static bool post_audio(const uint8_t *pcm, size_t len)
+{
+    char url[NET_URL_MAX + 64];
+    snprintf(url, sizeof(url), "%s%s?device=%s", s_url, VOICE_PATH, s_device);
+
+    /* 不能和 post_batch 共用那块 static —— 两者跑在不同任务里，会互相踩。
+     * 同样不放栈上：栈只有 6 KB，4 KB 响应缓冲放上去就没余量了。 */
+    static resp_acc_t s_acc;
+    s_acc.len = 0;
+    s_acc.truncated = false;
+    s_acc.buf[0] = '\0';
+
+    esp_http_client_config_t cfg = {
+        .url = url,
+        .timeout_ms = TX_VOICE_TIMEOUT_MS,
+        .event_handler = http_event_handler,
+        .user_data = &s_acc,
+    };
+    esp_http_client_handle_t client = esp_http_client_init(&cfg);
+    if (client == NULL) {
+        return false;
+    }
+
+    esp_http_client_set_method(client, HTTP_METHOD_POST);
+    esp_http_client_set_header(client, "Content-Type", "application/octet-stream");
+    /* 用带长度的接口：PCM 里必然有 0x00，按字符串处理会在第一个静音样本处截断 */
+    esp_http_client_set_post_field(client, (const char *)pcm, (int)len);
+
+    esp_err_t ret = esp_http_client_perform(client);
+    int status = esp_http_client_get_status_code(client);
+    esp_http_client_cleanup(client);
+
+    if (ret == ESP_OK && status == 200) {
+        ESP_LOGI(TAG, "voice uploaded: %u bytes", (unsigned)len);
+        return true;
+    }
+    ESP_LOGW(TAG, "voice upload failed ret=%s status=%d",
+             esp_err_to_name(ret), status);
+    return false;
+}
+
+static void voice_task(void *arg)
+{
+    (void)arg;
+    while (true) {
+        if (xSemaphoreTake(s_voice_wake, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+        if (!wifi_link_is_up()) {
+            ESP_LOGW(TAG, "语音：WiFi 没连上，这次跳过");
+            continue;
+        }
+        if (!audio_ready()) {
+            ESP_LOGW(TAG, "语音：麦克风不可用（看上面的 audio 日志）");
+            continue;
+        }
+
+        status_lock();
+        s_st.voice_state = TRANSPORT_VOICE_RECORDING;
+        status_unlock();
+        led_feedback_play(LED_FB_ACK);
+
+        size_t n = 0;
+        const uint8_t *pcm = audio_record(&n);
+
+        status_lock();
+        s_st.voice_state = (pcm != NULL && n > 0) ? TRANSPORT_VOICE_UPLOADING
+                                                  : TRANSPORT_VOICE_IDLE;
+        status_unlock();
+
+        if (pcm == NULL || n == 0) {
+            ESP_LOGW(TAG, "语音：没录到数据");
+            continue;
+        }
+        post_audio(pcm, n);
+        /* 往后就交给服务端了：识别 → 大模型 → 回复随遥测帧回来。
+         * 板端把状态交还给服务端，UI 后续按 ai_pending / reply 显示。 */
+    }
+}
+
 /* ---------------- 1 Hz IMU diagnostic line (validation aid) -----------------
  *
  * Prints one line per second with the raw sensor sample, the screen-frame
@@ -1425,9 +1521,15 @@ void transport_start(void)
     if (s_tx_wake == NULL) {
         s_tx_wake = xSemaphoreCreateBinary();
     }
+    if (s_voice_wake == NULL) {
+        s_voice_wake = xSemaphoreCreateBinary();
+    }
     /* 采样任务优先级 5、上报任务 4：采样永远优先，网络再慢也不许反过来挤采样。 */
     xTaskCreatePinnedToCore(transport_task, "transport", 8192, NULL, 5, NULL, 0);
     xTaskCreatePinnedToCore(upload_task, "upload", 6144, NULL, 4, NULL, 0);
+    /* 语音任务优先级 3（低于上报）：录音 + 上传是个慢活，不该跟采样/上报抢 CPU。
+     * 栈给 6144 —— post_audio 里 esp_http_client_perform 有自己的栈开销。 */
+    xTaskCreatePinnedToCore(voice_task, "voice", 6144, NULL, 3, NULL, 0);
 }
 
 void transport_reload_config(void)
@@ -1480,6 +1582,16 @@ void transport_request_ask(const char *question)
     status_unlock();
 
     ESP_LOGI(TAG, "ask queued: %s", s_ask_text);
+}
+
+void transport_request_voice(void)
+{
+    /* 只置信号量，**绝不在按钮任务里录音** —— 录音要阻塞 3 秒，
+     * 会把 iot_button 的任务按住，长按/双击在那 3 秒里全部失灵。 */
+    if (s_voice_wake != NULL) {
+        xSemaphoreGive(s_voice_wake);
+        ESP_LOGI(TAG, "语音录制已排队");
+    }
 }
 
 void transport_get_status(transport_status_t *out)
