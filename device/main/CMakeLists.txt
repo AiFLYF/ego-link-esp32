@@ -10,16 +10,21 @@ idf_component_register(
     SRCS
         "main.c"
         "accel_input.c"
+        "audio.c"
         "wifi_link.c"
         "net_config.c"
         "prov_form.c"
         "provisioning.c"
+        "sd_card.c"
+        "sd_log.c"
         "transport.c"
         "led_feedback.c"
+        "camera.c"
         "ui.c"
         "rw1_font.c"
     INCLUDE_DIRS "."
     REQUIRES
+        esp_video
         esp_wifi
         esp_netif
         esp_event

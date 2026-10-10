@@ -72,6 +72,15 @@ def post_raw(url, raw, timeout=8):
         return json.loads(r.read().decode("utf-8"))
 
 
+def post_bytes(url, data, timeout=25):
+    """POST 原始字节（语音上传用：PCM 里必然有 0x00，不能走字符串那条路）。
+    响应仍按 JSON 解析。"""
+    req = urllib.request.Request(url, data=data,
+                                 headers={"Content-Type": "application/octet-stream"})
+    with OPENER.open(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
 def _expect_400(url, payload):
     """POST 一个应当被拒绝的载荷，返回 True 表示确实拿到了 HTTP 400。"""
     try:
@@ -154,13 +163,33 @@ def firmware_body(samples, source="SC7A20", ask=False, question=None, device="rw
 class MockLLM(BaseHTTPRequestHandler):
     delay = 6.0
     calls = []
+    seen = []          # 收到的请求体（用来验证"多轮历史真的带进了请求"）
+    asr_text = "板子现在怎么样"
 
     def log_message(self, *a):
         pass
 
     def do_POST(self):
         n = int(self.headers.get("Content-Length") or 0)
-        self.rfile.read(n)
+        raw = self.rfile.read(n)
+        path = self.path.split("?")[0]
+
+        # 语音识别：走同一个假上游，但**格式完全不同**（{"text": ...}）。
+        # 不区分路径的话，ASR 会拿到大模型的 choices 结构、解析出空文本。
+        if path.endswith("/audio/transcriptions"):
+            MockLLM.calls.append(time.time())
+            body = json.dumps({"text": MockLLM.asr_text}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        try:
+            MockLLM.seen.append(json.loads(raw.decode("utf-8")))
+        except ValueError:
+            MockLLM.seen.append({})
         MockLLM.calls.append(time.time())
         time.sleep(MockLLM.delay)
         body = json.dumps({"choices": [{"message": {"content": "这是慢速假大模型的回答。"}}]}).encode()
@@ -186,8 +215,13 @@ def feed(port, scenario, seconds, ask_at=None, expect_steps=None):
     return p.returncode, p.stdout + p.stderr
 
 
-def latest(port):
-    return get_json("http://127.0.0.1:%d/api/latest" % port)
+def latest(port, device=None):
+    """取快照。**多板场景下一定要带上 device** ——
+    不带就是"最近上报的那台"，同时有别的板子在跑时，谁后上报就查谁，
+    断言会随上报时序随机失败（2026-09-26 踩到：命令明明发给了 r12_dev，
+    却去查另一台的事件流，报"命令事件进了事件流"失败，单独复跑又全绿）。"""
+    q = "?device=" + urllib.parse.quote(device) if device else ""
+    return get_json("http://127.0.0.1:%d/api/latest%s" % (port, q))
 
 
 def main():
@@ -217,6 +251,7 @@ def main():
     threading.Thread(target=mock.serve_forever, daemon=True).start()
 
     rc = 0
+    nlboard = None          # 第 4 周的自然语言测试里才起；提前定义，finally 才能安全收尾
     try:
         # 等服务器起来
         for _ in range(50):
@@ -300,6 +335,11 @@ def main():
         env2["RW1_LLM_API_KEY"] = "sk-test"
         env2["RW1_LLM_BASE_URL"] = "http://127.0.0.1:%d/v1" % llm_port
         env2["RW1_LLM_MODEL"] = "mock"
+        # 语音识别指向**同一个假上游**（它按路径区分返回格式）。
+        # 不配的话，语音那一段只能测到"没配 ASR 的回退"，测不到真实链路。
+        env2["RW1_ASR_API_KEY"] = "sk-test"
+        env2["RW1_ASR_BASE_URL"] = "http://127.0.0.1:%d/v1" % llm_port
+        env2["RW1_ASR_MODEL"] = "mock-asr"
         srv = subprocess.Popen([PY, "-u", SERVER_PY, "--port", str(port),
                                 "--data-dir", data_dir, "--retain-days", "0",
                                 "--cmd-timeout", "5"],
@@ -414,10 +454,24 @@ def main():
              "--url", "http://127.0.0.1:%d" % port, "--device", r12_dev,
              "--scenario", "tilt", "--seconds", "14", "--quiet"],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        time.sleep(2.0)                    # 先让它报一帧，服务器才知道设备在线
+        # **等它真的在册**再下发，别用固定 sleep：板子还没报上第一帧时，
+        # 服务端的 pick_device 会回退到"最近上报的那台"，命令就发给了别人 ——
+        # 响应里 device_online 还是 True（那是别人的），断言却全在等自己的命令，
+        # 表现为"稳定失败但手工复现完全正常"（2026-09-23 踩过）。
+        for _ in range(40):
+            live = [d["id"] for d in get_json(
+                "http://127.0.0.1:%d/api/devices" % port).get("devices", [])]
+            if r12_dev in live:
+                break
+            time.sleep(0.25)
+        else:
+            check("测试用的板子已上报（%s 在册）" % r12_dev, False,
+                  "实际在册: %s" % live)
 
         r = post_json("http://127.0.0.1:%d/api/command" % port,
                       {"name": "capture_once", "device": r12_dev})
+        check("命令确实发给了指定设备（没被回退给别人）",
+              r.get("device") == r12_dev, "实际: %s" % r.get("device"))
         cid = r.get("id")
         check("下发指令返回 request_id", bool(cid), "实际: %s" % cid)
         check("下发响应带设备在线状态", r.get("device_online") is True,
@@ -445,27 +499,43 @@ def main():
         else:
             check("回传里带着同一个 request_id", False, "没有 result")
         check("命令事件进了事件流",
-              any("capture_once" in (e.get("text") or "") for e in latest(port).get("events", [])))
+              any("capture_once" in (e.get("text") or "")
+                  for e in latest(port, r12_dev).get("events", [])))
 
         # ---- 13. 指令超时看护 ---------------------------------------------
         print("\n[13] 指令超时（板子故意不执行）")
+        r13_dev = "聋板-01"        # 同第 12 节：固定设备名，别依赖"最近上报的那台"
         deaf = subprocess.Popen(
             [PY, os.path.join(HERE, "fake_board.py"),
-             "--url", "http://127.0.0.1:%d" % port,
-             "--scenario", "idle", "--seconds", "12", "--no-cmd", "--quiet"],
+             "--url", "http://127.0.0.1:%d" % port, "--device", r13_dev,
+             "--scenario", "idle", "--seconds", "14", "--no-cmd", "--quiet"],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        time.sleep(2.0)
-        r2 = post_json("http://127.0.0.1:%d/api/command" % port, {"name": "capture_once"})
+        for _ in range(40):
+            live = [d["id"] for d in get_json(
+                "http://127.0.0.1:%d/api/devices" % port).get("devices", [])]
+            if r13_dev in live:
+                break
+            time.sleep(0.25)
+        r2 = post_json("http://127.0.0.1:%d/api/command" % port,
+                       {"name": "capture_once", "device": r13_dev})
         cid2 = r2.get("id")
         rec2, st2 = None, None
-        deadline = time.time() + 12
+        q13 = "?device=" + urllib.parse.quote(r13_dev, safe="")
+        deadline = time.time() + 14
         while time.time() < deadline:
-            cmds = get_json("http://127.0.0.1:%d/api/commands" % port).get("commands", [])
+            cmds = get_json("http://127.0.0.1:%d/api/commands%s" % (port, q13)).get("commands", [])
             rec2 = next((c for c in cmds if c["id"] == cid2), None)
             st2 = rec2 and rec2["state"]
             if st2 == "timeout":
                 break
             time.sleep(0.4)
+        # **测完立刻停掉它**：这块板子故意不执行命令，而它还在上报 ——
+        # 下一节如果不带设备名，命令就会被发给它，然后永远等不到 done
+        # （2026-09-23 就是这么把下一节测挂的）。
+        try:
+            deaf.kill()
+        except OSError:
+            pass
         deaf.wait(timeout=25)
         check("板子不执行时被判超时", st2 == "timeout", "实际: %s" % st2)
         check("超时事件进了事件流",
@@ -473,16 +543,23 @@ def main():
 
         # ---- 15. 远端物理反馈指令（第 3 周）--------------------------------
         print("\n[14] 物理反馈指令 led_blink / led_set")
+        r14_dev = "灯板-01"        # 同上：固定设备名，别依赖"最近上报的那台"
         board2 = subprocess.Popen(
             [PY, os.path.join(HERE, "fake_board.py"),
-             "--url", "http://127.0.0.1:%d" % port,
-             "--scenario", "idle", "--seconds", "18", "--quiet"],
+             "--url", "http://127.0.0.1:%d" % port, "--device", r14_dev,
+             "--scenario", "idle", "--seconds", "20", "--quiet"],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        time.sleep(2.0)
+        for _ in range(40):
+            live = [d["id"] for d in get_json(
+                "http://127.0.0.1:%d/api/devices" % port).get("devices", [])]
+            if r14_dev in live:
+                break
+            time.sleep(0.25)
 
         r3 = post_json("http://127.0.0.1:%d/api/command" % port,
-                       {"name": "led_blink", "params": {"n": 3, "on_ms": 80, "off_ms": 80}})
-        rec3 = _wait_cmd(port, r3.get("id"), 14)
+                       {"name": "led_blink", "params": {"n": 3, "on_ms": 80, "off_ms": 80},
+                        "device": r14_dev})
+        rec3 = _wait_cmd(port, r3.get("id"), 14, device=r14_dev)
         check("led_blink 走到 done", rec3 is not None and rec3["state"] == "done",
               "实际: %s" % (rec3 and rec3["state"]))
         check("led_blink 参数被保留", (rec3 or {}).get("params", {}).get("n") == 3,
@@ -555,6 +632,69 @@ def main():
             post_json("http://127.0.0.1:%d/api/command" % port, {"name": "capture_once"})
         n = len(get_json("http://127.0.0.1:%d/api/commands" % port).get("commands", []))
         check("命令条数被限制在 20 条以内", n <= 20, "实际: %d 条" % n)
+
+        # ---- 摄像头：推帧 → 取帧 → 拍照留档 → 删除 ---------------------------
+        # 放在多设备那节**之前**：多设备节会改"最近上报过的设备"，
+        # 而前面若干节靠那个回退语义工作（那节自己的注释也写明了要放最后）。
+        print("\n[18] 摄像头：推帧 / 取帧 / 拍照留档 / 删除 / 安全")
+        camdev = "cam-01"
+        # 造一个**最小但合法**的 JPEG（头 FF D8、尾 FF D9，中间随便填）——
+        # 服务端只校验魔数，不解析图像，所以不必真造一张图
+        frame = bytes([0xFF, 0xD8, 0xFF, 0xE0]) + b"\x00" * 600 + bytes([0xFF, 0xD9])
+        frame2 = bytes([0xFF, 0xD8, 0xFF, 0xE1]) + b"\x01" * 900 + bytes([0xFF, 0xD9])
+
+        def cam_post(path, body, ctype="image/jpeg"):
+            req = urllib.request.Request("http://127.0.0.1:%d%s" % (port, path),
+                                         data=body, method="POST")
+            req.add_header("Content-Type", ctype)
+            try:
+                with urllib.request.urlopen(req, timeout=8) as r:
+                    return r.status, r.read()
+            except urllib.error.HTTPError as e:
+                return e.code, e.read()      # 4xx 也是有效结果（下面要断言它）
+
+        def cam_get(path):
+            try:
+                with urllib.request.urlopen(
+                        "http://127.0.0.1:%d%s" % (port, path), timeout=8) as r:
+                    return r.status, r.read()
+            except urllib.error.HTTPError as e:
+                return e.code, e.read()
+
+        st, body = cam_post("/api/frame?device=" + camdev, frame)
+        check("推一帧返回 200", st == 200, "实际: %s" % st)
+        st, got = cam_get("/api/frame?device=" + camdev)
+        check("取回的帧与推上去的**逐字节一致**", st == 200 and got == frame,
+              "状态 %s / %d 字节" % (st, len(got)))
+
+        st, body = cam_post("/api/frame?device=" + camdev + "&save=1", frame2)
+        saved = json.loads(body.decode()).get("saved") if st == 200 else None
+        check("带 save=1 会留档", st == 200 and bool(saved), "实际: %s / %s" % (st, saved))
+
+        shots = get_json("http://127.0.0.1:%d/api/shots?device=%s" % (port, camdev))
+        check("照片列表里有它", len(shots.get("shots", [])) >= 1,
+              "实际: %d 张" % len(shots.get("shots", [])))
+        if shots.get("shots"):
+            st, back = cam_get("/api/shots/%s/%s" % (camdev, shots["shots"][0]["name"]))
+            check("取回的照片内容一致", st == 200 and back == frame2,
+                  "状态 %s / %d 字节" % (st, len(back)))
+
+        # 安全：非 JPEG 拒收；路径穿越读不到东西
+        st, _ = cam_post("/api/frame?device=" + camdev, b"NOTJPEG!!")
+        check("非 JPEG 的帧被拒（400）", st == 400, "实际: %s" % st)
+        st, _ = cam_get("/api/shots/" + camdev + "/..%2F..%2Fserver.py")
+        check("照片路径穿越被拒（404）", st == 404, "实际: %s" % st)
+
+        # 删除
+        if shots.get("shots"):
+            st, _ = cam_post("/api/shots/delete",
+                             json.dumps({"device": camdev,
+                                         "name": shots["shots"][0]["name"]}).encode(),
+                             "application/json")
+            check("删除照片返回 200", st == 200, "实际: %s" % st)
+            left = get_json("http://127.0.0.1:%d/api/shots?device=%s" % (port, camdev))
+            check("删完列表里没有了", len(left.get("shots", [])) == len(shots["shots"]) - 1,
+                  "实际: %d 张" % len(left.get("shots", [])))
 
         # ---- 18. 多设备（PROPOSAL §4.1 / 优先级 ③）---------------------------
         # 这一节必须放在最后：它往服务端注册了新设备，会改变"最近上报过的设备"
@@ -769,9 +909,209 @@ def main():
               and "batch" not in rs,
               "实际 keys: %s" % sorted(rs.keys()))
 
+        # ---- 22. 语音链路（第 4 周）----------------------------------------
+        print("\n[20] 语音：音频 → 识别 → 大模型")
+        vdev = "voice-01"
+        vurl = "http://127.0.0.1:%d/api/audio?device=%s" % (port, vdev)
+
+        # 边界：空 / 过短 / 超长都要被拒。**关键是客户端能读到 400**，
+        # 而不是拿到连接被重置（服务端不读 body 就回绝时会发生，见手册 T58）。
+        for payload, label in ((b"", "空载荷"), (b"\x00" * 32, "过短"),
+                               (b"\x00" * (600 * 1024), "超长")):
+            try:
+                post_bytes(vurl, payload)
+                check("音频%s被拒" % label, False, "竟然接受了")
+            except urllib.error.HTTPError as e:
+                check("音频%s被拒（400 可读）" % label, e.code == 400, "HTTP %d" % e.code)
+            except Exception as e:  # noqa: BLE001
+                check("音频%s被拒" % label, False, "%s: %s" % (type(e).__name__, e))
+
+        out = post_bytes(vurl, b"\x01\x02" * 16000)     # 1 秒假 PCM
+        check("音频被接收", out.get("ok") is True and out.get("bytes") == 32000,
+              "实际: %s" % out)
+
+        deadline = time.time() + MockLLM.delay + 12
+        snap = {}
+        while time.time() < deadline:
+            snap = latest(port, vdev)
+            if "慢速假大模型" in snap.get("ai_reply", ""):
+                break
+            time.sleep(0.5)
+        check("识别出的文字落进了状态", snap.get("voice_text") == MockLLM.asr_text,
+              "实际: %r" % snap.get("voice_text"))
+        check("识别结果被当成提问交给了大模型",
+              "慢速假大模型" in snap.get("ai_reply", ""),
+              "实际: %r" % (snap.get("ai_reply") or "")[:40])
+        check("语音状态回到 idle", snap.get("voice_state") == "idle",
+              "实际: %s" % snap.get("voice_state"))
+        check("没有残留错误", not snap.get("voice_err"), "实际: %r" % snap.get("voice_err"))
+
+        # 澄清：第二次提问应该把上一轮问答带进大模型请求
+        before = len(MockLLM.seen)
+        post_bytes(vurl, b"\x01\x02" * 16000)
+        deadline = time.time() + MockLLM.delay + 12
+        while time.time() < deadline and len(MockLLM.seen) <= before:
+            time.sleep(0.5)
+        roles = [m.get("role") for m in (MockLLM.seen[-1].get("messages") or [])]
+        check("追问带上了上一轮问答（澄清）",
+              roles.count("assistant") >= 1 and roles.count("user") >= 2, str(roles))
+
+        # 停止
+        rc = post_json("http://127.0.0.1:%d/api/ask/cancel?device=%s" % (port, vdev), {})
+        check("取消接口可用（停止）", rc.get("ok") is True, "实际: %s" % rc)
+
+        # ---- 24. 自然语言请求（第 4 周）-------------------------------------
+        print("\n[21] 自然语言请求：说话 → 指令（第 4 周）")
+        nl_dev = "nl-01"
+        nbase = "http://127.0.0.1:%d" % port
+        # **必须真的起一块板子**：自然语言下发的指令得有人执行，"结果回显到屏幕"
+        # 那一条才有东西可断言。不跑板子的话指令只会停在 queued 直到超时。
+        nlboard = subprocess.Popen(
+            [PY, os.path.join(HERE, "fake_board.py"),
+             "--url", nbase, "--device", nl_dev, "--scenario", "idle",
+             "--period", "0.25", "--seconds", "60", "--quiet"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        for _ in range(40):
+            if nl_dev in [d["id"] for d in get_json(nbase + "/api/devices").get("devices", [])]:
+                break
+            time.sleep(0.25)
+
+        def ask_nl(text):
+            """把一句话当成"板端提问"发上去 —— 板端就是这么发的（ask=1 + q=文字）。"""
+            return post_raw(nbase + "/api/telemetry",
+                            firmware_body([(0.0, 0.0, 1.0)] * 5, ask=True,
+                                          question=text, device=nl_dev))
+
+        def cmds_of():
+            return get_json(nbase + "/api/commands?device=" + urllib.parse.quote(nl_dev)) \
+                   .get("commands", [])
+
+        names_ok = set(get_json(nbase + "/api/commands").get("names", []))
+        # 每句话 → 期望翻成的指令与参数。**故意用不同说法**：学生不会照着按钮文案念。
+        nl_cases = (
+            ("拍张照",          "cam_capture",  {}),
+            ("采集一次",        "capture_once", {}),
+            ("开一下实时画面",   "cam_stream",   {"on": True}),
+            ("把实时画面关掉",   "cam_stream",   {"on": False}),
+            ("卡里有什么文件",   "sd_ls",        {}),
+            ("闪五下",          "led_blink",    {"n": 5}),
+            ("把灯关掉",        "led_set",      {"on": False}),
+            ("切到第3档",       "set_orient",   {"o": 3}),
+        )
+        misses, spoken_ok = [], True
+        for text, want, params in nl_cases:
+            prev = (cmds_of() or [{}])[0].get("id")
+            out = ask_nl(text)
+            time.sleep(0.3)
+            rec = (cmds_of() or [{}])[0]
+            if (rec.get("name") != want or rec.get("id") == prev
+                    or want not in names_ok):
+                misses.append("%s→%s" % (text, rec.get("name")))
+                if rec.get("id"):
+                    _wait_cmd(port, rec["id"], 8, device=nl_dev)
+                continue
+            for k, v in params.items():
+                if (rec.get("params") or {}).get(k) != v:
+                    misses.append("%s 参数 %s=%r" % (text, k, v))
+            # 回话要短、口语化（"好，让板子拍一张照…"），不是大模型那种长回答
+            if not (out.get("reply") or "").startswith("好"):
+                spoken_ok = False
+                misses.append("%s 回话=%r" % (text, out.get("reply")))
+            # **等这条真的走完再发下一条**：板子一次只执行一条，队列堆起来后
+            # 后面的会撞上 5 秒超时（queued 以 created 计时），回显被"超时"覆盖 ——
+            # 那不是产品缺陷，是测试自己在制造拥塞。
+            _wait_cmd(port, rec["id"], 8, device=nl_dev)
+        check("8 句自然语言都翻成了对应指令（名字 + 参数）", not misses,
+              "问题: %s" % misses)
+        check("板端立刻收到'好的…'而不是去等大模型", spoken_ok)
+        check("自然语言下发的指令标了 source=nl（网页能看出是语音来的）",
+              all(c.get("source") == "nl" for c in cmds_of()[:4]),
+              "实际: %s" % [c.get("source") for c in cmds_of()[:4]])
+
+        # 课程第 4 周的**当堂验证项**：同一份旧数据，「查看上次数据」和「重新采集」
+        # 必须走不同路径 —— 前者不产生新指令（走查询、保留旧时间），后者要等新结果。
+        prev_id = (cmds_of() or [{}])[0].get("id")
+        ask_nl("上次采集的数据是多少")
+        time.sleep(0.4)
+        check("「查看上次数据」不被当成新采集请求（没有新指令产生）",
+              (cmds_of() or [{}])[0].get("id") == prev_id,
+              "实际: 最新指令 %s → %s" % (prev_id, (cmds_of() or [{}])[0].get("id")))
+        ask_nl("重新采集一次")
+        time.sleep(0.4)
+        rec_fresh = (cmds_of() or [{}])[0]
+        check("「重新采集」确实产生一条新的采集指令",
+              rec_fresh.get("name") == "capture_once" and rec_fresh.get("source") == "nl"
+              and rec_fresh.get("id") != prev_id,
+              "实际: %s / %s" % (rec_fresh.get("name"), rec_fresh.get("source")))
+
+        # 危险动作：**必须**只回话、不下发 —— 语音识别错一个字就可能把卡格了
+        n_before = len(cmds_of())
+        out = ask_nl("格式化存储卡")
+        time.sleep(0.4)
+        check("危险动作（格式化）被拒：不下发指令，只回一句指路",
+              len(cmds_of()) == n_before and "危险" in (out.get("reply") or ""),
+              "实际: %r / 指令数 %d→%d" % (out.get("reply"), n_before, len(cmds_of())))
+
+        # 普通问题不能被意图规则"抢"走 —— 该问大模型的还是问大模型。
+        # **放最后**：它会拉起一次 6 秒的假大模型生成，放前面会干扰后面的回显断言。
+        before_calls = len(MockLLM.seen)
+        out = ask_nl("今天天气怎么样")
+        time.sleep(0.5)
+        check("普通问题不被误判成设备请求（仍走大模型）",
+              len(MockLLM.seen) > before_calls or "天气" in (out.get("reply") or ""),
+              "实际: %r" % out.get("reply"))
+
+        # 执行完 → 结果写回板端屏幕（用户是对着板子说的，眼睛也在板子上）
+        ask_nl("采集一次")
+        time.sleep(0.4)
+        cid_nl = (cmds_of() or [{}])[0].get("id")
+        done_nl = _wait_cmd(port, cid_nl, 15, device=nl_dev)
+        time.sleep(0.8)                     # 等回显落到 ai_reply
+        snap_nl = latest(port, nl_dev)
+        check("指令执行完，结果回显到板端屏幕",
+              done_nl is not None and done_nl["state"] == "done"
+              and "采好了" in (snap_nl.get("ai_reply") or ""),
+              "实际: %s / %r" % (done_nl and done_nl["state"], snap_nl.get("ai_reply")))
+        check("自然语言请求进了事件流（说了什么 → 什么指令）",
+              any("自然语言请求" in (e.get("text") or "")
+                  for e in snap_nl.get("events", [])))
+
+        # 新指令必须**作废**还在后台跑的那次生成 —— 否则几秒后旧回答会盖掉指令回显，
+        # 用户看到的是"刚才那个问题的答案"，而他明明已经改口了。
+        ask_nl("闪三下")
+        time.sleep(0.4)
+        cid_cancel = (cmds_of() or [{}])[0].get("id")
+        _wait_cmd(port, cid_cancel, 8, device=nl_dev)
+        time.sleep(MockLLM.delay + 2)       # 等那次被作废的生成真的回来
+        check("新指令作废了上一轮还在生成的大模型回答（回显不被旧回答盖掉）",
+              "闪好了" in (latest(port, nl_dev).get("ai_reply") or ""),
+              "实际: %r" % (latest(port, nl_dev).get("ai_reply")))
+
+        # ---- 25. 文字入口（第 5 周）-----------------------------------------
+        # 课程第 5 周要求「用同一句任务对照文字和语音入口」。对照的前提是两条入口
+        # 真的走同一套处理 —— 所以这里断言：同一句话，打字和说话**结果一致**。
+        print("\n[22] 文字入口：打字下达任务（第 5 周）")
+        q = "?device=" + urllib.parse.quote(nl_dev)
+        out = post_json(nbase + "/api/ask" + q, {"text": "闪三下"})
+        check("文字入口可用，且立刻回一句", out.get("ok") is True and bool(out.get("reply")),
+              "实际: %s" % out)
+        time.sleep(0.4)
+        rec_txt = (cmds_of() or [{}])[0]
+        check("打字和说话解析成同一条指令（同一套 request_ai）",
+              rec_txt.get("name") == "led_blink" and rec_txt.get("source") == "nl",
+              "实际: %s / %s" % (rec_txt.get("name"), rec_txt.get("source")))
+        check("空文字被拒（400）", _expect_400(nbase + "/api/ask", {"text": "   "}))
+
+        try:
+            nlboard.kill()
+            nlboard.wait(timeout=5)
+        except Exception:  # noqa: BLE001
+            pass
 
     finally:
-        for p in (srv,):
+        for p in (srv, nlboard):
+            if p is None:
+                continue
             try:
                 p.kill()
                 p.wait(timeout=5)

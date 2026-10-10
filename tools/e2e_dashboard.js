@@ -33,11 +33,20 @@ const PY = process.env.E2E_PYTHON || 'python';
 const DATA_DIR = path.join(os.tmpdir(), 'rw1-e2e-data');
 
 const procs = [];
-function start(args) {
+const logs = [];
+function start(args, tag) {
   const env = Object.assign({}, process.env, {
     no_proxy: '127.0.0.1,localhost', NO_PROXY: '127.0.0.1,localhost',
   });
-  const p = spawn(PY, args, { cwd: ROOT, env });
+  /* 把子进程输出落盘：失败时能一眼看出是"服务端没起来"还是"产品 bug"，
+     而不是对着一个空日志猜。 */
+  const fs = require('fs');
+  const logPath = path.join(os.tmpdir(), 'rw1-e2e-' + (tag || 'proc') + '.log');
+  const fd = fs.openSync(logPath, 'w');
+  logs.push(logPath);
+  const p = spawn(PY, args, { cwd: ROOT, env, stdio: ['ignore', fd, fd] });
+  /* 父进程这一份 fd 必须关掉：副本已经给子进程了，自己留着是泄漏（2026-09-29 修）。 */
+  try { fs.closeSync(fd); } catch (e) { /* 已关 */ }
   procs.push(p);
   return p;
 }
@@ -45,6 +54,40 @@ function cleanup() {
   for (const p of procs) { try { p.kill(); } catch (e) { /* 已经没了 */ } }
 }
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+/* 关浏览器可能挂住：仪表盘有 SSE 长连接，Chrome 关不掉时 browser.close() 会一直等。
+   跑完断言却卡在收尾，在 CI 里等于永不结束，所以给它一个上限。 */
+async function closeBrowser(b) {
+  try { await Promise.race([b.close(), sleep(8000)]); } catch (e) { /* 已经关了 */ }
+}
+
+/* 显式退出：playwright + spawn 的子进程会留下活跃 handle，事件循环不空，
+   node 自己就永远不退（实测跑完断言后仍挂着，被 timeout 杀掉、退出码 124）。
+   flush 用 race 兜底：Windows 下 write('') 空写不触发回调，等它就会卡死。 */
+async function exitNow(code) {
+  await Promise.race([
+    new Promise(r => { try { process.stdout.write('\n', () => r()); } catch (e) { r(); } }),
+    sleep(1500),
+  ]);
+  process.exit(code);
+}
+
+/* 等 HTTP 真的能应答再往下走。
+   固定 `sleep(2500)` 是**不可靠的**：机器忙一点、服务端晚 1 秒绑定端口，
+   后面的 `page.goto` 就会超时，看起来像产品打不开，其实是测试自己抢跑。
+   （踩过：连着跑三套测试时这套报 "navigating ... waiting until domcontentloaded" 超时，
+   单独跑又全绿 —— 就是这个原因。本仓库的记忆里早写着"E2E 必须先就绪探测"。） */
+async function waitHttp(url, maxSec) {
+  const t0 = Date.now();
+  while (Date.now() - t0 < (maxSec || 25) * 1000) {
+    try {
+      const r = await fetch(url, { signal: AbortSignal.timeout(1500) });
+      if (r.ok) return true;
+    } catch (e) { /* 还没起来 */ }
+    await sleep(400);
+  }
+  return false;
+}
 
 const problems = [];
 let passed = 0;
@@ -59,14 +102,25 @@ async function step(name, fn) {
 
 (async () => {
   start(['-u', 'server/server.py', '--port', String(PORT),
-         '--data-dir', DATA_DIR, '--retain-days', '0']);
-  await sleep(2500);
+         '--data-dir', DATA_DIR, '--retain-days', '0'], 'server');
+  if (!await waitHttp(BASE + '/api/latest')) {
+    throw new Error('服务端在 ' + PORT + ' 端口起不来（看 ' + logs[0] + '）');
+  }
   // 两块假板子：一块带 oN，一块不带（模拟不支持 oN 的老固件）
   start(['-u', 'tools/fake_board.py', '--url', BASE, '--device', '第三组-07',
-         '--orient', '7', '--scenario', 'tilt', '--seconds', '180', '--quiet']);
+         '--orient', '7', '--scenario', 'tilt', '--seconds', '180', '--quiet'], 'boardA');
   start(['-u', 'tools/fake_board.py', '--url', BASE, '--device', '老固件-01',
-         '--scenario', 'idle', '--seconds', '180', '--quiet']);
-  await sleep(4000);
+         '--scenario', 'idle', '--seconds', '180', '--quiet'], 'boardB');
+  /* 等两块板子都真的上报过 —— 用"设备列表里有 2 台"当就绪信号，
+     不要 sleep 固定秒数（板子晚到 1 秒，后面的断言就会假失败）。 */
+  const t0 = Date.now();
+  while (Date.now() - t0 < 20000) {
+    try {
+      const j = await (await fetch(BASE + '/api/devices')).json();
+      if ((j.devices || []).length >= 2) break;
+    } catch (e) { /* 再等 */ }
+    await sleep(500);
+  }
 
   const browser = await chromium.launch({
     channel: 'chrome', headless: true,
@@ -131,6 +185,22 @@ async function step(name, fn) {
     await page.waitForSelector('#devcard:not([hidden])', { timeout: 15000 });
     const n = await page.locator('#devs .dev').count();
     if (n !== 2) throw new Error('设备行数 = ' + n);
+  });
+
+  await step('设备卡片不会闪（连续取数 3 秒内始终可见）', async () => {
+    /* 2026-09-26 抓到的真 bug：`/api/latest`（100ms 轮询）不带 devices 字段，
+       而 SSE（500ms）带 —— 于是这一块以取数频率反复藏/显，大部分时间不可见。
+       采样 60 次 × 50ms = 3 秒，覆盖 30 次轮询 + 6 次 SSE。 */
+    const r = await page.evaluate(() => new Promise(resolve => {
+      const el = document.getElementById('devcard');
+      let hidden = 0, n = 0;
+      const t = setInterval(() => {
+        n++;
+        if (el.hidden || getComputedStyle(el).display === 'none') hidden++;
+        if (n >= 60) { clearInterval(t); resolve({ hidden, n }); }
+      }, 50);
+    }));
+    if (r.hidden) throw new Error('3 秒内被藏起来 ' + r.hidden + '/' + r.n + ' 次（应为 0）');
   });
 
   await step('每台前面有复选框', async () => {
@@ -252,6 +322,35 @@ async function step(name, fn) {
     console.log('     canvas ' + m.w + 'x' + m.h);
   });
 
+  await step('第 5 周：文字入口 + 播报开关都在，且打字能真的发出去', async () => {
+    const has = await page.locator('#asktext, #asksend, #ttsbtn').count();
+    if (has !== 3) throw new Error('控件不全：' + has + '/3');
+    // 打字 → 点发送：请求要真的发到 /api/ask，且**带上那句话**
+    const sent = await page.evaluate(() => new Promise(resolve => {
+      const reqs = [];
+      const of = window.fetch;
+      window.fetch = function(u, o){
+        if (String(u).indexOf('/api/ask') === 0) {
+          reqs.push({ url: String(u), body: (o && o.body) || '' });
+        }
+        return of.apply(this, arguments);
+      };
+      document.getElementById('asktext').value = '闪三下';
+      document.getElementById('asksend').click();
+      setTimeout(() => { window.fetch = of; resolve(reqs); }, 600);
+    }));
+    if (!sent.length) throw new Error('点了发送却没发出 /api/ask 请求');
+    if (sent[0].body.indexOf('闪三下') < 0) {
+      throw new Error('请求体里没带上那句话：' + sent[0].body);
+    }
+    // 播报开关：点一下文案要翻转（板子没喇叭，播报在浏览器里做）
+    const before = ((await page.textContent('#ttsbtn')) || '').trim();
+    await page.click('#ttsbtn');
+    const after = ((await page.textContent('#ttsbtn')) || '').trim();
+    if (before === after) throw new Error('播报开关点了没反应：' + before);
+    console.log('     ' + before + ' → ' + after + '；/api/ask 已带文字发出');
+  });
+
   await step('没有横向溢出', async () => {
     const over = await page.evaluate(() =>
       document.documentElement.scrollWidth - document.documentElement.clientWidth);
@@ -264,13 +363,30 @@ async function step(name, fn) {
 
   const shot = process.env.E2E_SHOT;
   if (shot) await page.screenshot({ path: shot, fullPage: true });
-  await browser.close();
+  await closeBrowser(browser);
   cleanup();
 
   console.log('\n结果: ' + passed + ' 通过' + (problems.length ? ', ' + problems.length + ' 处问题' : ', 无问题'));
-  if (problems.length) { console.log(problems.join('\n')); process.exitCode = 1; }
-})().catch(e => {
+  if (problems.length) {
+    console.log(problems.join('\n'));
+    const fs = require('fs');
+    for (const p of logs) {
+      try {
+        const t = fs.readFileSync(p, 'utf8').trim();
+        if (t) console.log('\n--- ' + path.basename(p) + ' ---\n' + t.split('\n').slice(-20).join('\n'));
+      } catch (e) { /* 没日志 */ }
+    }
+  }
+  await exitNow(problems.length ? 1 : 0);
+})().catch(async e => {
   console.log('FATAL: ' + (e && e.message));
+  const fs = require('fs');
+  for (const p of logs) {
+    try {
+      const t = fs.readFileSync(p, 'utf8').trim();
+      if (t) console.log('\n--- ' + path.basename(p) + ' ---\n' + t.split('\n').slice(-20).join('\n'));
+    } catch (err) { /* 没日志 */ }
+  }
   cleanup();
-  process.exit(1);
+  await exitNow(1);
 });

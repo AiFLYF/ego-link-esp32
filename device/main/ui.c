@@ -124,19 +124,19 @@ static const char *TAG = "ui";
 
 /* 三轴对称条 */
 #define UI_AXIS_Y       124
-#define UI_AXIS_ROW_H   11
+#define UI_AXIS_ROW_H   13
 #define UI_AXIS_GAP     3
-#define UI_AXIS_LBL_X   10
-#define UI_AXIS_LBL_W   12
+#define UI_AXIS_LBL_X   8
+#define UI_AXIS_LBL_W   14
 #define UI_AXIS_BAR_X   26
-#define UI_AXIS_BAR_W   158
+#define UI_AXIS_BAR_W   152
 #define UI_AXIS_BAR_H   7
-#define UI_AXIS_VAL_X   190
-#define UI_AXIS_VAL_W   42
+#define UI_AXIS_VAL_X   184
+#define UI_AXIS_VAL_W   48
 
 /* AI 回复卡片 */
-#define UI_CARD_Y       168
-#define UI_CARD_H       66
+#define UI_CARD_Y       174
+#define UI_CARD_H       60
 #define UI_CARD_X       UI_MARGIN
 #define UI_CARD_W       (UI_SCR_W - 2 * UI_MARGIN)
 #define UI_TAG_X        14
@@ -159,7 +159,7 @@ static const char *TAG = "ui";
 #define UI_REPLY_X      14
 #define UI_REPLY_Y      22                      /* 相对卡片 */
 #define UI_REPLY_W      200
-#define UI_REPLY_H      40
+#define UI_REPLY_H      34
 
 /* ==========================================================================
  * 配色（深色玻璃拟态：深底 + 低对比描边 + 高饱和语义色）
@@ -640,7 +640,16 @@ static void set_offline_pulse(bool on)
     }
 }
 
-/* 姿态球平滑跟随：把生硬的 2Hz 跳变变成 260ms 的滑动 */
+/* 姿态球平滑跟随。
+ *
+ * 时长**不能太长**：ui_timer_cb 每 33 ms 调一次本函数，只要位置变了就重建动画，
+ * 所以动画几乎永远走不完 —— 等效行为是"每 33 ms 走掉剩余距离的 ease_out(33/时长)"。
+ * 260 ms 时 33 ms 处只走 38%（等效时间常数 ~87 ms），球看着就是"慢慢爬"、
+ * 跟不上手；降到 60 ms 后时间常数 ~44 ms，跟手得多，而且每帧重建动画
+ * 带来的内存分配与动画表操作也便宜得多。
+ * （用户 2026-09-27 反馈"移动都要等几秒才能反应"——这是其中一个叠加因素。） */
+#define UI_BUBBLE_ANIM_MS 60
+
 static void move_bubble(int tx, int ty)
 {
     if (tx == s_bubble_tx && ty == s_bubble_ty) {
@@ -650,7 +659,7 @@ static void move_bubble(int tx, int ty)
     lv_anim_t a;
     lv_anim_init(&a);
     lv_anim_set_var(&a, s_bubble);
-    lv_anim_set_duration(&a, 260);
+    lv_anim_set_duration(&a, UI_BUBBLE_ANIM_MS);
     lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
     lv_anim_set_exec_cb(&a, anim_translate_x);
     lv_anim_set_values(&a, lv_obj_get_style_translate_x(s_bubble, 0), tx);
@@ -658,7 +667,7 @@ static void move_bubble(int tx, int ty)
 
     lv_anim_init(&a);
     lv_anim_set_var(&a, s_bubble);
-    lv_anim_set_duration(&a, 260);
+    lv_anim_set_duration(&a, UI_BUBBLE_ANIM_MS);
     lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
     lv_anim_set_exec_cb(&a, anim_translate_y);
     lv_anim_set_values(&a, lv_obj_get_style_translate_y(s_bubble, 0), ty);
@@ -753,12 +762,21 @@ static void ui_timer_cb(lv_timer_t *timer)
     snprintf(buf, sizeof(buf), "↑%u", (unsigned)st.posts_ok);
     lv_label_set_text(s_lbl_posts, buf);
 
-    /* ---------- 远程指令徽标（出现时临时顶替上报数，二者互斥） ---------- */
+    /* ---------- 远程指令徽标 / 语音状态（互斥，出现时临时顶替上报数） ----------
+     * 语音**优先于**远程指令：用户刚按完键，"它在听"是此刻最该看到的信息。
+     * 值 4/5 是语音态，直接接在 cmd_state 的 0..3 之后，共用一个徽标控件 ——
+     * 不为它新开一个 UI 元素，屏幕上本来就没几处空白。 */
     int badge = (st.cmd_state <= TRANSPORT_CMD_FAILED) ? (int)st.cmd_state : 0;
+    if (st.voice_state == TRANSPORT_VOICE_RECORDING) {
+        badge = 4;
+    } else if (st.voice_state == TRANSPORT_VOICE_UPLOADING) {
+        badge = 5;
+    }
     if (badge != s_last_badge) {
         s_last_badge = badge;
-        static const char *const badge_text[4] = {"", "...", "OK", "NG"};
-        static const uint32_t badge_color[4] = {0, UI_C_AMBER, UI_C_GREEN, UI_C_RED};
+        static const char *const badge_text[6] = {"", "...", "OK", "NG", "录音", "上传"};
+        static const uint32_t badge_color[6] = {0, UI_C_AMBER, UI_C_GREEN, UI_C_RED,
+                                                UI_C_TEAL, UI_C_BLUE};
 
         if (badge == TRANSPORT_CMD_IDLE) {
             lv_obj_set_hidden(s_badge, true);
@@ -934,7 +952,7 @@ static void ui_timer_cb(lv_timer_t *timer)
         s_page_tick = 0;
 
         bool has_reply = st.reply[0] != '\0';
-        const char *text = has_reply ? st.reply : "按 BOOT 键向电脑服务器的 AI 提问";
+        const char *text = has_reply ? st.reply : "单击 BOOT 提问 · 三击说话";
         char pagebuf[128];
         s_page_total = reply_page(text, 0, pagebuf, sizeof(pagebuf));
         lv_label_set_text(s_lbl_reply, pagebuf);
@@ -1106,8 +1124,11 @@ static void build_axis_rows(lv_obj_t *scr)
     for (int i = 0; i < 3; i++) {
         int y = UI_AXIS_Y + i * (UI_AXIS_ROW_H + UI_AXIS_GAP);
 
+        /* 字号必须**小于行高**：原来是 montserrat_14 塞进 UI_AXIS_ROW_H = 11 的行里，
+         * 字被上下切掉 —— 用户反馈"X/Y/Z 的字母和数字都显示不完整"就是这个。
+         * 现在 12px 字 + 13px 行，纵向留 1px 余量。 */
         lv_obj_t *lbl = make_label(scr, UI_AXIS_LBL_X, y, UI_AXIS_LBL_W, UI_AXIS_ROW_H,
-                                   &lv_font_montserrat_14, axis_color[i], LV_TEXT_ALIGN_LEFT);
+                                   &lv_font_montserrat_12, axis_color[i], LV_TEXT_ALIGN_LEFT);
         lv_label_set_long_mode(lbl, LV_LABEL_LONG_CLIP);
         lv_label_set_text(lbl, axis_name[i]);
 
@@ -1136,8 +1157,10 @@ static void build_axis_rows(lv_obj_t *scr)
                  1, UI_AXIS_BAR_H + 2, UI_C_MARK, 0, 0);
 
         /* 数值与 X/Y/Z 标签同色，左右呼应，不再是一串灰蒙蒙的数字 */
+        /* 同上：12px 字，并且数值框从 42 加宽到 48 —— `+1.03` 这种
+         * （带符号 5 个字符）在 14px 下约 42~45px，贴着框边会被裁掉。 */
         s_axis_val[i] = make_label(scr, UI_AXIS_VAL_X, y, UI_AXIS_VAL_W, UI_AXIS_ROW_H,
-                                   &lv_font_montserrat_14, axis_color[i], LV_TEXT_ALIGN_RIGHT);
+                                   &lv_font_montserrat_12, axis_color[i], LV_TEXT_ALIGN_RIGHT);
         lv_label_set_long_mode(s_axis_val[i], LV_LABEL_LONG_CLIP);
         lv_label_set_text(s_axis_val[i], "0.00");
     }
@@ -1190,7 +1213,7 @@ static void build_reply_card(lv_obj_t *scr)
     /* 初始是引导语不是回复，用弱化灰；timer 收到真回复后才换成琥珀色 */
     s_lbl_reply = make_label(card, UI_REPLY_X, UI_REPLY_Y, UI_REPLY_W, UI_REPLY_H,
                              cjk_font(14), UI_C_FAINT, LV_TEXT_ALIGN_LEFT);
-    lv_label_set_text(s_lbl_reply, "按 BOOT 键向电脑服务器的 AI 提问");
+    lv_label_set_text(s_lbl_reply, "单击 BOOT 提问 · 三击说话");
 }
 
 /* 配网覆盖层：整屏盖住仪表盘，把"怎么连"讲清楚。
