@@ -322,6 +322,35 @@ async function step(name, fn) {
     console.log('     canvas ' + m.w + 'x' + m.h);
   });
 
+  await step('第 5 周：文字入口 + 播报开关都在，且打字能真的发出去', async () => {
+    const has = await page.locator('#asktext, #asksend, #ttsbtn').count();
+    if (has !== 3) throw new Error('控件不全：' + has + '/3');
+    // 打字 → 点发送：请求要真的发到 /api/ask，且**带上那句话**
+    const sent = await page.evaluate(() => new Promise(resolve => {
+      const reqs = [];
+      const of = window.fetch;
+      window.fetch = function(u, o){
+        if (String(u).indexOf('/api/ask') === 0) {
+          reqs.push({ url: String(u), body: (o && o.body) || '' });
+        }
+        return of.apply(this, arguments);
+      };
+      document.getElementById('asktext').value = '闪三下';
+      document.getElementById('asksend').click();
+      setTimeout(() => { window.fetch = of; resolve(reqs); }, 600);
+    }));
+    if (!sent.length) throw new Error('点了发送却没发出 /api/ask 请求');
+    if (sent[0].body.indexOf('闪三下') < 0) {
+      throw new Error('请求体里没带上那句话：' + sent[0].body);
+    }
+    // 播报开关：点一下文案要翻转（板子没喇叭，播报在浏览器里做）
+    const before = ((await page.textContent('#ttsbtn')) || '').trim();
+    await page.click('#ttsbtn');
+    const after = ((await page.textContent('#ttsbtn')) || '').trim();
+    if (before === after) throw new Error('播报开关点了没反应：' + before);
+    console.log('     ' + before + ' → ' + after + '；/api/ask 已带文字发出');
+  });
+
   await step('没有横向溢出', async () => {
     const over = await page.evaluate(() =>
       document.documentElement.scrollWidth - document.documentElement.clientWidth);
