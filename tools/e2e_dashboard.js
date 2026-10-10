@@ -351,6 +351,67 @@ async function step(name, fn) {
     console.log('     ' + before + ' → ' + after + '；/api/ask 已带文字发出');
   });
 
+  /* 计时（第 6 周）。服务端那一侧（voice_ms / ai_ms / total_ms 真的被填上）
+     由 verify_server.py 断言；这里管的是"服务端给了数，页面会不会显示出来"。
+     本套 E2E 没有假大模型，跑不出真实耗时，所以**拦截 /api/latest 的响应**喂一份
+     带耗时的快照 —— 走的是真实渲染路径（pull → render → renderTiming）。
+     ⚠️ 注意：页面脚本整体包在 IIFE 里，`fmtMs`/`renderTiming` **不是全局**，
+     不能在 page.evaluate 里直接调 —— 只能从数据入口驱动。 */
+  await step('第 6 周：计时能显示，没数据时不占位', async () => {
+    const n = await page.locator('#timing').count();
+    if (n !== 1) throw new Error('#timing 不存在：' + n);
+
+    // 1) 一开始没有任何耗时数据 —— 必须收起来，不能留个空白占位
+    const hidden0 = await page.evaluate(() => document.getElementById('timing').hidden);
+    if (!hidden0) throw new Error('没有计时数据时不该显示出来');
+
+    // 2) 装一个假的 /api/latest：返回带耗时的快照
+    await page.evaluate(() => {
+      const of = window.fetch;
+      window.__rw1Fetch = of;
+      window.__rw1Timing = { voice_ms: 1200, ai_ms: 3400, total_ms: 5000 };
+      window.fetch = function (u, o) {
+        if (String(u).indexOf('/api/latest') === 0) {
+          const s = Object.assign({
+            ok: true, device: '-', device_online: true, samples: [], events: [],
+            commands: [], activity: '静置·水平', ai_reply: '计时测试',
+            ai_mode: '大模型', ai_pending: false, voice_state: 'idle',
+            step_count: 0, shake_count: 0, posts_ok: 1,
+          }, window.__rw1Timing);
+          return Promise.resolve(new Response(JSON.stringify(s),
+            { status: 200, headers: { 'Content-Type': 'application/json' } }));
+        }
+        return of.apply(this, arguments);
+      };
+    });
+
+    let txt = '';
+    for (let i = 0; i < 50; i++) {                 // 等页面下一轮轮询
+      txt = ((await page.textContent('#timing')) || '').trim();
+      if (txt) break;
+      await sleep(100);
+    }
+    if (!txt) throw new Error('服务端给了耗时，页面却没显示出来');
+    if (txt !== '识别 1.2 s · 生成 3.4 s · 共 5.0 s') {
+      throw new Error('计时文案不对：' + JSON.stringify(txt));
+    }
+
+    // 3) 数据清空后要能收回去（换设备 / 新一轮开始时都会发生）
+    await page.evaluate(() => { window.__rw1Timing = { voice_ms: 0, ai_ms: 0, total_ms: 0 }; });
+    let hiddenAgain = false;
+    for (let i = 0; i < 50; i++) {
+      hiddenAgain = await page.evaluate(() => document.getElementById('timing').hidden);
+      if (hiddenAgain) break;
+      await sleep(100);
+    }
+    if (!hiddenAgain) throw new Error('耗时清空后没有收起来');
+
+    // 4) 恢复真实 fetch，别影响后面的步骤
+    await page.evaluate(() => { if (window.__rw1Fetch) window.fetch = window.__rw1Fetch; });
+
+    console.log('     ' + txt + '；空数据时自动收起');
+  });
+
   await step('没有横向溢出', async () => {
     const over = await page.evaluate(() =>
       document.documentElement.scrollWidth - document.documentElement.clientWidth);
