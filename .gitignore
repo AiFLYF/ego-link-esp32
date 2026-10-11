@@ -28,3 +28,30 @@ Desktop.ini
 .workbuddy-ai/
 # 有的 agent 会写 .workbuddy/（没有 -ai），别让它被误提交
 .workbuddy/
+
+# ---- 过程性 / 协作类文档（不入库）-------------------------------------
+# 这些是工作过程的产物，不是产品内容：发现过什么问题、打算怎么改、
+# 上一轮交代了什么、多个 agent 之间怎么分工。
+# 产品说明在 README.md —— 那个要入库，别顺手加进来。
+#
+# 规则写在这里（入库）而不是 .git/info/exclude（纯本机），是为了让
+# clone 仓库的人看到同一套约定：不是本机忘了提交，是这类东西本就不该入库。
+# 名单与 AGENTS.md 第 8 节一一对应，改一边记得改另一边。
+
+# 多 agent 协作总章及其入口
+/AGENTS.md
+/CLAUDE.md
+/.agents/
+/.agent/
+/.claude/
+/.trae/
+/docs/agents/
+/tools/agents_status.py
+
+# 交接 / 提案 / 评审：按「动作-日期.md」命名，根目录
+/HANDOFF-*.md
+/PROPOSAL-*.md
+/REVIEW-*.md
+
+# 临时产物（探针日志、合成的树、一次性验证脚本）
+/_local_tmp/
