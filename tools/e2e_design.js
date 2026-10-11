@@ -11,7 +11,9 @@
  *             （font-family 写对了但字体没送到浏览器 = 静默退回系统字体，最阴的一种）
  *   颜色   —— 令牌用 OKLCH 定义；没有纯黑/纯白大面积；主色只有一个
  *   圆角   —— 全站非圆形圆角值不超过 3 种，且只能是 6 / 10 / 14
- *   字号   —— hero ≥ 正文 × 3；标题层级步进落在 1.25~1.5
+ *   字号   —— hero ≥ 正文 × 3；标题层级步进落在 1.25~1.5；
+ *             且**页面里不许有裸 px 字号**（全部走 --fs-* 令牌，表单控件的
+ *             16px 是平台约束、单独放行）
  *   间距   —— 令牌严格落在 8px 基准网格上；section 上下 padding ≥ 64
  *   对齐   —— 标题默认左对齐，不居中
  *   布局   —— 1600/1280/900/390/320 五档都不横向溢出
@@ -412,6 +414,40 @@ const CONTRAST = `(function(rgb1, rgb2){
     console.log('     标题步进 ' + steps.map(s => s.toFixed(3) + '×').join('  '));
   });
 
+  await step('字号全部走令牌（页面里没有裸 px 字号）', async () => {
+    /* 2026-10-11 补。设计系统声明"字号只 4 级"，但当时实际散着
+       10.5 / 11 / 11.5px 三种硬编码（13 处）—— 声明和现实对不上，
+       "冻结"就等于半个空话：改一处得找十处，也没人拦得住第 14 处。
+       现在全部归到 --fs-micro / --fs-meta，这条断言守住"以后别再写裸 px"。
+       唯一放行：表单控件上的 16px —— iOS 对上焦时会把 < 16px 的输入框
+       强制放大页面，这是**平台约束**，不是排版选择。 */
+    const r = await page.evaluate(() => {
+      const css = [...document.querySelectorAll('style')]
+        .map(s => s.textContent).join('\n')
+        .replace(/\/\*[\s\S]*?\*\//g, ' ');   // 注释里也会提到 px，先剥掉
+      const bad = [], allowed = [];
+      const re = /\bfont(?:-size)?\s*:\s*([^;{}]*)/g;
+      let m;
+      while ((m = re.exec(css)) !== null) {
+        for (const v of m[1].match(/[\d.]+px/g) || []) {
+          /* 这条声明属于哪个选择器：先找开这条规则的 `{`，
+             再往前找它前面那个 `}`/`{` —— 选择器在 `{` **前面**。
+             （写成"`{` 之后到声明之间"会切出空串，见下面 bad 里 why 字段。） */
+          const before = css.slice(0, m.index);
+          const open = before.lastIndexOf('{');
+          const prev = Math.max(before.lastIndexOf('}', open - 1),
+                                before.lastIndexOf('{', open - 1));
+          const sel = css.slice(prev + 1, open).trim();
+          if (v === '16px' && /(^|,)\s*(input|select)\b/.test(sel)) allowed.push(v);
+          else bad.push(sel.slice(0, 40) + ' → ' + m[1].trim().slice(0, 40));
+        }
+      }
+      return { bad: bad.slice(0, 5), nBad: bad.length, nAllowed: allowed.length };
+    });
+    if (r.nBad) throw new Error('还有 ' + r.nBad + ' 处裸 px 字号：' + JSON.stringify(r.bad));
+    console.log('     字号全部来自令牌（表单控件 16px 例外 ' + r.nAllowed + ' 处）');
+  });
+
   await step('间距令牌全部落在 8px 基准网格上', async () => {
     const r = await page.evaluate(() => {
       const cs = getComputedStyle(document.documentElement);
@@ -568,15 +604,41 @@ const CONTRAST = `(function(rgb1, rgb2){
   await checkContrast();
 
   console.log('\n【弹窗】');
+  let nativeCalled = false;              // 供下面的诊断读到（原生 confirm 有没有被调用）
+  /* 等自定义确认弹窗出现。**失败时把现场一起带出来**（2026-10-11 补）：
+     这一步曾偶发红（5 次里 1 次），报的却是干巴巴的
+     `waitForSelector: Timeout 5000ms exceeded` —— 看不出是"按钮被禁用"、
+     "点到的是被重渲染掉的旧节点"、还是"弹窗弹了但选择器不对"。
+     断言本身不放松（还是 5 秒 + 还是必须出现），只是让失败自带证据。 */
+  const waitConfirmOpen = async (timeout = 5000) => {
+    try {
+      await page.waitForSelector('dialog.modal[open]', { timeout });
+    } catch (e) {
+      const diag = await page.evaluate(() => {
+        const b = document.querySelector('#cmdbts button[data-cmd="sd_format"]');
+        const d = document.querySelector('dialog.modal');
+        return {
+          btnFound: !!b, btnDisabled: b ? b.disabled : null,
+          btnText: b ? b.textContent.trim() : null,
+          dlgs: document.querySelectorAll('dialog.modal').length,
+          hasOpenAttr: d ? d.hasAttribute('open') : null,
+          bodyHasModal: document.body.classList.contains('modal-open'),
+        };
+      });
+      throw new Error('弹窗 5 秒内没出现；现场=' + JSON.stringify(diag)
+                      + '；原生 confirm 被调用=' + nativeCalled
+                      + '；上报错=' + e.message.split('\n')[0]);
+    }
+  };
   await step('破坏性操作弹自定义弹窗（不是 window.confirm），能开能关', async () => {
-    let nativeCalled = false;
+    nativeCalled = false;
     page.on('dialog', async d => { nativeCalled = true; await d.dismiss(); });
     const sentBefore = [];
     page.on('request', r => {
       if (r.method() === 'POST' && r.url().indexOf('/api/command') >= 0) sentBefore.push(r.postData());
     });
     await page.click('#cmdbts button[data-cmd="sd_format"]');
-    await page.waitForSelector('dialog.modal[open]', { timeout: 5000 });
+    await waitConfirmOpen();
     if (nativeCalled) throw new Error('弹的是原生 window.confirm');
     const title = await page.textContent('#cfm-title');
     if (title.indexOf('格式化') < 0) throw new Error('弹窗标题不对：' + title);
@@ -589,7 +651,7 @@ const CONTRAST = `(function(rgb1, rgb2){
     if (sentBefore.length) throw new Error('取消之后居然还是下发了：' + JSON.stringify(sentBefore));
     // Esc 也能关（原生 dialog 行为）
     await page.click('#cmdbts button[data-cmd="sd_format"]');
-    await page.waitForSelector('dialog.modal[open]', { timeout: 5000 });
+    await waitConfirmOpen();
     await page.keyboard.press('Escape');
     await page.waitForFunction(() => !document.querySelector('dialog.modal[open]'),
                               { polling: 100, timeout: 5000 });
