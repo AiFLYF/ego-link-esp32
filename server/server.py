@@ -3764,7 +3764,7 @@ function doSendCmd(name, btn, overrideParams){
 /* ---------------- 摄像头 ----------------
  * 板子是 HTTP 客户端、没有自己的服务端，所以画面是**板子 POST 上来、网页从这里取**。
  * 网页只拿最近一帧（/api/frame），拍照则由板子写 SD 卡、服务器另存一份给这里展示。 */
-var camDev = "", camOn = false, camTimer = null, camFails = 0;
+var camDev = "", camOn = false, camTimer = null, camFails = 0, camBusy = false;
 
 /* 卡片现在是**常驻**的：早先版本让它 hidden、等收到第一帧才显示，
  * 但"开启实时画面"按钮就在卡片里 —— 收不到帧就点不到按钮，点不到按钮就
@@ -3777,10 +3777,15 @@ function camShow(on){
 function camFrame(){
   var im = $("camimg");
   if (!im) return;
+  /* 同 pull() 的理由：取帧也是固定节拍发起的，服务端慢起来请求会排队积压。
+     画面这点尤其明显 —— 27KB 一帧，30 个请求挤成一坨时带宽全喂给了早已过期的旧帧。 */
+  if (camBusy) return;
+  camBusy = true;
   var dev = selDevice || "";      /* 空着就交给服务端回退到"最近上报的那台" */
   camDev = dev;
   im.src = "/api/frame?device=" + encodeURIComponent(dev) + "&t=" + Date.now();
   im.onload = function(){
+    camBusy = false;
     camFails = 0;
     camShow(true);
     im.hidden = false;          /* 收到第一帧才让它出现，之前别露出"图片裂了"的图标 */
@@ -3791,6 +3796,7 @@ function camFrame(){
                              "（约 2 帧/秒）";
   };
   im.onerror = function(){
+    camBusy = false;
     camFails++;
     im.hidden = true;
     var ns = $("camnosig");
@@ -3810,6 +3816,11 @@ function camFps(){
 }
 function camSetLive(on){
   camOn = on;
+  /* 开关一档旧帧就作废了，连它的在飞标记一起清掉。
+     这是给 camBusy 上的一道保险：pull() 靠 fetch 的 .then 兜底，必然复位；
+     而 <img> 的 load / error 属于浏览器回调，万一某个请求既没 load 也没 error，
+     camBusy 就永久为真、画面再也不更新。重置这个开关总能把它救回来。 */
+  camBusy = false;
   if (camTimer) { clearInterval(camTimer); camTimer = null; }
   var btn = $("camlive");
   var fps = camFps();
@@ -4416,12 +4427,31 @@ function sendAsk(){
   }).catch(function(){});
 }
 
+/* setInterval 只管按节拍往下排，不等上一个请求回来。
+ * 内网正常时响应只要几毫秒，看不出问题；但服务端一慢，请求就会排队积压
+ * 而且**永不收敛** —— 实测给浏览器网络加 400ms 延迟后，10 秒里发起 99 个、
+ * 只回来 21 个，结束时仍有 78 个在飞，数字还在往上走。
+ *
+ * 服务端为什么会慢：它只有一把全局 LOCK，取数要进去、20 台同时上报也要进去。
+ * 课堂 WiFi 再打个折，恰恰是这套东西真正上场（一个班 20 块板）的场景。
+ * 所以这不是"理论上的奢华优化"，是第一需求场景下的实际故障。
+ *
+ * 修法：这一 tick 要是上一轮还没回来，直接跳过。丢掉冗余请求总比让它们
+ * 排队强 —— 反正板端 500ms 才上报一次，慢一点拿到的也只是同一份数据。
+ * 网络正常时这个判断形同虚设（每次都能立即执行），行为完全不变。 */
+var pullBusy = false;
 function pull(){
+  if (pullBusy) return;
+  pullBusy = true;
   fetch("/api/latest" + devQuery()).then(function(r){ return r.json(); }).then(function(s){
     samples = s.samples || [];
     drawChart();
     render(s);
-  }).catch(function(){});
+  }).catch(function(){}).then(function(){
+    /* 接到 catch 后面当 finally 用：成功失败都得复位，
+       否则断网一次就永久停更了。 */
+    pullBusy = false;
+  });
 }
 
 /* 换设备要重连 SSE（服务端按 ?device= 过滤）。用世代号防止旧连接的回调
