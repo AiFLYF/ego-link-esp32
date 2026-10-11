@@ -2573,7 +2573,15 @@ h1,h2,h3{font-family:var(--font-display);text-wrap:balance}
 .devlist{
   display:flex;flex-direction:column;
   border:1px solid var(--color-line);border-radius:var(--radius-card);
-  background:var(--color-surface);overflow:hidden;
+  background:var(--color-surface);
+  /* **必须给高度上限**（2026-10-11 补）。原来没有，于是 20 台设备时这张列表
+     有 1117 px 高（窄屏 2116 px），把 AI 卡片、曲线、3D 全顶到首屏外面去 ——
+     而这个项目的第一需求恰恰就是「一个班 20 块板子」，课堂里永远是这个数。
+     上限 + 内部滚动：设备照样全都够得着，但主内容留在该在的位置。
+     设计语言没变（不加新令牌、不改圆角/字号），只是不让这一块无限长。 */
+  max-height:min(45vh, 480px);
+  overflow-y:auto;overflow-x:hidden;
+  overscroll-behavior:contain;      /* 滚到底别把整页一起带着滚 */
 }
 .dev{
   display:grid;align-items:center;gap:var(--sp-4);
