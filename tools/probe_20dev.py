@@ -20,8 +20,6 @@ import subprocess
 import sys
 import tempfile
 import time
-import urllib.parse
-import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
