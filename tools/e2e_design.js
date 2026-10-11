@@ -704,6 +704,68 @@ const CONTRAST = `(function(rgb1, rgb2){
                 + (m.hero / m.body).toFixed(2) + '×，无溢出');
   });
 
+  /* 动效令牌：2026-10-11 新增。原先时长散落成 8 个硬编码值（.06~.7s），
+     收敛成 4 档（dur-1~4）+ 2 条缓动（ease-out / ease-in-out）。
+     这条断言防止"以后有人加新动画时直接写 .3s 而不用令牌" ——
+     时长一旦散开，"精致感"就散了，而且很难再收回来。 */
+  await step('动效令牌已定义且 transition/animation 用令牌', async () => {
+    const r = await page.evaluate(() => {
+      const cs = getComputedStyle(document.documentElement);
+      const d1 = cs.getPropertyValue('--dur-1').trim();
+      const d2 = cs.getPropertyValue('--dur-2').trim();
+      const d3 = cs.getPropertyValue('--dur-3').trim();
+      const d4 = cs.getPropertyValue('--dur-4').trim();
+      const eo = cs.getPropertyValue('--ease-out').trim();
+      const ei = cs.getPropertyValue('--ease-in-out').trim();
+      /* 令牌必须全部存在且非空 */
+      if (!d1 || !d2 || !d3 || !d4 || !eo || !ei) {
+        return { ok: false, reason: '令牌缺失', d1, d2, d3, d4, eo, ei };
+      }
+      /* 扫所有元素的 transition 和 animation，看有没有硬编码秒数 */
+      const violators = [];
+      const all = document.querySelectorAll('*');
+      for (const el of all) {
+        const s = getComputedStyle(el);
+        const tr = s.transition;
+        const an = s.animation;
+        /* transition 里出现 Nms / Ns 但不是 var(--dur-*) 的 → 违规 */
+        /* 注意：getComputedStyle 会把 var() 解析成计算值，所以这里查的是
+           计算后的值 —— 如果值等于某个令牌的值，算通过 */
+        for (const decl of [tr, an]) {
+          if (!decl || decl === 'all 0s ease 0s' || decl === 'none') continue;
+          /* 提取时长部分，检查是否落在 4 档之内 */
+          const times = decl.match(/\d+\.?\d*(ms|s)/g) || [];
+          for (const t of times) {
+            /* 允许的时长值（令牌的最终值） */
+            const allowed = ['150ms', '300ms', '450ms', '700ms', '0.9s', '0s'];
+            /* 0.15s = 150ms, 0.3s = 300ms 等 —— getComputedStyle 可能用秒 */
+            const num = parseFloat(t);
+            const unit = t.endsWith('ms') ? 'ms' : 's';
+            const inMs = unit === 'ms' ? num : num * 1000;
+            if (inMs === 0) continue; /* delay 0s 无所谓 */
+            if (![150, 300, 450, 700, 900].includes(inMs)) {
+              const cn = (el.className && typeof el.className === 'string')
+                ? '.' + el.className.split(/\s+/)[0] : '';
+              violators.push({
+                el: el.tagName + cn,
+                decl: decl.slice(0, 80),
+                time: t,
+              });
+            }
+          }
+        }
+      }
+      if (violators.length > 0) {
+        return { ok: false, reason: '硬编码时长', violators: violators.slice(0, 5) };
+      }
+      return { ok: true, d1, d2, d3, d4 };
+    });
+    if (!r.ok) {
+      throw new Error(r.reason + ': ' + JSON.stringify(r).slice(0, 300));
+    }
+    console.log('     dur-1=' + r.d1 + ' dur-2=' + r.d2 + ' dur-3=' + r.d3 + ' dur-4=' + r.d4);
+  });
+
   await step('服务端全程没挂（否则上面的"请求失败"全是它引起的假象）', async () => {
     const alive = await waitHttp(BASE + '/api/latest', 3);
     if (!alive) throw new Error('服务端已经不应答了，看 .workbuddy-ai/tmp/design-server.log');
