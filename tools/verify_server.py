@@ -538,6 +538,12 @@ def main():
             if r13_dev in live:
                 break
             time.sleep(0.25)
+        else:
+            # 没有这个 else 的话，板子没起来时这里会**静默通过**，
+            # 失败拖到后面变成"命令没走到 timeout — 实际: None"这种看不懂的报错。
+            # 一个明确的"板子没上报"比五条莫名其妙的断言有用得多（手册 T59）。
+            check("测试用的板子已上报（%s 在册）" % r13_dev, False,
+                  "实际在册: %s" % live)
         r2 = post_json("http://127.0.0.1:%d/api/command" % port,
                        {"name": "capture_once", "device": r13_dev})
         cid2 = r2.get("id")
@@ -577,6 +583,9 @@ def main():
             if r14_dev in live:
                 break
             time.sleep(0.25)
+        else:
+            check("测试用的板子已上报（%s 在册）" % r14_dev, False,
+                  "实际在册: %s" % live)
 
         r3 = post_json("http://127.0.0.1:%d/api/command" % port,
                        {"name": "led_blink", "params": {"n": 3, "on_ms": 80, "off_ms": 80},
@@ -1005,9 +1014,13 @@ def main():
              "--period", "0.25", "--seconds", "60", "--quiet"],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=CHILD_ENV)
         for _ in range(BOARD_WAIT_STEPS):
-            if nl_dev in [d["id"] for d in get_json(nbase + "/api/devices").get("devices", [])]:
+            live = [d["id"] for d in get_json(nbase + "/api/devices").get("devices", [])]
+            if nl_dev in live:
                 break
             time.sleep(0.25)
+        else:
+            check("测试用的板子已上报（%s 在册）" % nl_dev, False,
+                  "实际在册: %s" % live)
 
         def ask_nl(text):
             """把一句话当成"板端提问"发上去 —— 板端就是这么发的（ask=1 + q=文字）。"""
@@ -1153,9 +1166,13 @@ def main():
              "--period", "0.25", "--seconds", "60", "--no-cmd", "--quiet"],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=CHILD_ENV)
         for _ in range(BOARD_WAIT_STEPS):
-            if slow_dev in [d["id"] for d in get_json(nbase + "/api/devices").get("devices", [])]:
+            live = [d["id"] for d in get_json(nbase + "/api/devices").get("devices", [])]
+            if slow_dev in live:
                 break
             time.sleep(0.25)
+        else:
+            check("测试用的板子已上报（%s 在册）" % slow_dev, False,
+                  "实际在册: %s" % live)
 
         def ask_on(dev_id, text):
             return post_raw(nbase + "/api/telemetry",
