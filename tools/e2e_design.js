@@ -14,7 +14,8 @@
  *   字号   —— hero ≥ 正文 × 3；标题层级步进落在 1.25~1.5
  *   间距   —— 令牌严格落在 8px 基准网格上；section 上下 padding ≥ 64
  *   对齐   —— 标题默认左对齐，不居中
- *   布局   —— 1600/1280/900/390/320 五档都不横向溢出
+ *   布局   —— 七档宽度（含两个断点两侧 1281 / 1201）都不横向溢出；
+ *             1280 宽时 AI 卡片必须与读数同一行（两列档门槛不许往上挪）
  *   对比度 —— 关键文字/背景组合过 WCAG AA（正文 4.5、大字 3.0）
  *   弹窗   —— 破坏性操作真的弹自定义弹窗（不是 window.confirm），能开能关
  *   隐藏   —— 带 hidden 的元素必须真的 display:none（作者样式的 display 会盖掉它）
@@ -458,8 +459,10 @@ const CONTRAST = `(function(rgb1, rgb2){
     console.log('     ' + JSON.stringify(r));
   });
 
-  await step('1600/1280/900/390/320 五档都不横向溢出', async () => {
-    for (const w of [1600, 1280, 900, 390, 320]) {
+  await step('七档宽度都不横向溢出（含两个断点两侧 1281 / 1201）', async () => {
+    /* 只测"整数档"会漏掉断点：两列档门槛降到 1200 之后，最窄的三列布局
+       出现在 1201 —— 那才是最容易挤到溢出的宽度。断点两侧各测一档。 */
+    for (const w of [1600, 1281, 1280, 1201, 900, 390, 320]) {
       await page.setViewportSize({ width: w, height: 900 });
       await sleep(600);
       await assertNoOverflow(w + 'px 下');
@@ -519,6 +522,32 @@ const CONTRAST = `(function(rgb1, rgb2){
     }, TO_RGB);
     if (r.solid.length !== 1) throw new Error('实心主色按钮有 ' + r.solid.length + ' 个：' + JSON.stringify(r.solid));
     console.log('     ' + r.total + ' 个按钮里，实心的只有「' + r.solid[0] + '」');
+  });
+
+  await step('1280 宽时 AI 卡片仍与读数同一行（两列档的门槛不许往上挪）', async () => {
+    /* 2026-10-11。两列档的门槛原来是 1280 —— 正好是常见笔记本宽度，
+       于是 1280 宽的窗口里 .hero-ai 被 grid-column:1/-1 挤到第二行；
+       再叠上课堂场景那 20 台设备的设备列表，AI 卡片直接掉出首屏
+       （实测：1280 宽 top=1188 / 首屏 900；1281 宽 top=803 / 在首屏内 ——
+       差 1px、差 385px）。门槛已降到 1200，这条断言钉住"1280 必须还是同一行"。 */
+    await page.setViewportSize({ width: 1280, height: 900 });
+    await sleep(600);
+    const r = await page.evaluate(() => {
+      const top = s => {
+        const e = document.querySelector(s);
+        return e ? Math.round(e.getBoundingClientRect().top) : -1;
+      };
+      const cols = getComputedStyle(document.querySelector('.stage-grid'))
+        .gridTemplateColumns.split(' ').length;
+      return { cols, ai: top('.hero-ai'), readout: top('.hero-readout') };
+    });
+    if (r.cols < 3) throw new Error('1280 宽时 .stage-grid 只有 ' + r.cols + ' 列（要求 3 列）');
+    if (r.ai < 0 || r.readout < 0) throw new Error('页面里找不到 .hero-ai / .hero-readout');
+    if (Math.abs(r.ai - r.readout) > 2) {
+      throw new Error('1280 宽时 AI 卡片被挤到第二行：读数 top=' + r.readout
+                      + ' / AI top=' + r.ai + '（两列档门槛是不是被调回 1280 了？）');
+    }
+    console.log('     1280 宽：' + r.cols + ' 列，AI 卡片与读数同一行（top=' + r.ai + '）');
   });
 
   await step('主操作在首屏内（900px 高的笔记本也不用滚）', async () => {
