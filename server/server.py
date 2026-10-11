@@ -2217,7 +2217,24 @@ DASHBOARD_HTML = """<!doctype html>
   --tint-fall:oklch(0.660 0.200 25 / .16);
 
   --w-max:1440px;
-  --ease:cubic-bezier(.16,1,.3,1);
+
+  /* ---- 动效（2026-10-11 补）---------------------------------------------
+     颜色 / 字号 / 间距 / 圆角都定了规范，**唯独动效从来没定过**：
+     原先只有 1 个缓动令牌（`--ease`，只用在 3 处），时长全是硬编码，
+     散落成 8 个值（.06/.15/.16/.3/.4/.45/.5/.7s）—— 而"精不精致"最看这个。
+     收敛成 **4 档时长 + 2 条缓动**，取值刻意贴着原来那 8 个值，不趁机改手感：
+
+       dur-1 150ms  即时反馈：按下、悬停、小球跟随数据（原 .06/.15/.16）
+       dur-2 300ms  状态切换：颜色、背景、边框、条宽（原 .3/.4）
+       dur-3 450ms  位移与展开：环、活动词（原 .45/.5）
+       dur-4 700ms  数据可视化过渡：背景渐变（原 .7）
+
+     缓动只两条：`out` 用于"响应/进入"（快出慢停），`in-out` 用于"来回"。
+     **秒级循环动画不走这套**（呼吸灯 1.7s、转圈 .9s）—— 它们按语义各自定，
+     转圈必须 linear，不然会一顿一顿的。 */
+  --dur-1:150ms; --dur-2:300ms; --dur-3:450ms; --dur-4:700ms;
+  --ease-out:cubic-bezier(.16,1,.3,1);     /* 就是原来那个 --ease 的值 */
+  --ease-in-out:cubic-bezier(.4,0,.2,1);
 }
 
 /* ==========================================================================
@@ -2370,7 +2387,7 @@ h1,h2,h3{font-family:var(--font-display);text-wrap:balance}
 .pill i{width:6px;height:6px;border-radius:50%;background:currentColor;flex:none}
 .pill.on{color:var(--color-action-primary);border-color:var(--tint-primary-line);background:var(--tint-primary)}
 .pill.off{color:var(--color-fall);border-color:var(--tint-danger-line);background:var(--tint-danger)}
-.pill.off i{animation:breathe 1.7s ease-in-out infinite}
+.pill.off i{animation:breathe var(--dur-3) var(--ease-in-out) infinite}
 @keyframes breathe{0%,100%{opacity:1}50%{opacity:.22}}
 
 /* ==========================================================================
@@ -2388,7 +2405,7 @@ h1,h2,h3{font-family:var(--font-display);text-wrap:balance}
   background-image:
     radial-gradient(880px 320px at 4% 0%, rgb(var(--act-rgb) / .10), transparent 64%),
     var(--stage-veil);
-  transition:background-image .7s var(--ease);
+  transition:background-image var(--dur-4) var(--ease-out);
 }
 .stage-head{
   display:flex;align-items:baseline;justify-content:space-between;
@@ -2408,7 +2425,7 @@ h1,h2,h3{font-family:var(--font-display);text-wrap:balance}
 .hero-ring .val{
   fill:none;stroke:var(--color-idle);stroke-width:9;stroke-linecap:round;
   stroke-dasharray:0 351.9;
-  transition:stroke-dasharray .5s var(--ease),stroke .4s ease;
+  transition:stroke-dasharray var(--dur-3) var(--ease-out),stroke var(--dur-2) var(--ease-out);
 }
 .ring-mid{
   position:absolute;inset:0;display:flex;flex-direction:column;
@@ -2421,9 +2438,9 @@ h1,h2,h3{font-family:var(--font-display);text-wrap:balance}
 .hero-word{
   font:700 var(--fs-hero)/1.02 var(--font-display);
   letter-spacing:-.02em;color:var(--act-color);
-  transition:color .45s ease;
+  transition:color var(--dur-3) var(--ease-out);
 }
-.hero-word.pop{animation:pop .45s var(--ease)}
+.hero-word.pop{animation:pop var(--dur-3) var(--ease-out)}
 @keyframes pop{from{opacity:.15;transform:translateY(6px)}to{opacity:1;transform:none}}
 /* 读数行：三个「小标签 + 大数字」，标签比数字小两级，层级一眼看得出 */
 .hero-metrics{display:flex;gap:var(--sp-8);margin-top:var(--sp-6);flex-wrap:wrap}
@@ -2463,13 +2480,13 @@ h1,h2,h3{font-family:var(--font-display);text-wrap:balance}
   border-radius:50%;background:var(--color-still);
   /* 小球短且线性：0.15s linear 让它贴着数据走，没有加速-减速的假动作。
      原来 .3s ease-out 配 500ms 一次的数据更新，观感是"猛冲一下然后停住"。 */
-  transition:transform .15s linear,background .4s,box-shadow .4s;
+  transition:transform var(--dur-1) linear,background var(--dur-2) var(--ease-out),box-shadow var(--dur-2) var(--ease-out);
 }
 .bars{display:flex;flex-direction:column;gap:var(--sp-3)}
 .bar{display:grid;grid-template-columns:16px minmax(0,1fr) 56px;gap:var(--sp-3);align-items:center}
 .bar em{font:600 var(--fs-meta)/1 var(--font-mono);font-style:normal}
 .bar .t{position:relative;height:6px;border-radius:var(--radius-control);background:var(--color-surface-3)}
-.bar .t i{position:absolute;top:0;height:100%;border-radius:var(--radius-control);left:50%;width:0;transition:left .3s,width .3s,background .3s}
+.bar .t i{position:absolute;top:0;height:100%;border-radius:var(--radius-control);left:50%;width:0;transition:left var(--dur-2) var(--ease-out),width var(--dur-2) var(--ease-out),background var(--dur-2) var(--ease-out)}
 .bar .t::after{content:"";position:absolute;left:50%;top:-2px;bottom:-2px;width:1px;transform:translateX(-.5px);background:var(--color-line-strong)}
 .bar .v{text-align:right;font:500 var(--fs-meta)/1 var(--font-mono)}
 
@@ -2588,7 +2605,7 @@ h1,h2,h3{font-family:var(--font-display);text-wrap:balance}
   grid-template-columns:18px 8px minmax(110px,180px) minmax(150px,240px) minmax(0,1fr);
   padding:var(--sp-3) var(--sp-4);
   border-bottom:1px solid var(--color-line);
-  cursor:pointer;transition:background .16s;
+  cursor:pointer;transition:background var(--dur-1) var(--ease-out);
 }
 .dev:last-child{border-bottom:0}
 .dev:hover{background:var(--color-surface-2)}
@@ -2599,7 +2616,7 @@ h1,h2,h3{font-family:var(--font-display);text-wrap:balance}
 .dev:focus-visible{outline:2px solid var(--color-action-primary);outline-offset:-2px}
 .dev input[type=checkbox]{accent-color:var(--color-action-primary);width:15px;height:15px;cursor:pointer}
 .dev .dot{width:8px;height:8px;border-radius:50%}
-.dev .dot.off{animation:breathe 1.7s ease-in-out infinite}
+.dev .dot.off{animation:breathe var(--dur-3) var(--ease-in-out) infinite}
 .dev .did{font:600 var(--fs-body)/1.3 var(--font-display);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .dev .meta{
   font:400 11.5px/1.5 var(--font-mono);color:var(--color-text-faint);
@@ -2621,7 +2638,7 @@ button{
   background:transparent;
   color:var(--color-text-muted);
   cursor:pointer;
-  transition:background .16s,border-color .16s,color .16s,transform .06s;
+  transition:background var(--dur-1) var(--ease-out),border-color var(--dur-1) var(--ease-out),color var(--dur-1) var(--ease-out),transform var(--dur-1) var(--ease-out);
 }
 button:hover:not(:disabled){
   background:var(--color-surface-2);color:var(--color-text);border-color:var(--color-line-strong);
@@ -2734,7 +2751,7 @@ select{padding-right:var(--sp-2);font-family:var(--font-mono);font-size:var(--fs
 .ringwrap{display:flex;align-items:center;gap:var(--sp-6);flex-wrap:wrap}
 .ring{
   position:relative;width:104px;height:104px;flex:0 0 auto;cursor:pointer;
-  border-radius:50%;transition:transform .16s;
+  border-radius:50%;transition:transform var(--dur-1) var(--ease-out);
 }
 .ring:hover{transform:scale(1.03)}
 .ring:focus-visible{outline:2px solid var(--color-action-primary);outline-offset:2px}
