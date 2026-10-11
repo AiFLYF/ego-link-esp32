@@ -468,6 +468,29 @@ const CONTRAST = `(function(rgb1, rgb2){
     await sleep(400);
   });
 
+  /* 设备列表必须有高度上限（2026-10-11 补）。
+     这张列表原来没有上限：**20 台设备时它有 1117 px 高（窄屏 2116 px）**，
+     把 AI 卡片、曲线、3D 全顶到首屏外面去 —— 而这个项目的第一需求恰恰就是
+     「一个班 20 块板子」，课堂里永远是这个数。当时没人发现，是因为本套 E2E
+     只起 2 块假板子（见 tools/probe_20dev.py：那个才真的喂 20 台进去看）。
+     这里守的是**上限本身**：没有 max-height 就直接红。 */
+  await step('设备列表有高度上限（20 台时不会把主内容顶出首屏）', async () => {
+    const r = await page.evaluate(() => {
+      const el = document.getElementById('devs');
+      if (!el) return { err: '找不到 #devs' };
+      const cs = getComputedStyle(el);
+      return { maxHeight: cs.maxHeight, overflowY: cs.overflowY };
+    });
+    if (r.err) throw new Error(r.err);
+    if (!r.maxHeight || r.maxHeight === 'none') {
+      throw new Error('#devs 没有 max-height —— 设备一多就会把整页撑开（' + r.maxHeight + '）');
+    }
+    if (r.overflowY !== 'auto' && r.overflowY !== 'scroll') {
+      throw new Error('#devs 限了高却没开滚动（overflow-y:' + r.overflowY + '），设备会够不着');
+    }
+    console.log('     max-height:' + r.maxHeight + '  overflow-y:' + r.overflowY);
+  });
+
   await step('带 hidden 的元素真的不显示（作者 display 没盖掉它）', async () => {
     const bad = await page.evaluate(() => {
       const out = [];
