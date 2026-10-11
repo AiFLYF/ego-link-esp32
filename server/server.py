@@ -2182,7 +2182,19 @@ DASHBOARD_HTML = """<!doctype html>
   --radius-card:10px;     /* 卡片 / 面板 / 画面 / 图表 */
   --radius-modal:14px;    /* 弹窗 */
 
-  /* ---- 字号：正文 15 → 卡片标题 19 → 区域标题 24 → hero 48 ---- */
+  /* ---- 字号：正文 15 → 卡片标题 19 → 区域标题 24 → hero 48 ----
+     另有**两档小而固定的字号**，同样只走令牌、不许写裸 px：
+       --fs-micro  微型标签：全大写 + 字距（.14~.16em）的等宽小字，
+                   用在「加加速度 / 倾角 / 设置项名」这类**标签**上，
+                   以及等宽的 meta 行（事件时间、图例、页脚）。
+       --fs-meta   出处/提示类小字（.src / .hint / .empty / 下拉框）。
+     2026-10-11 收口：原先 10.5 / 11 / 11.5px 三种值散落在 13 处硬编码，
+     与"字号只 4 级"的声明自相矛盾，且改一处就得找十处。现在全部归一到
+     --fs-micro（≤1px 的视觉变化），并由 e2e_design 的断言守住"不许再写裸 px"。
+     ⚠️ 唯一例外：表单控件 16px（见文件末尾 input/select 那条）——
+     那是**平台约束**（iOS 上 < 16px 的输入框获得焦点会自动放大页面），
+     不是排版选择，写死在控件规则里。 */
+  --fs-micro:11.5px;
   --fs-meta:12.5px;
   --fs-body:15px;
   --fs-h3:19px;    /* 卡片 / 面板标题 */
@@ -2369,7 +2381,7 @@ h1,h2,h3{font-family:var(--font-display);text-wrap:balance}
 .brand .mark svg{width:15px;height:15px;display:block}
 .brand b{font:600 var(--fs-body)/1.2 var(--font-display);letter-spacing:-.01em}
 .brand span{
-  font:500 10.5px/1 var(--font-mono);letter-spacing:.16em;text-transform:uppercase;
+  font:500 var(--fs-micro)/1 var(--font-mono);letter-spacing:.16em;text-transform:uppercase;
   color:var(--color-text-faint);
 }
 .appbar .gap{flex:1 1 auto}
@@ -2432,7 +2444,7 @@ h1,h2,h3{font-family:var(--font-display);text-wrap:balance}
   align-items:center;justify-content:center;gap:var(--sp-1);
 }
 .ring-mid b{font:600 var(--fs-h2)/1 var(--font-mono);font-variant-numeric:tabular-nums}
-.ring-mid span{font:500 11px/1 var(--font-mono);letter-spacing:.14em;color:var(--color-text-faint)}
+.ring-mid span{font:500 var(--fs-micro)/1 var(--font-mono);letter-spacing:.14em;color:var(--color-text-faint)}
 
 /* hero 标题：全页最大的字。48px = 正文 15px 的 3.2 倍。 */
 .hero-word{
@@ -2446,7 +2458,7 @@ h1,h2,h3{font-family:var(--font-display);text-wrap:balance}
 .hero-metrics{display:flex;gap:var(--sp-8);margin-top:var(--sp-6);flex-wrap:wrap}
 .hero-metrics>div{display:flex;flex-direction:column;gap:var(--sp-2)}
 .hero-metrics dt{
-  font:500 10.5px/1 var(--font-mono);letter-spacing:.14em;
+  font:500 var(--fs-micro)/1 var(--font-mono);letter-spacing:.14em;
   text-transform:uppercase;color:var(--color-text-faint);
 }
 .hero-metrics dd{font:600 var(--fs-h3)/1.1 var(--font-mono);font-variant-numeric:tabular-nums}
@@ -2502,7 +2514,7 @@ h1,h2,h3{font-family:var(--font-display);text-wrap:balance}
 .reply .tag{
   /* 字距收到 .08em：这个标签是"拉丁 + 中文"混排（AI 回复），
      等宽字体上 .16em 的字距会把 A 和 I 拉得像两个词，中文也跟着散。 */
-  font:600 11px/1 var(--font-mono);letter-spacing:.08em;text-transform:uppercase;
+  font:600 var(--fs-micro)/1 var(--font-mono);letter-spacing:.08em;text-transform:uppercase;
   color:var(--color-text-faint);
 }
 .reply .txt{font-size:var(--fs-body);color:var(--color-text-muted);white-space:pre-wrap;word-break:break-word}
@@ -2516,7 +2528,7 @@ h1,h2,h3{font-family:var(--font-display);text-wrap:balance}
 .askrow input{flex:1 1 200px;min-width:0}
 .reply-foot{
   margin-top:auto;display:flex;justify-content:space-between;gap:var(--sp-4);flex-wrap:wrap;
-  font:400 11.5px/1.5 var(--font-mono);color:var(--color-text-faint);
+  font:400 var(--fs-micro)/1.5 var(--font-mono);color:var(--color-text-faint);
 }
 .reply.pending::after{
   content:"";position:absolute;right:0;top:0;
@@ -2619,7 +2631,7 @@ h1,h2,h3{font-family:var(--font-display);text-wrap:balance}
 .dev .dot.off{animation:breathe var(--dur-3) var(--ease-in-out) infinite}
 .dev .did{font:600 var(--fs-body)/1.3 var(--font-display);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .dev .meta{
-  font:400 11.5px/1.5 var(--font-mono);color:var(--color-text-faint);
+  font:400 var(--fs-micro)/1.5 var(--font-mono);color:var(--color-text-faint);
   overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
 }
 
@@ -2678,7 +2690,7 @@ input::placeholder{color:var(--color-text-faint)}
 input:focus,select:focus{outline:none;border-color:var(--color-action-primary);box-shadow:var(--ring)}
 select{padding-right:var(--sp-2);font-family:var(--font-mono);font-size:var(--fs-meta)}
 .field{display:flex;flex-direction:column;gap:var(--sp-2)}
-.field>label{font:500 10.5px/1 var(--font-mono);letter-spacing:.14em;text-transform:uppercase;color:var(--color-text-faint)}
+.field>label{font:500 var(--fs-micro)/1 var(--font-mono);letter-spacing:.14em;text-transform:uppercase;color:var(--color-text-faint)}
 .formrow{display:flex;gap:var(--sp-4);flex-wrap:wrap;align-items:flex-end}
 .actions{display:flex;align-items:center;gap:var(--sp-3);flex-wrap:wrap}
 
@@ -2703,9 +2715,9 @@ select{padding-right:var(--sp-2);font-family:var(--font-mono);font-size:var(--fs
 .item>*{min-width:0}
 .item:last-child{border-bottom:0}
 .item .name{color:var(--color-text);font-weight:600;font-family:var(--font-display)}
-.item .meta{color:var(--color-text-faint);font-size:11.5px;font-family:var(--font-mono)}
+.item .meta{color:var(--color-text-faint);font-size:var(--fs-micro);font-family:var(--font-mono)}
 .st{
-  font:500 11px/1 var(--font-mono);letter-spacing:.06em;
+  font:500 var(--fs-micro)/1 var(--font-mono);letter-spacing:.06em;
   padding:4px var(--sp-2);border-radius:var(--radius-control);
   white-space:nowrap;flex:none;
 }
@@ -2714,7 +2726,7 @@ select{padding-right:var(--sp-2);font-family:var(--font-mono);font-size:var(--fs
 .st-done{background:var(--tint-still);color:var(--color-still)}
 .st-failed,.st-timeout{background:var(--tint-fall);color:var(--color-fall)}
 #feed{max-height:340px;overflow-y:auto}
-#feed .t{color:var(--color-text-faint);font-size:11.5px;flex:none;font-family:var(--font-mono)}
+#feed .t{color:var(--color-text-faint);font-size:var(--fs-micro);flex:none;font-family:var(--font-mono)}
 #feed .k{flex:none;width:7px;height:7px;border-radius:50%;margin-top:6px}
 .k-info{background:var(--color-text-faint)}
 .k-motion{background:var(--color-move)}
@@ -2725,7 +2737,7 @@ select{padding-right:var(--sp-2);font-family:var(--font-mono);font-size:var(--fs
 
 /* ---- 曲线 ---- */
 #cv{width:100%;height:144px;display:block;border-radius:var(--radius-card)}
-.legend{display:flex;gap:var(--sp-6);font:400 11.5px/1 var(--font-mono);color:var(--color-text-faint);flex-wrap:wrap}
+.legend{display:flex;gap:var(--sp-6);font:400 var(--fs-micro)/1 var(--font-mono);color:var(--color-text-faint);flex-wrap:wrap}
 .legend i{display:inline-block;width:12px;height:3px;border-radius:var(--radius-control);vertical-align:middle;margin-right:var(--sp-2)}
 
 /* ---- 摄像头 ---- */
@@ -2761,14 +2773,14 @@ select{padding-right:var(--sp-2);font-family:var(--font-mono);font-size:var(--fs
   align-items:center;justify-content:center;line-height:1.15;
 }
 .ring .ringtxt b{font:600 var(--fs-h3)/1 var(--font-mono)}
-.ring .ringtxt span{font:500 10.5px/1 var(--font-mono);letter-spacing:.14em;color:var(--color-text-faint)}
+.ring .ringtxt span{font:500 var(--fs-micro)/1 var(--font-mono);letter-spacing:.14em;color:var(--color-text-faint)}
 .ringmeta{font:400 var(--fs-meta)/1.9 var(--font-mono);color:var(--color-text-muted)}
 .ringmeta .k{color:var(--color-text-faint)}
 
 footer{
   border-top:1px solid var(--color-line);
   padding-block:var(--sp-8);
-  color:var(--color-text-faint);font:400 11.5px/1.9 var(--font-mono);
+  color:var(--color-text-faint);font:400 var(--fs-micro)/1.9 var(--font-mono);
 }
 
 /* ==========================================================================

@@ -31,12 +31,25 @@ import verify_server as vs          # noqa: E402  复用 firmware_body / CHILD_E
 OUT = os.path.join(ROOT, ".workbuddy-ai", "tmp")
 N = int(os.environ.get("PROBE_N", "20"))
 
+# 要量哪些视口。默认扫一遍常见分辨率 + 两个断点贴边的值：
+#   1920/1440 = 三列布局；1280 恰好是断点（≤1280 塌成两列）；
+#   1024 是一列；320 是手机。
+# 只量 1280 会把"断点"和"设备列表太高"两件事混在一起（见 PROBE_JS 里的注释）。
+DEFAULT_VIEWPORTS = [[1920, 1080, "fhd"], [1440, 900, "wide"],
+                     [1280, 900, "bp1280"], [1024, 768, "bp1024"],
+                     [320, 720, "narrow"]]
+
 PROBE_JS = r"""
 const { chromium } = require('playwright-core');
 (async () => {
   const b = await chromium.launch({ channel: 'chrome' });
   const out = [];
-  for (const [w, h, tag] of [[1280, 900, 'wide'], [320, 720, 'narrow']]) {
+  /* 视口列表由 Python 侧传进来（PROBE_VIEWPORTS）。**必须扫多个宽度**：
+     1280 恰好是 .stage-grid 从三列塌成两列的断点，只量它一个会把
+     "断点把 hero-ai 挤到第二行"误读成"设备列表太长"（T64 的同一个教训：
+     夹具规模/覆盖面本身是覆盖面的一部分）。 */
+  const VPS = JSON.parse(process.env.PROBE_VIEWPORTS || '[]');
+  for (const [w, h, tag] of VPS) {
     const page = await b.newPage({ viewport: { width: w, height: h } });
     const errs = [];
     page.on('pageerror', e => errs.push(String(e)));
@@ -68,6 +81,12 @@ const { chromium } = require('playwright-core');
         rowH: devs[0] ? Math.round(devs[0].getBoundingClientRect().height) : 0,
         aiCard: box('.hero-ai'),
         c3d: box('#card3d'),
+        heroWord: box('.hero-word'),
+        /* .stage-grid 是几列、hero-ai 落在哪个 grid-column ——
+           这是"AI 卡片被挤下去"到底是断点造成的、还是设备列表造成的分水岭 */
+        gridCols: getComputedStyle(document.querySelector('.stage-grid'))
+                    .gridTemplateColumns.split(' ').length,
+        aiCol: getComputedStyle(document.querySelector('.hero-ai')).gridColumn,
       };
     });
     const png = process.env.PROBE_OUT + '/dash-20dev-' + tag + '.png';
@@ -112,14 +131,21 @@ def main():
         live = vs.get_json(base + "/api/devices").get("devices", [])
         print("喂进去 %d 台，服务端在册 %d 台" % (len(devs), len(live)))
 
+        vps = json.loads(os.environ.get("PROBE_VIEWPORTS") or "null") or DEFAULT_VIEWPORTS
         env = dict(os.environ)
         env["PROBE_URL"] = base + "/"
         env["PROBE_OUT"] = OUT.replace(os.sep, "/")
+        env["PROBE_VIEWPORTS"] = json.dumps(vps)
         js = os.path.join(tempfile.gettempdir(), "rw1_probe20.js")
         with open(js, "w", encoding="utf-8") as fh:
             fh.write(PROBE_JS)
+        # 超时**按视口数算**，别写死：一个视口 ≈ 一次冷启动 Chrome + 加载 20 台设备
+        # 的整页 + 等 2.5s + 截图，实测 40~70 秒（沙箱里进程创建本身就慢，见手册 T59）。
+        # 原来写死 180s 是照 2 个视口给的余量；加到 5 个视口会**稳定超时**
+        # （2026-10-11 踩到：TimeoutExpired 而不是断言失败，看着像探针坏了）。
+        timeout = 150 * len(vps) + 60
         p = subprocess.run([os.environ.get("NODE", "node"), js],
-                           capture_output=True, text=True, env=env, timeout=180)
+                           capture_output=True, text=True, env=env, timeout=timeout)
         for line in (p.stdout or "").splitlines():
             if line.startswith("PROBE_JSON="):
                 for item in json.loads(line[len("PROBE_JSON="):]):
@@ -128,8 +154,12 @@ def main():
                     print("   页面总高 %d px / 视口 %d px（%.1f 屏）"
                           % (item["pageHeight"], item["viewport"],
                              item["pageHeight"] / float(item["viewport"])))
+                    print("   stage-grid 列数: %s（hero-ai 落在 grid-column:%s）"
+                          % (item.get("gridCols"), item.get("aiCol")))
                     if item.get("devCard"):
                         print("   设备卡片: top=%d 高=%d" % (item["devCard"]["top"], item["devCard"]["h"]))
+                    if item.get("heroWord"):
+                        print("   hero 活动词: top=%d" % item["heroWord"]["top"])
                     if item.get("aiCard"):
                         print("   AI 卡片: top=%d（首屏 %d px，%s）"
                               % (item["aiCard"]["top"], item["viewport"],
