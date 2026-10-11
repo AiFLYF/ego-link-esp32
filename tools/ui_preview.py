@@ -35,7 +35,7 @@ import os
 import re
 import sys
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -147,6 +147,36 @@ def box(draw: ImageDraw.ImageDraw, x, y, w, h, fill=None, outline=None,
 
 def circle(draw, cx, cy, r, fill=None, outline=None, width=1):
     draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=fill, outline=outline, width=width)
+
+
+def shadow(img, x, y, w, h, radius=8, blur=6, dy=4, alpha=70):
+    """LVGL 的 shadow_width / shadow_ofs_y 语义：在控件下方铺一团模糊的黑。
+
+    与 ui.c 的 add_elevation() 一一对应 —— 深色界面靠"更黑"分层，
+    不是靠把描边调亮。必须在画控件**之前**调（阴影垫在底下），
+    返回新的 ImageDraw（因为 alpha 合成换掉了像素缓冲）。
+    """
+    pad = blur * 2 + 4
+    lay = Image.new("RGBA", (w + pad * 2, h + pad * 2), (0, 0, 0, 0))
+    ImageDraw.Draw(lay).rounded_rectangle(
+        [pad, pad + dy, pad + w - 1, pad + h - 1 + dy],
+        radius=radius, fill=(0, 0, 0, alpha))
+    lay = lay.filter(ImageFilter.GaussianBlur(blur))
+    base = img.convert("RGBA")
+    base.alpha_composite(lay, (int(x) - pad, int(y) - pad))
+    img.paste(base.convert("RGB"), (0, 0))
+    return ImageDraw.Draw(img)
+
+
+def sheen(img, x, y, w, base, alpha=24):
+    """顶面 1px 内高光（对应 ui.c 的 add_sheen()）：一条很淡的白线。
+    `base` 是高光底下那层的颜色（卡顶 = 渐变上端 CARD_HI）——
+    预览画布是 RGB 的不吃 alpha，所以这里直接把混合结果算出来画上去。
+    只在深色底上看得见，和板端一样只给 AI 卡片这一处用。"""
+    c = tuple(int(v + (255 - v) * alpha / 255) for v in base)
+    d = ImageDraw.Draw(img)
+    d.line([(int(x) + 1, int(y)), (int(x) + int(w) - 2, int(y))], fill=c, width=1)
+    return d
 
 
 def arc(draw, cx, cy, r, start_deg, end_deg, color, width):
@@ -318,15 +348,19 @@ class Renderer:
 
         # ---------------- 左面板：活动环 ----------------
         px, py = e["UI_PANEL_LX"], e["UI_PANEL_Y"]
+        # 阴影先垫底（对应板端 add_elevation），再画面板本体
+        d = shadow(img, px, py, e["UI_PANEL_W"], e["UI_PANEL_H"], radius=e["UI_PANEL_R"])
         # 边框随活动色微染（板端 border_opa=80/255 ≈ 31% 活动色与 LINE 混合）
         edge = tuple(int(C["LINE"][i] + (act_c[i] - C["LINE"][i]) * 80 / 255) for i in range(3))
         box(d, px, py, e["UI_PANEL_W"], e["UI_PANEL_H"], fill=C["CARD"],
-            outline=edge, radius=16)
+            outline=edge, radius=e["UI_PANEL_R"])
 
         if kind == 5:      # 跌落：环外呼吸红光（预览图取呼吸中段的不透明度）
-            gd = e["UI_RING_D"] + 14
+            # 与 ui.c 的 build_activity_panel() 保持同一套算法：
+            # 直径 = RING_D+4、y = RING_Y-2（贴着面板内沿，不被裁）
+            gd = e["UI_RING_D"] + 4
             gx = px + (e["UI_PANEL_W"] - gd) // 2
-            gy = py + e["UI_RING_Y"] - 7
+            gy = py + e["UI_RING_Y"] - 2
             ov = Image.new("RGBA", img.size, (0, 0, 0, 0))
             ImageDraw.Draw(ov).ellipse([gx, gy, gx + gd - 1, gy + gd - 1],
                                        outline=act_c + (150,), width=2)
@@ -359,8 +393,9 @@ class Renderer:
 
         # ---------------- 右面板：姿态球 ----------------
         px = e["UI_PANEL_RX"]
+        d = shadow(img, px, py, e["UI_PANEL_W"], e["UI_PANEL_H"], radius=e["UI_PANEL_R"])
         box(d, px, py, e["UI_PANEL_W"], e["UI_PANEL_H"], fill=C["CARD"],
-            outline=C["LINE"], radius=16)
+            outline=C["LINE"], radius=e["UI_PANEL_R"])
 
         bd = e["UI_BALL_D"]
         bx0 = px + (e["UI_PANEL_W"] - bd) // 2
@@ -441,6 +476,7 @@ class Renderer:
 
         # ---------------- AI 回复卡片 ----------------
         cy0 = e["UI_CARD_Y"]
+        d = shadow(img, e["UI_CARD_X"], cy0, e["UI_CARD_W"], e["UI_CARD_H"], radius=14)
         box(d, e["UI_CARD_X"], cy0, e["UI_CARD_W"], e["UI_CARD_H"], fill=C["CARD"],
             outline=C["LINE"], radius=14)
         # 卡片顶部那道渐亮，用几行淡色叠出来
@@ -449,6 +485,9 @@ class Renderer:
             d.line([(e["UI_CARD_X"] + 1, cy0 + 1 + i),
                     (e["UI_CARD_X"] + e["UI_CARD_W"] - 2, cy0 + 1 + i)],
                    fill=tuple(min(255, C["CARD"][k] + a) for k in range(3)))
+        # 顶面 1px 内高光（对应板端 add_sheen），压在渐变最亮的那一端
+        d = sheen(img, e["UI_CARD_X"], cy0 + 1, e["UI_CARD_W"],
+                  tuple(min(255, C["CARD"][k] + 14) for k in range(3)))
 
         # 左侧 AI 蓝竖条（在渐变叠色之后画，避免被盖）
         box(d, e["UI_CARD_X"], cy0 + 12, e["UI_STRIPE_W"], e["UI_CARD_H"] - 24,
