@@ -2342,6 +2342,33 @@ body{
 }
 h1,h2,h3{font-family:var(--font-display);text-wrap:balance}
 .mono{font-family:var(--font-mono);font-variant-numeric:tabular-nums}
+
+/* ---- 质感地基（2026-10-12 补）------------------------------------------
+   令牌规则一条没动（OKLCH / 圆角三值 / 8px 网格 / 字号阶梯），
+   这里补的是**执行层**那几处最容易被看出"没打磨"的地方：
+     · 选中文字：默认那条浏览器亮蓝，在任何定制配色里都是外来物
+     · 滚动条：深色 UI 里那条亮灰宽条，是"半成品"最直白的证据
+     · 段落换行：中文长段落末行只剩一两个字时，右缘看着是破的
+   全部走令牌，不引入新色值。 */
+::selection{background:var(--color-action-primary-soft);color:var(--color-text)}
+
+/* 滚动条：细条 + 圆角 + 悬停才提亮，平时几乎隐形，滚起来又不丢手感。
+   Firefox 用标准属性；WebKit 用伪元素。宽度刻意取 10px（不是 8）：
+   里面套 3px 透明边框后可见部分正好 4px，视觉上和 Firefox 的 thin 一致。 */
+*{scrollbar-width:thin;scrollbar-color:var(--color-line-strong) transparent}
+::-webkit-scrollbar{width:10px;height:10px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{
+  background-color:var(--color-line-strong);
+  border-radius:var(--radius-control);
+  border:3px solid transparent;background-clip:content-box;
+}
+::-webkit-scrollbar-thumb:hover{background-color:var(--color-text-faint);background-clip:content-box}
+::-webkit-scrollbar-corner{background:transparent}
+
+/* 中文段落：避免末行孤字（widow）。标题那边用的是 balance（各行长短均衡），
+   正文用 pretty 更合适 —— 它只动最后几行，不会把整段重排得奇形怪状。 */
+.hint,.empty,.region-sub,.reply .txt{text-wrap:pretty}
 .shell{max-width:var(--w-max);margin:0 auto;padding-inline:var(--sp-8)}
 /* 三类辅助文字，权重依次退下去 */
 .src{font:400 var(--fs-meta)/1.5 var(--font-mono);color:var(--color-text-faint)}
@@ -2365,7 +2392,12 @@ h1,h2,h3{font-family:var(--font-display);text-wrap:balance}
   background:var(--appbar-bg);
   backdrop-filter:blur(16px) saturate(140%);
   border-bottom:1px solid var(--color-line);
+  /* 滚动后顶栏轻轻"浮起来"：加一道阴影 + 描边提一档。
+     不滚的时候它是完全贴着页面的一层 —— 动静对比才成立。 */
+  transition:box-shadow var(--dur-2) var(--ease-out),
+             border-color var(--dur-2) var(--ease-out);
 }
+.appbar.scrolled{box-shadow:var(--shadow-1);border-bottom-color:var(--color-line-strong)}
 .appbar .shell{
   min-height:56px;display:flex;align-items:center;gap:var(--sp-6);
   flex-wrap:wrap;padding-block:var(--sp-2);
@@ -2589,11 +2621,40 @@ h1,h2,h3{font-family:var(--font-display);text-wrap:balance}
   border:1px solid var(--color-line);
   border-radius:var(--radius-card);
   background:var(--color-surface);
-  box-shadow:var(--shadow-1);
+  /* inset 那一截是顶面 1px 内高光（--sheen 深色下是 5% 白、浅色下透明），
+     和弹窗 dialog.modal 用的是同一个令牌 —— "光从上方来"全站只此一种说法。
+     浅色主题里它是 transparent，所以两套主题共用这一条声明不会穿帮。 */
+  box-shadow:var(--shadow-1), inset 0 1px 0 var(--sheen);
+  transition:box-shadow var(--dur-2) var(--ease-out),
+             border-color var(--dur-2) var(--ease-out);
 }
+/* 悬停：只**加深一层阴影 + 描边提一档**，不位移、不缩放。
+   位移（translateY）会让整排卡片一起抖，页面里卡片多时非常廉价；
+   用阴影层次表达"可交互"是更稳的做法。inset 高光两档都要带着，
+   否则悬停那一瞬间顶面高光会"闪没"。 */
+.card:hover{box-shadow:var(--shadow-2), inset 0 1px 0 var(--sheen);border-color:var(--color-line-strong)}
+
 .card-head{display:flex;align-items:baseline;justify-content:space-between;gap:var(--sp-4);flex-wrap:wrap}
 .card-head h3{font:600 var(--fs-h3)/1.2 var(--font-display);letter-spacing:-.015em}
 .card-head h3.sm{font-size:var(--fs-body)}
+
+/* ---- 图标系统（2026-10-12 新增）----------------------------------------
+   之前全站只有 brand mark 和主题切换两个 SVG，卡片标题一律裸文字 ——
+   一屏六张卡没有视觉锚点，扫读时找不到"这张是干什么的"。
+   统一规格：24 viewBox / 1.8 描边 / 圆头圆角 / currentColor，
+   与既有的两个图标完全一致，所以看起来像"一直就有"。
+
+   ⚠️ 排版上刻意用 `vertical-align:-2px` 而不是 flex 居中：
+   卡片标题是 baseline 对齐的（右边还有 .src 小字），用 flex 会把
+   整行的基线抬起来，破坏和右端文字的对齐关系。 */
+.ico{width:15px;height:15px;flex:none;display:inline-block;vertical-align:-2px;stroke:currentColor;fill:none}
+.card-head h3 .ico{color:var(--color-action-primary);opacity:.85}
+.pill .ico{width:11px;height:11px;vertical-align:-1px;opacity:.8}
+/* 区域标题比卡片标题大一级（24 vs 19），图标跟着放大一档，
+   否则同一个 .ico 在两种标题上会一边显小一边显大。 */
+.region-head h2 .ico{width:17px;height:17px;vertical-align:-3px;color:var(--color-action-primary);opacity:.7}
+.panel-title .ico{width:14px;height:14px;vertical-align:-2px;color:var(--color-action-primary);opacity:.75}
+.reply .tag .ico{width:13px;height:13px;vertical-align:-2px;color:inherit;opacity:1}
 
 /* ---- 设备列表（多板场景；只有一台时整块不出现） ----
    做成**表格式的行**而不是卡片：设备是重复项，一屏可能有 20 台，
@@ -2796,6 +2857,13 @@ dialog.modal{
   box-shadow:var(--shadow-3), inset 0 1px 0 var(--sheen);
 }
 dialog.modal::backdrop{background:var(--modal-backdrop);backdrop-filter:blur(3px)}
+/* 进出场动效：用 animation 而不是 transition —— <dialog> 的显示/隐藏
+   是 display 的切换，transition 抓不到中间态（点了没反应）。
+   运动距离刻意只有 8px：弹窗是"打断"，不是"转场"，动大了会显得急。 */
+dialog.modal[open]{animation:modal-in var(--dur-2) var(--ease-out)}
+dialog.modal[open]::backdrop{animation:modal-veil var(--dur-2) var(--ease-out)}
+@keyframes modal-in{from{opacity:0;transform:translateY(8px) scale(.985)}to{opacity:1;transform:none}}
+@keyframes modal-veil{from{opacity:0}to{opacity:1}}
 .modal-body{padding:var(--sp-8) var(--sp-8) var(--sp-6);display:grid;gap:var(--sp-3)}
 .modal-body h3{font:600 var(--fs-h2)/1.25 var(--font-display);letter-spacing:-.015em}
 .modal-body p{font-size:var(--fs-body);color:var(--color-text-muted)}
@@ -2878,8 +2946,8 @@ dialog.modal::backdrop{background:var(--modal-backdrop);backdrop-filter:blur(3px
     <div class="gap"></div>
     <div class="status">
       <span id="dev" class="pill off"><i></i>离线</span>
-      <span id="hzp" class="pill">— Hz</span>
-      <span id="postsp" class="pill">↑0 帧</span>
+      <span id="hzp" class="pill"><svg class="ico" viewBox="0 0 24 24" stroke-width="1.8" aria-hidden="true"><path d="M3 15.5c2-4 4-4 6 0s4 4 6 0 4-4 6 0"/></svg> <span id="hzv">— Hz</span></span>
+      <span id="postsp" class="pill"><svg class="ico" viewBox="0 0 24 24" stroke-width="1.8" aria-hidden="true"><path d="M12 19V5M6.5 10.5L12 5l5.5 5.5"/></svg> <span id="postv">↑0 帧</span></span>
       <button id="theme" class="icon" type="button" title="切换主题" aria-label="切换主题">
         <svg class="i-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true">
           <circle cx="12" cy="12" r="4.2"></circle>
@@ -2896,7 +2964,7 @@ dialog.modal::backdrop{background:var(--modal-backdrop);backdrop-filter:blur(3px
 <main class="shell">
   <section class="region" id="devcard" hidden>
     <div class="region-head">
-      <h2>设备</h2>
+      <h2><svg class="ico" viewBox="0 0 24 24" stroke-width="1.8" aria-hidden="true"><rect x="7" y="7" width="10" height="10" rx="2"/><rect x="10.5" y="10.5" width="3" height="3" rx="1"/><path d="M10 4v3M14 4v3M10 17v3M14 17v3M4 10h3M4 14h3M17 10h3M17 14h3"/></svg> 设备</h2>
       <div class="region-tools">
         <span class="src" id="devcount"></span>
         <button id="devall" class="sm">全选</button>
@@ -2939,7 +3007,7 @@ dialog.modal::backdrop{background:var(--modal-backdrop);backdrop-filter:blur(3px
 
       <div class="hero-attitude">
         <div class="panel-head">
-          <span class="panel-title">姿态</span>
+          <span class="panel-title"><svg class="ico" viewBox="0 0 24 24" stroke-width="1.8" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M15.4 8.6l-2.2 5.3-5.3 2.2 2.2-5.3z"/></svg> 姿态</span>
           <span class="src mono" id="tilt">倾角 —</span>
         </div>
         <div class="ball">
@@ -2957,7 +3025,7 @@ dialog.modal::backdrop{background:var(--modal-backdrop);backdrop-filter:blur(3px
 
       <div class="hero-ai">
         <div class="reply" id="replybox">
-          <span class="tag">AI 回复</span>
+          <span class="tag"><svg class="ico" viewBox="0 0 24 24" stroke-width="1.8" aria-hidden="true"><path d="M12 3l1.9 4.9L19 9.8l-4.2 3.2L16.2 19 12 16.2 7.8 19l1.4-6L5 9.8l5.1-1.9z"/></svg> AI 回复</span>
           <div class="txt" id="reply">还没有提问。</div>
           <div class="reply-foot">
             <span>按板子 BOOT 键提问，<b>三击</b>说话</span>
@@ -2988,7 +3056,7 @@ dialog.modal::backdrop{background:var(--modal-backdrop);backdrop-filter:blur(3px
 
     <div class="stage-block">
       <div class="panel-head">
-        <span class="panel-title">合加速度 |a|</span>
+        <span class="panel-title"><svg class="ico" viewBox="0 0 24 24" stroke-width="1.8" aria-hidden="true"><path d="M3 16.5l4.5-5 3.5 3 3-6.5 3.5 4 3.5-5"/></svg> 合加速度 |a|</span>
         <span class="src">最近 8 秒 · 服务端降采样</span>
       </div>
       <canvas id="cv" role="img" aria-label="合加速度 |a| 最近 8 秒的曲线"></canvas>
@@ -3002,13 +3070,13 @@ dialog.modal::backdrop{background:var(--modal-backdrop);backdrop-filter:blur(3px
 
   <section class="region">
     <div class="region-head">
-      <h2>远程操作</h2>
+      <h2><svg class="ico" viewBox="0 0 24 24" stroke-width="1.8" aria-hidden="true"><path d="M12 13.5v7"/><circle cx="12" cy="10" r="2.2"/><path d="M8.4 6.6a5 5 0 0 1 7.2 0M5.8 4a8.6 8.6 0 0 1 12.4 0"/></svg> 远程操作</h2>
       <p class="region-sub">指令搭在「下一帧遥测的响应」里下发，板子在再下一帧回传结果 —— 一次真实的硬件往返。</p>
     </div>
     <div class="cols">
       <div class="card lead" id="cardcmd">
         <div class="card-head">
-          <h3>指令记录</h3>
+          <h3><svg class="ico" viewBox="0 0 24 24" stroke-width="1.8" aria-hidden="true"><rect x="2.5" y="4.5" width="19" height="15" rx="2"/><path d="M7 10l2.6 2.4L7 15M12.5 15h4"/></svg> 指令记录</h3>
           <span class="src">最近 8 条</span>
         </div>
         <div class="formrow">
@@ -3024,7 +3092,7 @@ dialog.modal::backdrop{background:var(--modal-backdrop);backdrop-filter:blur(3px
 
       <div class="card" id="cardfeed">
         <div class="card-head">
-          <h3>事件流</h3>
+          <h3><svg class="ico" viewBox="0 0 24 24" stroke-width="1.8" aria-hidden="true"><path d="M2.5 12h4l2.2-5 3.1 10 2.7-7 1.8 2h5.2"/></svg> 事件流</h3>
           <span class="src" id="evcount"></span>
         </div>
         <div id="feed"></div>
@@ -3034,13 +3102,13 @@ dialog.modal::backdrop{background:var(--modal-backdrop);backdrop-filter:blur(3px
 
   <section class="region">
     <div class="region-head">
-      <h2>设备与画面</h2>
+      <h2><svg class="ico" viewBox="0 0 24 24" stroke-width="1.8" aria-hidden="true"><rect x="2.5" y="4" width="19" height="12.5" rx="2"/><path d="M9 20h6M12 16.5V20"/></svg> 设备与画面</h2>
       <p class="region-sub">板子是 HTTP 客户端，没有自己的服务端，所以画面由板子推上来、网页从这里取。</p>
     </div>
     <div class="cols">
       <div class="card lead" id="cardcam">
         <div class="card-head">
-          <h3>摄像头</h3>
+          <h3><svg class="ico" viewBox="0 0 24 24" stroke-width="1.8" aria-hidden="true"><path d="M3 8.5A2 2 0 0 1 5 6.5h1.8l1.3-2h6.9l1.3 2H19a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><circle cx="12" cy="12.5" r="3.4"/></svg> 摄像头</h3>
           <span class="src" id="camwho">—</span>
         </div>
         <div class="camwrap">
@@ -3073,7 +3141,7 @@ dialog.modal::backdrop{background:var(--modal-backdrop);backdrop-filter:blur(3px
           </div>
         </div>
         <div class="card-head" style="margin-top:var(--sp-2)">
-          <h3 class="sm">本机照片存档</h3>
+          <h3 class="sm"><svg class="ico" viewBox="0 0 24 24" stroke-width="1.8" aria-hidden="true"><rect x="3" y="4.5" width="18" height="15" rx="2"/><path d="M3 15l4.5-4.5 4 4 3-3L21 17"/><circle cx="8.6" cy="9" r="1.4"/></svg> 本机照片存档</h3>
           <span class="src" id="shotwho">—</span>
         </div>
         <div class="list" id="shotlist"></div>
@@ -3081,7 +3149,7 @@ dialog.modal::backdrop{background:var(--modal-backdrop);backdrop-filter:blur(3px
 
       <div class="card" id="card3d" hidden>
         <div class="card-head">
-          <h3>板子姿态 · 3D</h3>
+          <h3><svg class="ico" viewBox="0 0 24 24" stroke-width="1.8" aria-hidden="true"><path d="M12 2.8l8 4.4v9.6l-8 4.4-8-4.4V7.2z"/><path d="M4 7.2l8 4.4 8-4.4M12 11.6V21"/></svg> 板子姿态 · 3D</h3>
           <span class="src" id="d3src">—</span>
         </div>
         <div class="field">
@@ -3105,13 +3173,13 @@ dialog.modal::backdrop{background:var(--modal-backdrop);backdrop-filter:blur(3px
 
   <section class="region">
     <div class="region-head">
-      <h2>板子管理</h2>
+      <h2><svg class="ico" viewBox="0 0 24 24" stroke-width="1.8" aria-hidden="true"><path d="M4 7h11M18 7h2M4 12h2M9 12h11M4 17h11M18 17h2"/><circle cx="16.5" cy="7" r="1.9"/><circle cx="7.5" cy="12" r="1.9"/><circle cx="16.5" cy="17" r="1.9"/></svg> 板子管理</h2>
       <p class="region-sub">改完通过「下一帧遥测的响应」下发到板子并写入 NVS；空着 = 不改那一项。</p>
     </div>
     <div class="cols">
       <div class="card lead" id="cardcfg">
         <div class="card-head">
-          <h3>板子设置</h3>
+          <h3><svg class="ico" viewBox="0 0 24 24" stroke-width="1.8" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/><circle cx="9" cy="7" r="2"/><circle cx="15" cy="12" r="2"/><circle cx="8" cy="17" r="2"/></svg> 板子设置</h3>
         </div>
         <div class="formrow">
           <div class="field">
@@ -3146,7 +3214,7 @@ dialog.modal::backdrop{background:var(--modal-backdrop);backdrop-filter:blur(3px
 
       <div class="card" id="cardsd">
         <div class="card-head">
-          <h3>存储管理</h3>
+          <h3><svg class="ico" viewBox="0 0 24 24" stroke-width="1.8" aria-hidden="true"><ellipse cx="12" cy="6" rx="7.5" ry="3"/><path d="M4.5 6v6c0 1.7 3.4 3 7.5 3s7.5-1.3 7.5-3V6"/><path d="M4.5 12v6c0 1.7 3.4 3 7.5 3s7.5-1.3 7.5-3v-6"/></svg> 存储管理</h3>
           <span class="src" id="sdwho">—</span>
         </div>
         <div class="actions">
@@ -4308,8 +4376,13 @@ function render(s){
   syncButtons();
 
   $("src").textContent = (s.source && s.source !== "-") ? s.source : "—";
-  $("hzp").textContent = s.sample_hz ? (s.sample_hz + " Hz") : "— Hz";
-  $("postsp").textContent = "↑" + (s.posts_ok !== undefined ? s.posts_ok : 0) + " 帧";
+  /* ⚠️ 只写胶囊**里面那个数值 span**，不要写整个 #hzp / #postsp。
+     那两个胶囊现在各带一个图标（.ico），直接 textContent 赋值会把图标连带抹掉
+     —— 静态 HTML 里有、一刷新就没了，这种"半失效"最难查。
+     #dev 那个胶囊保留了 `<i></i>` 呼吸点，它的 innerHTML 仍然整体重写，
+     因为点和文字是**同一个状态的两部分**，必须一起换。 */
+  $("hzv").textContent = s.sample_hz ? (s.sample_hz + " Hz") : "— Hz";
+  $("postv").textContent = "↑" + (s.posts_ok !== undefined ? s.posts_ok : 0) + " 帧";
   $("steps").textContent = s.step_count;
   $("shakes").textContent = s.shake_count;
   $("mode").textContent = (s.ai_mode || "规则AI") + (s.ai_pending ? " · 生成中…" : "");
@@ -4473,6 +4546,24 @@ function stream(){
     setTimeout(stream, 2000);
   };
 }
+
+/* ---------------- 顶栏滚动阴影 ----------------
+   页面滚起来之后顶栏才"浮"出一道阴影（样式见 .appbar.scrolled）。
+   用 passive 监听 + rAF 合并：滚动是高频事件，回调里只做一次 class 切换，
+   不读布局、不触发重排，所以滚多快都不卡。 */
+(function(){
+  var bar = document.querySelector(".appbar");
+  if (!bar) return;
+  var raf = 0;
+  function upd(){
+    raf = 0;
+    bar.classList.toggle("scrolled", window.scrollY > 4);
+  }
+  addEventListener("scroll", function(){
+    if (!raf) raf = requestAnimationFrame(upd);
+  }, {passive:true});
+  upd();
+})();
 
 /* ---------------- 启动 ---------------- */
 $("host").textContent = location.host;
