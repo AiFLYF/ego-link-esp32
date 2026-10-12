@@ -31,6 +31,7 @@ AI 交互课 · PC 服务器（无需 VPS，自己的电脑即服务器）
 import argparse
 import datetime
 import hashlib
+import hmac
 import io
 import json
 import math
@@ -64,6 +65,16 @@ LLM_TIMEOUT = 25.0        # 大模型请求超时（后台线程里等，不影�
 LLM_MAX_CONCURRENT = int(os.environ.get("RW1_LLM_MAX_CONCURRENT", "4"))
 LLM_QUEUE_TIMEOUT = float(os.environ.get("RW1_LLM_QUEUE_TIMEOUT", "30"))
 _LLM_SEM = threading.BoundedSemaphore(max(1, LLM_MAX_CONCURRENT))
+
+# ---- 访问密钥（可选，默认关）------------------------------------------------
+# 威胁模型：教室里任何连上同一 WiFi 的人。破坏性动作（格式化 SD、删照片）与
+# 花钱的动作（问大模型）**只能从网页来** —— 板子只会上报遥测/帧/音频，
+# 命令永远是服务端**下发**给板子的。所以门这几个网页写入口**不需要动固件**，
+# 老固件照常上报（后向兼容的关键证据：无密钥环境下整套回归全绿）。
+# 不配 RW1_API_TOKEN = 完全关闭，行为与以前逐字节相同。
+# 配了则下面这些接口要求 `X-RW1-Token` 请求头（或 `?token=` 查询参数）。
+API_TOKEN = os.environ.get("RW1_API_TOKEN", "").strip()
+WEB_WRITE_PATHS = ("/api/command", "/api/ask", "/api/ask/cancel", "/api/shots/delete")
 
 # ---- 语音（第 4 周：按键说话 → 识别 → 大模型 → 屏显回复）---------------------
 # 识别两条路**自动选**：配了云端 key 走云端，没配就用本地 whisper；
@@ -1711,6 +1722,19 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path, _, query = self.path.partition("?")
+        # 网页写入口的访问密钥门（API_TOKEN 为空时整段跳过，行为与以前一样）。
+        # 故意**不门** /api/telemetry、/api/frame、/api/audio：那是板子的上报
+        # 通道，老固件没有密钥可带，门了就等于把全班挡在门外（后向兼容 > 洁癖）。
+        if API_TOKEN and path in WEB_WRITE_PATHS:
+            got = (self.headers.get("X-RW1-Token")
+                   or query_param(query, "token") or "")
+            if not hmac.compare_digest(got.encode("utf-8"),
+                                       API_TOKEN.encode("utf-8")):
+                self._send(401, json.dumps(
+                    {"ok": False, "error": "bad token",
+                     "hint": "服务端开启了访问密钥：网页页脚点「🔑 密钥」填写"},
+                    ensure_ascii=False))
+                return
         if path == "/api/telemetry":
             self._telemetry()
         elif path == "/api/command":
@@ -2949,6 +2973,16 @@ footer{
   padding-block:var(--sp-8);
   color:var(--color-text-faint);font:400 var(--fs-micro)/1.9 var(--font-mono);
 }
+/* 页脚访问密钥入口：平时只是一枚和周围文字同重量的小按钮，不占注意力；
+   服务端回 401 时按钮涂成"待处理"色并自动摊开输入框（见 apiFetch）。
+   间距/圆角/颜色全部走现成令牌，不引入新值。 */
+.foot-key{display:inline-flex;align-items:center;gap:var(--sp-2);margin-left:var(--sp-2);vertical-align:middle}
+.foot-key input{
+  height:28px;width:132px;padding:0 var(--sp-2);
+  color:var(--color-text);background:var(--color-surface-2);
+  border:1px solid var(--color-line);border-radius:var(--radius-control);
+}
+#keybtn.want{color:var(--color-danger);border-color:var(--color-danger)}
 
 /* ==========================================================================
    弹窗：全站唯一用 14px 圆角的地方。用原生 <dialog>，
@@ -3337,6 +3371,13 @@ dialog.modal[open]::backdrop{animation:modal-veil var(--dur-2) var(--ease-out)}
   <div class="shell">
     服务器 <span id="host"></span> · <span id="logdir"></span> ·
     页面只用标准库 SSE 推送，不依赖外网；指令白名单 <span id="names"></span>
+    <span class="foot-key">
+      <button id="keybtn" class="sm" type="button">🔑 密钥</button>
+      <span id="keywrap" hidden>
+        <input id="keyinput" type="password" placeholder="访问密钥" autocomplete="new-password">
+        <button id="keysave" class="sm" type="button">保存</button>
+      </span>
+    </span>
   </div>
 </footer>
 
@@ -3356,6 +3397,42 @@ dialog.modal[open]::backdrop{animation:modal-veil var(--dur-2) var(--ease-out)}
 "use strict";
 
 var $ = function(id){ return document.getElementById(id); };
+
+/* ---------------- 访问密钥（可选） ----------------
+   服务端配了 RW1_API_TOKEN 时，网页的写操作（下发指令 / 提问 / 停止 / 删照片）
+   要带 X-RW1-Token。密钥只存在本机 localStorage：课堂就一台教师机，这个共享
+   秘密防的是"班里同学顺手捣乱"，不是定向攻击 —— 所以 UX 是"页脚一个小按钮，
+   需要时才摊开"，不是每次弹窗。
+   没配密钥的服务端：apiToken 为空 → 不求头、行为与以前逐字节相同。 */
+var apiToken = "";
+try { apiToken = localStorage.getItem("rw1-token") || ""; } catch(e) {}
+
+/* 所有网页写入口统一走这里：带头部 + 把 401 换成"结构正常的响应"
+   （调用方的 .then(r=>r.json()) 链条不会炸，错误照常显示在 cmdhint 上），
+   同时摊开页脚密钥框。 */
+function apiFetch(path, opts){
+  opts = opts || {};
+  var headers = opts.headers || {};
+  if (apiToken) headers["X-RW1-Token"] = apiToken;
+  opts.headers = headers;
+  return fetch(path, opts).then(function(r){
+    if (r.status === 401){
+      openKeyBox(true);
+      return new Response(JSON.stringify(
+        {ok:false, error:"需要访问密钥（页脚「🔑 密钥」里填）", need_token:true}),
+        {status:200, headers:{"Content-Type":"application/json"}});
+    }
+    return r;
+  });
+}
+
+/* 摊开/收起页脚密钥框。401 自动摊开并把按钮涂成"待处理"色。 */
+function openKeyBox(focusIt){
+  var w = $("keywrap"), b = $("keybtn");
+  if (w) w.hidden = false;
+  if (b) b.classList.add("want");
+  if (focusIt && $("keyinput")) $("keyinput").focus();
+}
 
 /* 设备名/事件文本都是**外部输入**（板端上报、且设备名由用户在配网页手填），
    拼进 innerHTML 之前必须转义。 */
@@ -3915,7 +3992,7 @@ function doSendCmd(name, btn, overrideParams){
     /* 没勾任何一台 → 就发给"当前查看的那台"（单板场景与以前完全一样） */
     body.device = selDevice;
   }
-  fetch("/api/command", {
+  apiFetch("/api/command", {
     method:"POST", headers:{"Content-Type":"application/json"},
     body: JSON.stringify(body)
   }).then(function(r){ return r.json(); }).then(function(d){
@@ -4046,7 +4123,7 @@ function renderShots(){
             if (btn.getAttribute("data-local")) {
               idbDel(nm, renderShots);
             } else {
-              fetch("/api/shots/delete", {method: "POST",
+              apiFetch("/api/shots/delete", {method: "POST",
                 headers: {"Content-Type": "application/json"},
                 body: JSON.stringify({device: dev, name: nm})}).then(renderShots);
             }
@@ -4750,7 +4827,7 @@ function sendAsk(){
   var t = el ? String(el.value || "").trim() : "";
   if (!t) return;
   el.value = "";
-  fetch("/api/ask" + devQuery(), {
+  apiFetch("/api/ask" + devQuery(), {
     method: "POST",
     headers: {"Content-Type": "application/json"},
     body: JSON.stringify({text: t})
@@ -4842,6 +4919,30 @@ applyTheme(_themeName());
   b.textContent = "播报 " + (ttsOn ? "开" : "关");
   b.setAttribute("aria-pressed", ttsOn ? "true" : "false");
 })();
+/* 访问密钥：按钮文字反映"这台机器存没存过密钥"，平时输入框收起。
+   401 时 apiFetch 会调 openKeyBox() 摊开它。 */
+(function(){
+  var btn = $("keybtn"), wrap = $("keywrap"), inp = $("keyinput"), save = $("keysave");
+  if (!btn) return;
+  function label(){ btn.textContent = apiToken ? "🔑 密钥 ✓" : "🔑 密钥"; }
+  function put(){
+    apiToken = String((inp && inp.value) || "").trim();
+    try { localStorage.setItem("rw1-token", apiToken); } catch(e) {}
+    if (wrap) wrap.hidden = true;
+    btn.classList.remove("want");
+    label();
+    /* 存完立刻重试一次刚才失败的操作：命令/提问的调用方在 401 时已经显示
+       了"需要访问密钥"，这里替用户补一次拉取，让画面先活过来。 */
+    pull();
+  }
+  label();
+  btn.onclick = function(){
+    if (wrap) wrap.hidden = !wrap.hidden;
+    if (wrap && !wrap.hidden && inp) inp.focus();
+  };
+  if (save) save.onclick = put;
+  if (inp) inp.onkeydown = function(e){ if (e.key === "Enter"){ e.preventDefault(); put(); } };
+})();
 /* 设备列表：事件委托挂在容器上（行可以随便重建），
    「x 秒前」交给 1Hz 定时器（不跟 10Hz 取数一起抖）。 */
 bindDeviceList($("devs"));
@@ -4906,7 +5007,7 @@ fetch("/api/commands" + devQuery()).then(function(r){ return r.json(); }).then(f
     var btn = this;
     btn.disabled = true;
     stopSpeaking();
-    fetch("/api/ask/cancel" + devQuery(), {method:"POST"})
+    apiFetch("/api/ask/cancel" + devQuery(), {method:"POST"})
       .then(function(){ btn.disabled = false; })
       .catch(function(){ btn.disabled = false; });
   };

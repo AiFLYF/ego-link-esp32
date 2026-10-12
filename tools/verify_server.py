@@ -295,6 +295,21 @@ def main():
 
     rc = 0
     nlboard = None          # 第 4 周的自然语言测试里才起；提前定义，finally 才能安全收尾
+    srv2 = None             # 第 25 节（访问密钥门）的第二个实例；同上
+    TOKEN = "classroom-secret-42"
+    # ⚠️ free_port() 是"bind(0) 再立刻释放"，而 **Windows 的临时端口是游标式
+    # 分配** —— 主实例刚占过一个端口，第二次极可能把同一个端口再发回来。
+    # 撞了的话第 25 节的请求全会打到主实例（没有门）上去，三个 401 断言
+    # 会集体误报成"门没生效"。所以这里重抽，并在第 25 节再加一道
+    # "新实例的设备列表必须是空的"实测判别（见下文）。
+    port2 = free_port()
+    while port2 == port:
+        port2 = free_port()
+    # ⚠️ 变量名不能叫 env2：第 21 节（假大模型）已经有一个同名 env2，
+    # 会在 try 块里把这里覆盖掉 —— 第一版就是这么踩的（srv2 拿到的是
+    # 只有 LLM 密钥的环境，令牌门"没生效"，三个 401 断言集体误报）。
+    token_env = dict(CHILD_ENV)  # 照抄 T63 的纪律：别各自 dict(os.environ)
+    token_env["RW1_API_TOKEN"] = TOKEN
     try:
         # 等服务器起来
         for _ in range(50):
@@ -1270,8 +1285,95 @@ def main():
         except Exception:  # noqa: BLE001
             pass
 
+        # ---- 25. 访问密钥门（#51 遗留项二，2026-10-12）---------------------
+        # 威胁模型：教室里任何连上同一 WiFi 的人。破坏性动作（sd_format）与
+        # 花钱的动作（问大模型）**只能从网页来** —— 板子只会上报遥测/帧/音频，
+        # 命令永远是服务端下发下去的。所以门网页写入口**不需要动固件**：
+        # 这里起第二个实例（RW1_API_TOKEN 已设）逐条验，主实例（无密钥）
+        # 的 128 条断言同时就是"默认关闭、行为不变"的证据。
+        print("\n[25] 访问密钥门（配了 RW1_API_TOKEN 的第二个实例）")
+        srv2 = subprocess.Popen([PY, "-u", SERVER_PY, "--port", str(port2),
+                                 "--data-dir", data_dir + "2", "--retain-days", "0"],
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True, env=token_env, cwd=ROOT)
+        up = False
+        for _ in range(50):
+            try:
+                get_json("http://127.0.0.1:%d/api/latest" % port2, timeout=1)
+                up = True
+                break
+            except (urllib.error.URLError, OSError):
+                time.sleep(0.2)
+        check("带密钥的服务端起得来", up, "实际: 起不来（看日志）")
+
+        # 判别"这真的是一个新进程"：全新实例没有任何板子上报过，
+        # 设备列表必然为空；若端口和主实例撞了，这里会看到主实例的一堆设备。
+        # 没有这道判别，端口相撞会让下面三个 401 断言集体误报。
+        fresh = False
+        if up:
+            try:
+                fresh = not get_json("http://127.0.0.1:%d/api/devices" % port2,
+                                     timeout=3).get("devices")
+            except (urllib.error.URLError, OSError):
+                fresh = False
+        check("第二个实例是全新进程（端口没和主实例撞上）", fresh,
+              "实际: %d 端口上应答的服务端带着历史设备，端口撞了" % port2)
+
+        def post_tok(path, payload, token=None, use_query=False):
+            url = "http://127.0.0.1:%d%s" % (port2, path)
+            if token and use_query:
+                url += ("&" if "?" in url else "?") + "token=" + urllib.parse.quote(token)
+            req = urllib.request.Request(
+                url, data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json",
+                         # use_query 时**只**走查询参数，不发头 ——
+                         # 否则头先通过，就证明不了查询参数这条路是通的
+                         "X-RW1-Token": ("" if use_query else (token or ""))})
+            try:
+                with OPENER.open(req, timeout=6) as r:
+                    return r.status, json.loads(r.read().decode("utf-8"))
+            except urllib.error.HTTPError as e:
+                raw = e.read().decode("utf-8", "replace")
+                try:
+                    return e.code, json.loads(raw)
+                except ValueError:
+                    return e.code, {"raw": raw[:120]}
+
+        # 只有在"确实是带密钥的新实例"时，下面的 401 断言才有意义
+        if up and fresh:
+            st, body = post_tok("/api/command", {"name": "capture_once"})
+            check("没带密钥 → 401", st == 401, "实际: %s %s" % (st, body))
+            st, body = post_tok("/api/command", {"name": "capture_once"}, "wrong-key")
+            check("带错密钥 → 401", st == 401, "实际: %s" % st)
+            st, body = post_tok("/api/command", {"name": "capture_once"}, TOKEN)
+            check("带对密钥 → 正常下发", st == 200 and body.get("ok"),
+                  "实际: %s %s" % (st, body))
+            st, body = post_tok("/api/command", {"name": "capture_once"}, TOKEN,
+                                use_query=True)
+            check("?token= 查询参数同样认（给不方便加头的客户端）",
+                  st == 200 and body.get("ok"), "实际: %s" % st)
+            st, body = post_tok("/api/ask", {"text": "你好"})
+            check("提问入口同样要密钥（花钱的动作）", st == 401, "实际: %s" % st)
+            # 板子上报**不要**密钥：老固件没有密钥可带，门了就是把全班挡在门外
+            try:
+                with OPENER.open(urllib.request.Request(
+                        "http://127.0.0.1:%d/api/telemetry" % port2,
+                        data=firmware_body([(0.0, 0.0, 1.0)] * 20,
+                                           device="tok-01").encode("utf-8"),
+                        headers={"Content-Type": "application/json"}), timeout=8) as r:
+                    tcode = r.status
+            except urllib.error.HTTPError as e:
+                tcode = e.code
+            check("板子上报不带密钥也收（后向兼容）", tcode == 200,
+                  "实际: HTTP %s" % tcode)
+        # 主实例（没配密钥）：行为必须与以前逐字节一样
+        mbody = post_json("http://127.0.0.1:%d/api/command" % port,
+                          {"name": "capture_once"})
+        check("没配密钥的实例完全不设防（与历史行为一致）",
+              mbody.get("ok") is True, "实际: %s" % mbody)
+
     finally:
-        for p in (srv, nlboard):
+        for p in (srv, srv2, nlboard):
             if p is None:
                 continue
             try:
