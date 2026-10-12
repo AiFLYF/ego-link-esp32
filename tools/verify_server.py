@@ -247,6 +247,27 @@ def latest(port, device=None):
     return get_json("http://127.0.0.1:%d/api/latest%s" % (port, q))
 
 
+def events_of(port, device=None):
+    """从 **SSE** 读一帧，拿该设备当前的事件流。
+
+    2026-10-12 起事件流是 SSE 的独通道：`/api/latest`（网页 10Hz 轮询）为省
+    "锁内序列化全量历史"的开销不再带 events（服务端 `snapshot(with_events=
+    False)`）。这是**有意的契约分工**（命令历史同样只走 SSE 与 /api/commands），
+    所以断言改的是**数据来源**，不是把字段加回轮询通道去迁就旧写法。
+    SSE 首帧即时（服务端先发再 sleep），读一帧即拿到当时的完整 deque（≤200 条）。
+    """
+    q = "?device=" + urllib.parse.quote(device) if device else ""
+    try:
+        with OPENER.open("http://127.0.0.1:%d/api/stream%s" % (port, q), timeout=8) as r:
+            line = r.readline().decode("utf-8", "replace")
+        if not line.startswith("data: "):
+            return []
+        return json.loads(line[6:]).get("events", [])
+    except Exception as exc:  # noqa: BLE001 —— 读失败按空处理，让断言把真相报出来
+        print("    [警告] SSE 读事件流失败: %s" % exc)
+        return []
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--keep", action="store_true", help="保留临时目录")
@@ -522,7 +543,7 @@ def main():
             check("回传里带着同一个 request_id", False, "没有 result")
         check("命令事件进了事件流",
               any("capture_once" in (e.get("text") or "")
-                  for e in latest(port, r12_dev).get("events", [])))
+                  for e in events_of(port, r12_dev)))
 
         # ---- 13. 指令超时看护 ---------------------------------------------
         print("\n[13] 指令超时（板子故意不执行）")
@@ -567,7 +588,7 @@ def main():
         deaf.wait(timeout=25)
         check("板子不执行时被判超时", st2 == "timeout", "实际: %s" % st2)
         check("超时事件进了事件流",
-              any("超时" in (e.get("text") or "") for e in latest(port).get("events", [])))
+              any("超时" in (e.get("text") or "") for e in events_of(port)))
 
         # ---- 15. 远端物理反馈指令（第 3 周）--------------------------------
         print("\n[14] 物理反馈指令 led_blink / led_set")
@@ -655,7 +676,7 @@ def main():
                   "实际: %s" % auto[0].get("params"))
         check("自动告警进了事件流",
               any("跌落" in (e.get("text") or "") and "LED 告警" in (e.get("text") or "")
-                  for e in latest(port).get("events", [])))
+                  for e in events_of(port)))
 
         # ---- 17. 命令历史有上限（放最后，因为它会堆一队列指令）--------------
         print("\n[16] 命令历史不无限增长")
@@ -1120,7 +1141,7 @@ def main():
               "实际: %s / %r" % (done_nl and done_nl["state"], snap_nl.get("ai_reply")))
         check("自然语言请求进了事件流（说了什么 → 什么指令）",
               any("自然语言请求" in (e.get("text") or "")
-                  for e in snap_nl.get("events", [])))
+                  for e in events_of(port, nl_dev)))
 
         # 新指令必须**作废**还在后台跑的那次生成 —— 否则几秒后旧回答会盖掉指令回显，
         # 用户看到的是"刚才那个问题的答案"，而他明明已经改口了。
@@ -1213,8 +1234,8 @@ def main():
               reply_late == "已停止", "实际: %r" % reply_late)
         check("丢弃这件事在事件流里留了痕（不是静默吞掉）",
               any("来晚了" in (e.get("text") or "")
-                  for e in latest(port, slow_dev).get("events", [])),
-              "实际: %s" % [e.get("text") for e in latest(port, slow_dev).get("events", [])[:3]])
+                  for e in events_of(port, slow_dev)),
+              "实际: %s" % [e.get("text") for e in events_of(port, slow_dev)[:3]])
         try:
             slowboard.kill()
             slowboard.wait(timeout=5)
