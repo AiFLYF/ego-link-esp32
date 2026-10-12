@@ -30,6 +30,7 @@ AI 交互课 · PC 服务器（无需 VPS，自己的电脑即服务器）
 
 import argparse
 import datetime
+import hashlib
 import io
 import json
 import math
@@ -55,6 +56,14 @@ MOTION_WINDOW_S = 0.6     # 瞬时运动分类（晃动/跌落）用的短窗（
 
 DEVICE_TIMEOUT = 5.0      # 超过该秒数没有新遥测则视为离线
 LLM_TIMEOUT = 25.0        # 大模型请求超时（后台线程里等，不影响板端）
+# 同时打大模型的请求上限。一个班 20 块板可能同时提问，没有上限时 20 个线程
+# 一起砸过去，对方一限流就**全部**超时 —— 课堂里表现为"全班的 AI 同时傻了"，
+# 且每个人都要干等 LLM_TIMEOUT 秒。语义：最多 N 个在飞，其余在信号量上排队；
+# 排队超过 LLM_QUEUE_TIMEOUT 就明说"人太多，稍后再试"并回退本地 AI，
+# 不装死、也不无限占着线程。
+LLM_MAX_CONCURRENT = int(os.environ.get("RW1_LLM_MAX_CONCURRENT", "4"))
+LLM_QUEUE_TIMEOUT = float(os.environ.get("RW1_LLM_QUEUE_TIMEOUT", "30"))
+_LLM_SEM = threading.BoundedSemaphore(max(1, LLM_MAX_CONCURRENT))
 
 # ---- 语音（第 4 周：按键说话 → 识别 → 大模型 → 屏显回复）---------------------
 # 识别两条路**自动选**：配了云端 key 走云端，没配就用本地 whisper；
@@ -215,9 +224,19 @@ SHOT_MAX = 200             # 每台设备最多留多少张（免得把磁盘塞
 
 
 def safe_name(s):
-    """把设备名变成安全的目录/文件名：只留字母数字和 - _ .，其余换成 _。"""
+    """把设备名变成安全的目录/文件名：只留字母数字和 - _ .，其余换成 _。
+
+    ⚠️ 无脑截断到 48 字符会**撞名**：前 48 字符相同的两台板（课堂上最常见的
+    「第三组-07-xxxx…」式命名）会拿到同一个文件名，照片/记录互相覆盖且看不出来。
+    2026-10-12 修：截断发生时追加一个 6 位短哈希（源字符串 md5 前 6 位）——
+    总长仍是 48，但不同全名几乎不可能撞到同一个短哈希。只有"被截断"才付这个
+    代价，普通短名字的输出与以前逐字节一致。
+    """
     keep = "".join(c if (c.isalnum() or c in "-_.") else "_" for c in str(s))
-    return (keep[:48] or "unknown")
+    if len(keep) > 48:
+        digest = hashlib.md5(str(s).encode("utf-8")).hexdigest()[:6]
+        keep = keep[:41] + "_" + digest          # 41 + 1 + 6 = 48，总长不变
+    return keep or "unknown"
 
 
 def clean_device_id(raw):
@@ -597,9 +616,23 @@ def expire_commands():
 
 
 def commands_snapshot(dev):
-    """按时间倒序返回该设备最近若干条命令的副本（**调用方必须已持有 LOCK**）。"""
-    return [dict(r) for r in sorted(dev.commands.values(),
-                                    key=lambda r: r["created"], reverse=True)]
+    """按时间倒序返回该设备最近若干条命令的副本（**调用方必须已持有 LOCK**）。
+
+    ⚠️ `dict(r)` 只是**浅拷贝**：`history` 列表和 `result` 字典仍与活记录共享。
+    `_mark()` 会往 `history` 里追加（命令状态每秒都在迁移），而序列化发生在
+    **锁外**（`/api/latest` 与 SSE 都是先出快照再 `json.dumps`）—— 于是这一帧
+    可能混上"拍完之后"才发生的迁移，UI 上表现为时间线抖一下，或同一次轮询里
+    同一条命令一会儿 queued 一会儿 sent。所以这里把可变字段**各自再拷一份**，
+    快照从这一刻起与活记录没有任何共享对象（2026-10-12 修）。
+    """
+    out = []
+    for r in sorted(dev.commands.values(), key=lambda r: r["created"], reverse=True):
+        c = dict(r)
+        c["history"] = [list(h) for h in r["history"]]
+        if isinstance(r.get("result"), dict):
+            c["result"] = dict(r["result"])
+        out.append(c)
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -647,10 +680,32 @@ class JsonlLogger:
                    "kind": kind, "text": text})
 
     def _put(self, rec):
+        """入队。队列满时**丢最旧的**再进新的（类文档承诺的语义：
+        "宁可丢日志也不丢实时性" —— 旧日志的价值低于新日志，课堂掉线重连时
+        newest 恰是最该留下的现场）。
+
+        2026-10-12 订正：原实现是 put_nowait 失败就 dropped += 1 直接返回，
+        丢的是**最新**一条，与上面的承诺正好相反。
+        这里用有界重试而不是无锁 get+put：两个生产者线程（遥测/事件）可能
+        在同一毫秒都撞上 Full，简单的"出一个进一个"在极端时序下仍会丢新的。
+        """
         try:
             self.q.put_nowait(rec)
+            return
         except queue.Full:
-            self.dropped += 1
+            pass
+        for _ in range(3):
+            try:
+                self.q.get_nowait()          # 丢最旧的
+                self.dropped += 1
+            except queue.Empty:
+                pass                         # 被消费线程抢先取走了，静默即可
+            try:
+                self.q.put_nowait(rec)
+                return
+            except queue.Full:
+                continue
+        self.dropped += 1                    # 抢了三次还没进（消费线程停摆），丢新的
 
     # ---- 消费者 ----------------------------------------------------------
     def _run(self):
@@ -1065,8 +1120,19 @@ def _llm_worker(dev, question, token):
 
     `token` 是发起这次请求时的取消令牌。回来时若令牌已变（用户按了「停止」），
     结果就**直接丢弃** —— 而不是先写进去再被清掉，那样屏幕上会闪一下旧答案。
+
+    并发上限见 `_LLM_SEM`（LLM_MAX_CONCURRENT）：全班同时提问时排队，
+    排太久就明说并回退本地 AI，不让请求烂在队列里。
     """
-    reply = ask_llm(dev, question)
+    reply = None
+    if _LLM_SEM.acquire(timeout=LLM_QUEUE_TIMEOUT):
+        try:
+            reply = ask_llm(dev, question)
+        finally:
+            _LLM_SEM.release()
+    else:
+        push_event(dev, "warn", "大模型请求排队超过 %gs，已用本地 AI 回复"
+                                % LLM_QUEUE_TIMEOUT)
     mode = "大模型" if reply else "规则AI"
     if not reply:
         reply = ai_summary(dev)
@@ -1584,7 +1650,12 @@ class Handler(BaseHTTPRequestHandler):
                 snap["devices"] = devices_snapshot()
                 snap["samples"] = [[round(t, 2), x, y, z]
                                    for (t, x, y, z) in decimate(dev.samples, 240)]
-            self._send(200, json.dumps(snap, ensure_ascii=False))
+                # 序列化也必须在锁内：events/commands 的快照与活记录共享可变字段，
+                # 锁外 json.dumps 会把"拍完之后"的迁移混进这一帧（mixed snapshot）。
+                # 只把**字节**先在锁内做好；socket 发送留在锁外 —— 持锁写一个
+                # 慢客户端会连累全部板子的上报（T46 同款道理：别在锁里做 IO）。
+                payload = json.dumps(snap, ensure_ascii=False).encode("utf-8")
+            self._send(200, payload, "application/json; charset=utf-8")
         elif path == "/api/commands":
             want = query_param(query, "device")
             with LOCK:
@@ -2046,8 +2117,13 @@ class Handler(BaseHTTPRequestHandler):
                     snap = snapshot(dev)
                     snap["devices"] = devices_snapshot(now)
                     snap["sample"] = list(dev.samples[-1]) if dev.samples else None
-                snap["now"] = now
-                self.wfile.write(b"data: " + json.dumps(snap, ensure_ascii=False).encode("utf-8") + b"\n\n")
+                    snap["now"] = now
+                    # 与 /api/latest 同修：序列化在锁内做，字节发出去在锁外。
+                    # SSE 是长连接、每 500ms 一帧；持锁期间客户端网络卡一下，
+                    # 全校板子的上报都要等它 —— 那正是第一需求场景下最怕的事。
+                    frame = (b"data: " + json.dumps(snap, ensure_ascii=False).encode("utf-8")
+                             + b"\n\n")
+                self.wfile.write(frame)
                 self.wfile.flush()
                 time.sleep(0.5)
         except (BrokenPipeError, ConnectionResetError, OSError):
@@ -2328,6 +2404,20 @@ html{-webkit-text-size-adjust:100%}
    一张空卡片已经先亮在那里了（本仓库经验库里第 1 类高频真 bug）。
    所以在最前面显式提权一次，后面所有 display 都盖不掉它。 */
 [hidden]{display:none !important}
+
+/* 减少动态效果（prefers-reduced-motion）：系统层面要求"少动"的用户
+   （前庭功能障碍、或单纯觉得晕）会把动效全关掉。商业产品的基本尊重 ——
+   过渡压到 1ms（状态该变还是变，只是不演），循环动画停在中途。
+   ⚠️ e2e_design 的"动效必须走 4 档令牌"断言**不模拟**这个偏好
+   （Playwright 默认 no-preference），所以它与令牌纪律不冲突。 */
+@media (prefers-reduced-motion:reduce){
+  *,*::before,*::after{
+    transition-duration:1ms !important;
+    animation-duration:1ms !important;
+    animation-iteration-count:1 !important;
+    scroll-behavior:auto !important;
+  }
+}
 
 body{
   min-height:100vh;
@@ -4209,13 +4299,96 @@ function renderEvents(evts){
   }
 }
 
-/* ---------------- 设备列表（多板） ---------------- */
-/* selDevice = null 表示"自动跟随最近上报的那台"（单板场景就是这样，永远不用点）。
+/* ---------------- 设备列表（多板） ----------------
+   selDevice = null 表示"自动跟随最近上报的那台"（单板场景就是这样，永远不用点）。
    用户点过某台之后就固定看它，直到那台消失。 */
-var selDevice = null, devHTML = "";
+var selDevice = null;
+/* 设备列表的行复用状态（设计见 renderDevices 顶注释）：
+   devRows  id → 行元素；devSig 集合签名；devOrder 顺序签名；
+   devAges  id → [age, 采样时刻]（「x 秒前」按 1Hz 重算，不跟 10Hz Pull 抖）。 */
+var devRows = {}, devSig = "", devOrder = "", devAges = {}, devAgeTimer = null;
+var devCountTxt = "";
 
 function devQuery(){
   return selDevice ? "?device=" + encodeURIComponent(selDevice) : "";
+}
+
+/* 行内「在线 · x 秒前 · 来源 · oN」文本。age 传**已经过插值的秒数** ——
+   1Hz 定时器会在两次 pull 之间按真实时间补上零头，显示平滑但不抖。 */
+function paintRowState(row, sec){
+  if (!row || !row.__st) return;
+  row.__st.textContent = (row.__on ? "在线" : "离线") + " · " + ago(sec)
+    + (row.__src && row.__src !== "-" ? " · " + row.__src : "")
+    + (row.__orient === null || row.__orient === undefined ? "" : " · o" + row.__orient);
+}
+
+/* 每秒把每行的「x 秒前」按真实流逝时间重算一次。行元素本身不动 ——
+   只写一个 span 的 textContent，不碰焦点、不碰复选框、不碰滚动。 */
+function paintDevAges(){
+  var now = Date.now();
+  Object.keys(devRows).forEach(function(id){
+    var row = devRows[id];
+    if (!row || row.__age === undefined) return;
+    paintRowState(row, row.__age + Math.max(0, now - row.__ageAt) / 1000);
+  });
+}
+
+/* 只翻选中态，不重画整表 —— 点一下设备，强调条要**立刻**动，
+   而不是等下一帧 pull（慢网下要再等一个往返，看着就像没点着）。 */
+function markDevSelected(){
+  Object.keys(devRows).forEach(function(id){
+    var row = devRows[id];
+    var sel = id === selDevice;
+    if (row.__sel !== sel){
+      row.__sel = sel;
+      row.classList.toggle("sel", sel);
+    }
+  });
+}
+
+/* 「全选」按钮文案：它只依赖 selDevices，与 DOM 无关，
+   所以从「重写全部复选框」里拆出来，10Hz 刷列表时也能安全调用。
+   内容没变就不写 —— textContent 也是 DOM 写，10Hz 无条件写同样的字符串
+   正是这次清理要消灭的东西。 */
+var devAllTxt = null;
+function syncDevAllText(){
+  var n = Object.keys(selDevices).length;
+  var txt = n ? ("取消全选（已选 " + n + "）") : "全选";
+  if (devAllTxt === txt) return;
+  devAllTxt = txt;
+  var btn = $("devall");
+  if (btn) btn.textContent = txt;
+}
+
+/* 事件委托：click / change / keydown 各挂在 #devs 容器上**一次**。
+   旧实现每重建一次整表就重新绑定一遍行内 handler —— 重建越频繁，
+   悬空 handler 与重复绑定越难查。委托之后行可以随便重建，监听器不动。 */
+function bindDeviceList(host){
+  if (!host || host.__bound) return;
+  host.__bound = 1;
+  host.addEventListener("click", function(ev){
+    /* 点复选框是"勾选下发目标"，不该顺带切换查看的设备 */
+    if (ev.target && ev.target.classList && ev.target.classList.contains("devchk")) return;
+    var row = ev.target && ev.target.closest ? ev.target.closest(".dev") : null;
+    if (row) selectDevice(row.getAttribute("data-dev"));
+  });
+  host.addEventListener("change", function(ev){
+    var cb = ev.target;
+    if (!cb || !cb.classList || !cb.classList.contains("devchk")) return;
+    var id = cb.getAttribute("data-chk");
+    if (cb.checked) selDevices[id] = 1; else delete selDevices[id];
+    syncDevAll();
+  });
+  host.addEventListener("keydown", function(ev){
+    /* 焦点在复选框上时空格归原生控件（勾选/取消），不顺带切设备 */
+    if (ev.target && ev.target.classList && ev.target.classList.contains("devchk")) return;
+    var row = ev.target && ev.target.closest ? ev.target.closest(".dev") : null;
+    if (!row) return;
+    if (ev.key === "Enter" || ev.key === " " || ev.key === "Spacebar"){
+      ev.preventDefault();
+      selectDevice(row.getAttribute("data-dev"));
+    }
+  });
 }
 
 function renderDevices(list, current){
@@ -4227,70 +4400,120 @@ function renderDevices(list, current){
      以后再加新通道、忘了带 devices 时，页面不会再闪。 */
   if (!Array.isArray(list)) return;
   /* 只有一台板时不显示这块 —— 单板课堂不该凭空多出一张卡片 */
-  if (list.length <= 1){ card.hidden = true; devHTML = ""; return; }
+  if (list.length <= 1){
+    card.hidden = true;
+    devRows = {}; devSig = ""; devOrder = ""; devAges = {};
+    var host0 = $("devs");
+    if (host0) host0.textContent = "";
+    return;
+  }
   card.hidden = false;
 
-  var online = 0;
-  var h = list.map(function(d){
-    if (d.online) online++;
-    var color = d.online ? cssVar("--color-still") : cssVar("--color-fall");
-    var title = d.activity || "";
-    /* 记住每台的档位，供"方向档位"控件显示 */
-    if (d.orient !== null && d.orient !== undefined) devOrient[d.id] = d.orient;
-    var oTxt = (d.orient === null || d.orient === undefined) ? "" : (" · o" + d.orient);
-    var checked = selDevices[d.id] ? " checked" : "";
-    return '<div class="dev' + (d.id === current ? " sel" : "") + '" data-dev="' + esc(d.id) + '">'
-      + '<input type="checkbox" class="devchk" data-chk="' + esc(d.id) + '"' + checked + '>'
-      + '<span class="dot' + (d.online ? "" : " off") + '" style="background:' + color + '"></span>'
-      + '<span class="did">' + esc(d.id) + '</span>'
-      + '<span class="meta">' + (d.online ? "在线" : "离线") + ' · ' + ago(d.age)
-      + (d.source && d.source !== "-" ? " · " + esc(d.source) : "") + esc(oTxt) + '</span>'
-      + '<span class="meta">' + esc(title) + '</span>'
-      + '</div>';
-  }).join("");
-
-  $("devcount").textContent = list.length + " 台 · 在线 " + online;
-  if (h === devHTML) return;
-  devHTML = h;
   var host = $("devs");
-  host.innerHTML = h;
-  Array.prototype.forEach.call(host.querySelectorAll(".dev"), function(el){
-    el.onclick = function(ev){
-      /* 点复选框是"勾选下发目标"，不该顺带切换查看的设备 */
-      if (ev.target && ev.target.classList && ev.target.classList.contains("devchk")) return;
-      selectDevice(el.getAttribute("data-dev"));
-    };
-    /* 键盘可达：这一行是 div，不给 tabindex 的话键盘用户根本选不了设备。
-       Enter / 空格 都要能用（div 不像 <button> 会自己处理空格）。 */
-    el.tabIndex = 0;
-    el.setAttribute("role", "button");
-    el.onkeydown = function(ev){
-      if (ev.key === "Enter" || ev.key === " " || ev.key === "Spacebar"){
-        ev.preventDefault();
-        selectDevice(el.getAttribute("data-dev"));
-      }
-    };
+  var sig = list.map(function(d){ return d.id; }).join("\u0001");
+
+  /* 集合签名变了（设备上新 / 下线 / 改名）才整表重建。
+     这是**低频路径**；旧实现的问题是把它当成了每帧路径。 */
+  if (sig !== devSig){
+    devSig = sig;
+    devRows = {};
+    devAges = {};
+    var frag = document.createDocumentFragment();
+    list.forEach(function(d){
+      var row = document.createElement("div");
+      row.className = "dev";
+      row.setAttribute("data-dev", d.id);
+      row.setAttribute("role", "button");
+      row.tabIndex = 0;
+      row.innerHTML =
+        '<input type="checkbox" class="devchk" data-chk="' + esc(d.id) + '">'
+        + '<span class="dot"></span>'
+        + '<span class="did"></span>'
+        + '<span class="meta m-state"></span>'
+        + '<span class="meta m-act"></span>';
+      row.__chk = row.querySelector(".devchk");
+      row.__dot = row.querySelector(".dot");
+      row.__did = row.querySelector(".did");
+      row.__st  = row.querySelector(".m-state");
+      row.__act = row.querySelector(".m-act");
+      row.__did.textContent = d.id;
+      row.__sel = null;      /* 与"从未设过"区分：null 迫使下面立刻对齐一次 */
+      row.__on  = null;
+      row.__actTxt = null;
+      frag.appendChild(row);
+      devRows[d.id] = row;
+    });
+    host.textContent = "";
+    host.appendChild(frag);
+    bindDeviceList(host);
+  }
+
+  /* 顺序对齐：服务端按"在线的排前面"排序，一台板上/下线就会换序。
+     appendChild 移动**已有节点**（不销毁重建），焦点、复选框、滚动全保留。
+     顺序没变就一个都不碰。 */
+  var ids = list.map(function(d){ return d.id; });
+  var ordStr = ids.join("\u0002");
+  if (ordStr !== devOrder){
+    devOrder = ordStr;
+    ids.forEach(function(id){
+      var r = devRows[id];
+      if (r) host.appendChild(r);
+    });
+  }
+
+  /* 逐行更新：只写**真的变了**的字段。
+     复选框的 checked 只在不一致时赋值 —— 无条件赋值会让用户正在点的
+     那颗框被"改回旧值"，表现为点了没反应（旧实现每帧整体重建，
+     20 台时这问题必现）。 */
+  var online = 0, orientDirty = false;
+  list.forEach(function(d){
+    var row = devRows[d.id];
+    if (!row) return;
+    if (d.online) online++;
+    if (d.orient !== null && d.orient !== undefined){
+      if (devOrient[d.id] !== d.orient) orientDirty = true;
+      devOrient[d.id] = d.orient;
+    }
+    var sel = d.id === current;
+    if (row.__sel !== sel){
+      row.__sel = sel;
+      row.classList.toggle("sel", sel);
+    }
+    /* 先存原始字段（paintRowState 与 1Hz 定时器都读它们） */
+    row.__src = d.source;
+    row.__orient = (d.orient === null || d.orient === undefined) ? null : d.orient;
+    row.__age = d.age;
+    row.__ageAt = Date.now();
+    if (row.__on !== d.online){
+      row.__on = d.online;
+      row.__dot.style.background = d.online ? cssVar("--color-still") : cssVar("--color-fall");
+      row.__dot.classList.toggle("off", !d.online);
+      paintRowState(row, d.age);          /* 在线态翻转立刻重画，不等 1Hz */
+    }
+    var act = d.activity || "";
+    if (row.__actTxt !== act){
+      row.__actTxt = act;
+      row.__act.textContent = act;
+    }
+    if (row.__chk.checked !== !!selDevices[d.id]) row.__chk.checked = !!selDevices[d.id];
   });
-  Array.prototype.forEach.call(host.querySelectorAll(".devchk"), function(cb){
-    cb.onclick = function(ev){
-      ev.stopPropagation();
-      var id = cb.getAttribute("data-chk");
-      if (cb.checked) selDevices[id] = 1; else delete selDevices[id];
-      syncDevAll();
-    };
-  });
-  syncDevAll();
-  /* 档位显示也要在这里刷：它读的是 `devOrient`，而那个表是**本函数**填的。
-   * 只在初始化时调一次 syncOrient() 的话，设备列表后到就永远显示"还没收到档位"
-   * （2026-09-23 浏览器 E2E 抓到的时序 bug）。 */
-  syncOrient();
+
+  var cntTxt = list.length + " 台 · 在线 " + online;
+  if (devCountTxt !== cntTxt){
+    devCountTxt = cntTxt;
+    $("devcount").textContent = cntTxt;
+  }
+  syncDevAllText();
+  /* 档位显示跟着 devOrient 走。它只在**档位真的变了**时才刷 ——
+     原来每次都刷，textContent 每秒被写十遍同样的内容。 */
+  if (orientDirty) syncOrient();
 }
 
-/* 「全选」按钮：全都勾上 / 全都取消。文案随状态变，避免用户看不出当前是哪种。 */
+/* 「全选」按钮：全都勾上 / 全都取消。文案随状态变，避免用户看不出当前是哪种。
+   这是**用户操作路径**（点按钮 / 勾复选框才会到），所以连复选框一起全量对齐；
+    10Hz 的渲染路径走的是 syncDevAllText()（只动文案，不碰框）。 */
 function syncDevAll(){
-  var n = Object.keys(selDevices).length;
-  var btn = $("devall");
-  if (btn) btn.textContent = n ? ("取消全选（已选 " + n + "）") : "全选";
+  syncDevAllText();
   var host = $("devs");
   if (host) Array.prototype.forEach.call(host.querySelectorAll(".devchk"), function(cb){
     var id = cb.getAttribute("data-chk");
@@ -4310,13 +4533,21 @@ function toggleDevAll(){
 function selectDevice(id){
   if (!id || id === selDevice) return;
   selDevice = id;
-  devHTML = "";        /* 清掉缓存，让选中态立刻重画 */
+  markDevSelected();        /* 强调条立刻动，不等下一帧 pull */
+  /* 换设备 = 换了对话对象。原来这里不清 spokenText：新设备如果回复文本
+     与旧设备相同，speakReply() 的去重判断就永远拦住它，一句话也不念 ——
+     课堂上"切到 B 板提问却没声音"就是这么来的（2026-10-12 修）。
+     正在念的半句也该停：没人想听完上一台板子的回答。 */
+  spokenText = "";
+  try{ if (window.speechSynthesis) speechSynthesis.cancel(); }catch(e){}
   pull();              /* 先拉一次快照，不必等下一帧 SSE */
   stream();            /* SSE 是按设备过滤的，换设备要重连 */
 }
 
 /* ---------------- 主刷新 ---------------- */
 var aiReply = "";
+/* 上一次渲染时服务端报告的设备。见 render() 里的换设备播报重置。 */
+var lastDevSeen = "";
 /* ---------------- 计时（第 6 周） ----------------
    课程第 6 周要求语音任务能「澄清、停止、迟到结果隔离、**计时**」。
    板子屏幕上只有回复正文，看不到"等了多久"——识别慢还是模型慢，用户没法判断，
@@ -4350,10 +4581,14 @@ function renderTiming(s){
 
 function render(s){
   /* 服务端实际给的是哪台：若和我们选的不一致（选中的被淘汰/改名了），跟着它走，
-     免得页面一直停在一个已经不存在的设备上。 */
-  if (selDevice && s.device && s.device !== selDevice){
-    selDevice = s.device;
-    devHTML = "";
+     免得页面一直停在一个已经不存在的设备上。
+     自动跟随（selDevice 为 null）时同样要发现"最近上报的那台换了" ——
+     这时候旧设备的回答不该拦着新设备的回答再念一遍。 */
+  if (s.device && s.device !== lastDevSeen){
+    lastDevSeen = s.device;
+    if (selDevice && s.device !== selDevice) selDevice = s.device;
+    spokenText = "";
+    try{ if (window.speechSynthesis) speechSynthesis.cancel(); }catch(e){}
   }
   renderDevices(s.devices, s.device || selDevice);
 
@@ -4452,7 +4687,13 @@ function render(s){
    浏览器里做（Web Speech API）：零依赖、不用 API key、离线也能用 ——
    正好对上课程说的"设备音频未就绪时使用电脑音频，但明确运行位置"。
    运行位置是**这台电脑的浏览器**，不是板子，网页上要写清楚。 */
-var ttsOn = true;          /* 默认开：课程要的是"从说到听"的完整闭环 */
+/* 默认开：课程要的是"从说到听"的完整闭环。
+   但"开/关"是**用户的偏好**，刷新页面、重开浏览器都该记住 ——
+   原先每次开页都强行回到"开"：课堂上老师静音一次，翻个页又被念起来，
+   一屋子人面面相觑（2026-10-12 修：localStorage "rw1-tts"，与主题同一套路，
+   读不到（隐私模式）时保持默认开）。 */
+var ttsOn = true;
+try { if (localStorage.getItem("rw1-tts") === "0") ttsOn = false; } catch(e) {}
 var spokenText = "";       /* 上次念过的内容，避免每帧重复念同一句 */
 
 function speakable(t){
@@ -4570,6 +4811,19 @@ $("host").textContent = location.host;
 /* 主题：初始值已由 head 里那段内联脚本在首次绘制前定好（默认明亮）。
    这里只负责把按钮文案对齐、以及接上点击切换。 */
 applyTheme(_themeName());
+/* 播报开关的按钮文字对齐恢复出来的偏好（HTML 里写死的是"开"，
+   不清这一步的话，关过的用户每次开页看到的是一个说谎的按钮）。 */
+(function(){
+  var b = $("ttsbtn");
+  if (!b) return;
+  b.textContent = "播报 " + (ttsOn ? "开" : "关");
+  b.setAttribute("aria-pressed", ttsOn ? "true" : "false");
+})();
+/* 设备列表：事件委托挂在容器上（行可以随便重建），
+   「x 秒前」交给 1Hz 定时器（不跟 10Hz 取数一起抖）。 */
+bindDeviceList($("devs"));
+if (devAgeTimer) clearInterval(devAgeTimer);
+devAgeTimer = setInterval(paintDevAges, 1000);
 if ($("theme")) $("theme").onclick = function(){
   var next = _themeName() === "dark" ? "light" : "dark";
   try { localStorage.setItem("rw1-theme", next); } catch (e) { /* 存不了也照样切换 */ }
@@ -4642,6 +4896,7 @@ fetch("/api/commands" + devQuery()).then(function(r){ return r.json(); }).then(f
     ttsOn = !ttsOn;
     this.textContent = "播报 " + (ttsOn ? "开" : "关");
     this.setAttribute("aria-pressed", ttsOn ? "true" : "false");
+    try { localStorage.setItem("rw1-tts", ttsOn ? "1" : "0"); } catch(e) {}
     if (!ttsOn) stopSpeaking();
   };
   syncOrient();
@@ -4785,5 +5040,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-# PROBE_MARKER_12345
