@@ -373,8 +373,8 @@ async function step(name, fn) {
       window.fetch = function (u, o) {
         if (String(u).indexOf('/api/latest') === 0) {
           const s = Object.assign({
-            ok: true, device: '-', device_online: true, samples: [], events: [],
-            commands: [], activity: '静置·水平', ai_reply: '计时测试',
+            ok: true, device: '-', device_online: true, samples: [],
+            activity: '静置·水平', ai_reply: '计时测试',
             ai_mode: '大模型', ai_pending: false, voice_state: 'idle',
             step_count: 0, shake_count: 0, posts_ok: 1,
           }, window.__rw1Timing);

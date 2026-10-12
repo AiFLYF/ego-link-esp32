@@ -292,11 +292,21 @@ def pick_device(did=None):
     return DEVICES[DEFAULT_DEVICE]
 
 
-def snapshot(dev):
-    """一台设备的完整快照。**调用方必须已持有 LOCK。**"""
+def snapshot(dev, with_events=True, with_commands=True):
+    """一台设备的完整快照。**调用方必须已持有 LOCK。**
+
+    `with_events` / `with_commands` 让调用方只取**这一通道真正负责**的部分：
+    `/api/latest`（网页 10Hz 轮询）只要活状态与曲线样本，事件流和命令历史
+    是 SSE 的独通道（每 500ms 一帧）。10Hz 全量轮询在锁内序列化 ~25KB 的
+    events+commands，跟 20 块板的上报抢同一把 LOCK —— 课堂场景下这是实打实
+    的 contention。⚠️ 前端因此**不许**从 /api/latest 推导事件/命令状态
+    （renderEvents/renderCmds 对缺失字段直接跳过，不清空、不画空态）。
+    """
     snap = dict(dev.st)
-    snap["events"] = list(dev.events)
-    snap["commands"] = commands_snapshot(dev)
+    if with_events:
+        snap["events"] = list(dev.events)
+    if with_commands:
+        snap["commands"] = commands_snapshot(dev)
     return snap
 
 
@@ -1641,7 +1651,13 @@ class Handler(BaseHTTPRequestHandler):
             want = query_param(query, "device")
             with LOCK:
                 dev = pick_device(clean_device_id(want) if want else None)
-                snap = snapshot(dev)
+                # 瘦身通道：只带**活状态**（设备名/在线/活动/计数/AI/语音/计时）
+                # + 曲线样本 + 设备列表。events 与 commands 是 SSE 的独通道 ——
+                # 见 snapshot() 的 docstring：10Hz 在锁内序列化全量历史会跟
+                # 20 块板的上报抢锁，而同一个浏览器页面 500ms 后就会从 SSE
+                # 拿到它们。**不要再往这里加历史字段**（T47 的教训反过来用：
+                # 两条通道可以分工，但同一份数据只能有一个权威来源）。
+                snap = snapshot(dev, with_events=False, with_commands=False)
                 # ⚠️ **必须带上设备列表**：网页的 pull() 是每 100ms 一次，
                 # 而 renderDevices() 在"列表 ≤ 1 台"时会把「设备」区域藏起来。
                 # 早先这里不带 devices，于是多板课堂下那一块会以取数频率疯狂闪烁
@@ -4248,9 +4264,14 @@ function syncOrient(){
 }
 
 function renderCmds(cmds){
-  cmdsSeen = cmds || [];
+  /* 命令历史的**权威通道是 SSE**（500ms 一帧）；/api/latest（10Hz 轮询）
+     不再带 commands（见服务端 snapshot() 的说明）。所以字段缺失时**直接返回**：
+     那不是"还没有指令"，是"这一通道不负责"。以前这里会画空态，于是 SSE
+     刚画好的列表被 100ms 后的下一帧轮询抹掉 —— T47 的抖动换个方向再现。 */
+  if (!cmds) return;
+  cmdsSeen = cmds;
   var el = $("cmds");
-  if (!cmds || !cmds.length){
+  if (!cmds.length){
     setHTML(el, '<div class="empty">还没有下发过指令。</div>');
     return;
   }
@@ -4285,6 +4306,8 @@ function renderCmds(cmds){
 /* ---------------- 事件流 ---------------- */
 var evHTML = "";
 function renderEvents(evts){
+  /* 事件流的权威通道也是 SSE。/api/latest 不带 events，所以这里缺字段时
+     **什么都不要做**（包括画"暂无事件"空态）—— 画了就是跟 SSE 打架。 */
   if (!evts || !evts.length) return;
   var h = evts.slice(0,40).map(function(ev){
     var k = "k-" + (ev.kind || "info");
