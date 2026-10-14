@@ -1304,7 +1304,13 @@ def main():
                 break
             except (urllib.error.URLError, OSError):
                 time.sleep(0.2)
-        check("带密钥的服务端起得来", up, "实际: 起不来（看日志）")
+        # ⚠️ check() 的第三个参数在 PASS 时也会打印，所以别把"失败提示语"
+        # 写在那里 —— 否则日志里一片 [PASS] 跟着"起不来（看日志）"，
+        # 下一个值班的会被自己人吓到（2026-10-14 实测踩到过）。
+        # 成功/失败各有各的真实观察值。
+        check("带密钥的服务端起得来", up,
+              ("实际: 端口 %d 应答正常" % port2) if up
+              else "实际: %d 端口 %d 次探测都没应答，起不来（ srv2 日志见 --keep 保留的临时目录）" % (port2, 50))
 
         # 判别"这真的是一个新进程"：全新实例没有任何板子上报过，
         # 设备列表必然为空；若端口和主实例撞了，这里会看到主实例的一堆设备。
@@ -1317,7 +1323,8 @@ def main():
             except (urllib.error.URLError, OSError):
                 fresh = False
         check("第二个实例是全新进程（端口没和主实例撞上）", fresh,
-              "实际: %d 端口上应答的服务端带着历史设备，端口撞了" % port2)
+              ("实际: 端口 %d 上是全新实例，设备列表为空" % port2) if fresh
+              else "实际: %d 端口上应答的服务端带着历史设备，端口撞了" % port2)
 
         def post_tok(path, payload, token=None, use_query=False):
             url = "http://127.0.0.1:%d%s" % (port2, path)
