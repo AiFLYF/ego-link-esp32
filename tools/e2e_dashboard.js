@@ -34,10 +34,10 @@ const DATA_DIR = path.join(os.tmpdir(), 'rw1-e2e-data');
 
 const procs = [];
 const logs = [];
-function start(args, tag) {
+function start(args, tag, extraEnv) {
   const env = Object.assign({}, process.env, {
     no_proxy: '127.0.0.1,localhost', NO_PROXY: '127.0.0.1,localhost',
-  });
+  }, extraEnv || {});
   /* 把子进程输出落盘：失败时能一眼看出是"服务端没起来"还是"产品 bug"，
      而不是对着一个空日志猜。 */
   const fs = require('fs');
@@ -101,9 +101,13 @@ async function step(name, fn) {
 }
 
 (async () => {
+  /* 就绪探测的预算给到 60 秒：沙箱里子进程启动慢是**记过案的**（手册 T63：
+     空 python -c pass 基线 2~3 秒，实测劣化到过 17 秒）。25 秒在机器被别的
+     负载压着时会把"起得慢"误报成"起不来"（2026-10-14 连着红两次，都是它）。
+     探测本身没放松：还是要真实拿到 HTTP 200 才算就绪。 */
   start(['-u', 'server/server.py', '--port', String(PORT),
          '--data-dir', DATA_DIR, '--retain-days', '0'], 'server');
-  if (!await waitHttp(BASE + '/api/latest')) {
+  if (!await waitHttp(BASE + '/api/latest', 60)) {
     throw new Error('服务端在 ' + PORT + ' 端口起不来（看 ' + logs[0] + '）');
   }
   // 两块假板子：一块带 oN，一块不带（模拟不支持 oN 的老固件）
@@ -112,9 +116,10 @@ async function step(name, fn) {
   start(['-u', 'tools/fake_board.py', '--url', BASE, '--device', '老固件-01',
          '--scenario', 'idle', '--seconds', '180', '--quiet'], 'boardB');
   /* 等两块板子都真的上报过 —— 用"设备列表里有 2 台"当就绪信号，
-     不要 sleep 固定秒数（板子晚到 1 秒，后面的断言就会假失败）。 */
+     不要 sleep 固定秒数（板子晚到 1 秒，后面的断言就会假失败）。
+     预算同样按 T63 放宽到 45 秒：假板子的启动也是子进程。 */
   const t0 = Date.now();
-  while (Date.now() - t0 < 20000) {
+  while (Date.now() - t0 < 45000) {
     try {
       const j = await (await fetch(BASE + '/api/devices')).json();
       if ((j.devices || []).length >= 2) break;
@@ -153,11 +158,15 @@ async function step(name, fn) {
   const api = (p) => ctx.request.get(BASE + p).then(r => r.json());
   const lastSent = () => sent[sent.length - 1];
   /* 按钮会因为"上一条指令还没走完"而 disabled —— 等它可用再点，
-     否则测试会随命令往返的时机随机失败（不是产品 bug）。 */
+     否则测试会随命令往返的时机随机失败（不是产品 bug）。
+     预算 40 秒：沙箱劣化时 Playwright 的每次定位/状态读取都是秒级
+     （2026-10-14 实测 python 空启动 17s，15 秒预算连三次往返都做不完，
+     红得很冤 —— 同一次运行里板子日志证明指令其实全都执行成功了）。
+     等的性质没变：还是要等到"真的可点"才点。 */
   const clickWhenReady = async (sel, timeoutMs) => {
     const loc = page.locator(sel);
     const t0 = Date.now();
-    while (Date.now() - t0 < (timeoutMs || 15000)) {
+    while (Date.now() - t0 < (timeoutMs || 40000)) {
       if ((await loc.count()) && !(await loc.isDisabled())) {
         await loc.click({ timeout: 8000 });
         return;
@@ -410,6 +419,123 @@ async function step(name, fn) {
     await page.evaluate(() => { if (window.__rw1Fetch) window.fetch = window.__rw1Fetch; });
 
     console.log('     ' + txt + '；空数据时自动收起');
+  });
+
+  /* ---- 访问密钥门下的文字提问（2026-10-14 修的真 bug）--------------------
+   * sendAsk 曾经用裸 fetch：服务端配了 RW1_API_TOKEN 时，/api/ask 就在被门的
+   * 写入口里，401 被调用方的 catch 静默吞掉 —— 用户看到的就是"打了字、
+   * 什么都没发生"。其余三个写入口（指令/停止/删照片）一直走 apiFetch，
+   * 只有文字提问漏了；verify_server 只测得到"服务端会 401"，
+   * 测不到"页面会不会把这事告诉用户"。
+   * 所以这里起第二个带密钥的实例，在真浏览器里把整条路走一遍。 */
+  await step('密钥门：文字提问 401 时有可见反馈，填对密钥后能发通', async () => {
+    /* 端口**动态选**，不写死：写死 8100 撞上"上次没关干净的进程"时，
+       Windows 的 SO_REUSEADDR 会让两个进程共绑同一个端口 —— 现象是
+       **启动横幅明明打出来、页面却探不到**（手册 T54/T62 都记过）。
+       父进程先 TCP 探几个候选，取第一个探不通的。 */
+    const net = require('net');
+    const candidates = [PORT + 1, PORT + 2, 18321, 19482, 21317];
+    let TPORT = 0;
+    for (const c of candidates) {
+      const busy = await new Promise(res => {
+        const s = net.connect(c, '127.0.0.1');
+        const done = v => { try { s.destroy(); } catch (e) {} res(v); };
+        s.setTimeout(500);
+        s.on('connect', () => done(true));
+        s.on('timeout', () => done(false));
+        s.on('error', () => done(false));
+      });
+      if (!busy) { TPORT = c; break; }
+    }
+    if (!TPORT) throw new Error('找不到空闲端口（试了 ' + candidates.join('/') + '）');
+    const TBASE = 'http://127.0.0.1:' + TPORT;
+    const TOKEN = 'e2e-token-4242';
+    const srv2 = start(['-u', 'server/server.py', '--port', String(TPORT),
+                        '--data-dir', DATA_DIR + '-token', '--retain-days', '0'],
+                       'server-token', { RW1_API_TOKEN: TOKEN });
+    /* 沙箱里子进程启动慢（手册 T63），就绪探测给到 60 秒。起不来的原因
+       全在服务端日志里（端口被占退出 / 绑不上 / 横幅打了但探不到）——
+       直接把日志尾巴和进程退出码带进错误，别让下一个人去 temp 里翻。 */
+    if (!await waitHttp(TBASE + '/api/latest', 60)) {
+      const fs2 = require('fs');
+      let tailTxt = '';
+      try {
+        tailTxt = fs2.readFileSync(logs[logs.length - 1], 'utf8')
+                    .split('\n').slice(-8).join('\n');
+      } catch (e) { tailTxt = '（读不到日志）'; }
+      throw new Error('带密钥的服务端在 ' + TPORT
+                      + ' 起不来；进程退出码=' + srv2.exitCode
+                      + '；日志尾巴:\n' + tailTxt);
+    }
+    const tpage = await ctx.newPage();
+    /* 401 是这一步预期的中间态，不能进 problems（否则最后一条
+       "没有请求失败"会被它自己坑掉）；只记 5xx 这种真异常。 */
+    tpage.on('response', r => {
+      if (r.status() >= 500) problems.push('TOKENPAGE HTTP ' + r.status() + ' ' + r.url());
+    });
+    await tpage.goto(TBASE, { waitUntil: 'domcontentloaded' });
+    await sleep(2500);
+
+    // 1) 没填密钥就直接打字发送
+    await tpage.fill('#asktext', '闪三下');
+    await tpage.click('#asksend');
+    let reply = '';
+    for (let i = 0; i < 80; i++) {                 // 最多等 8 秒
+      reply = ((await tpage.textContent('#reply')) || '').trim();
+      if (reply.indexOf('需要访问密钥') >= 0) break;
+      await sleep(100);
+    }
+    if (reply.indexOf('需要访问密钥') < 0) {
+      throw new Error('401 之后 #reply 没有可见反馈: ' + JSON.stringify(reply));
+    }
+    const kb = await tpage.evaluate(() => ({
+      keywrapHidden: document.getElementById('keywrap').hidden,
+      asktext: document.getElementById('asktext').value,
+      keybtnWant: document.getElementById('keybtn').classList.contains('want'),
+    }));
+    if (kb.keywrapHidden !== false) throw new Error('401 后页脚密钥框没自动摊开');
+    if (kb.asktext !== '闪三下') {
+      throw new Error('文字没还给输入框（用户得重打一遍）: ' + JSON.stringify(kb.asktext));
+    }
+    if (!kb.keybtnWant) throw new Error('401 后密钥按钮没涂成"待处理"色');
+
+    // 2) 在页脚填对密钥、保存
+    await tpage.fill('#keyinput', TOKEN);
+    await tpage.click('#keysave');
+    let lbl = '';
+    for (let i = 0; i < 30; i++) {
+      lbl = ((await tpage.textContent('#keybtn')) || '').trim();
+      if (lbl.indexOf('✓') >= 0) break;
+      await sleep(100);
+    }
+    if (lbl.indexOf('✓') < 0) throw new Error('存完密钥按钮文案没变: ' + lbl);
+
+    // 3) 再发一次：请求要真的带上 X-RW1-Token 并且过门（200）
+    const sent2 = await tpage.evaluate(() => new Promise(resolve => {
+      const reqs = [];
+      const of = window.fetch;
+      window.fetch = function (u, o) {
+        if (String(u).indexOf('/api/ask') === 0) {
+          const rec = { headers: (o && o.headers) || {} };
+          reqs.push(rec);
+          of.apply(this, arguments).then(r => { rec.status = r.status; })
+                                   .catch(() => { rec.status = -1; });
+        }
+        return of.apply(this, arguments);
+      };
+      document.getElementById('asktext').value = '再闪三下';
+      document.getElementById('asksend').click();
+      setTimeout(() => { window.fetch = of; resolve(reqs); }, 2000);
+    }));
+    if (!sent2.length) throw new Error('填了密钥后点发送没发出请求');
+    if (sent2[0].status !== 200) {
+      throw new Error('带密钥的 /api/ask 没通过：HTTP ' + sent2[0].status);
+    }
+    if (String(sent2[0].headers['X-RW1-Token'] || '') !== TOKEN) {
+      throw new Error('请求没带 X-RW1-Token 头: ' + JSON.stringify(sent2[0].headers));
+    }
+    await tpage.close();
+    console.log('     401 → 提示+摊开密钥框+归还文字 → 填密钥 → 带头发送 200');
   });
 
   await step('没有横向溢出', async () => {

@@ -3677,7 +3677,12 @@ function drawChart(){
   ctx.font = (11*dpr)+"px PlexMono,Consolas,monospace";
   var tw = ctx.measureText(label).width;
   var lx = Math.max(padL + 4*dpr, Math.min(last[0] - tw/2, W - padR - tw - 12*dpr));
-  var ly = Math.max(padT, padT - 2*dpr);
+  /* 纵向跟着末端点走（贴在它上方 22px），不出顶界、也不压底线。
+     原来是 `Math.max(padT, padT - 2*dpr)` —— 这个式子的值恒等于 padT，
+     标签永远钉在绘图区顶部：|a| 掉到 0.35g（疑似跌落）时曲线沉到底，
+     标签还悬在顶上，读数和曲线看着像两样东西（2026-10-14 调优）。 */
+  var ly = Math.max(padT + 16*dpr, Math.min(last[1] - 22*dpr,
+                                            padT + plotH - 16*dpr));
   ctx.beginPath();
   if (ctx.roundRect) ctx.roundRect(lx - 6*dpr, ly, tw + 12*dpr, 16*dpr, 6*dpr);
   else ctx.rect(lx - 6*dpr, ly, tw + 12*dpr, 16*dpr);
@@ -3950,14 +3955,18 @@ function syncButtons(){
   var host = $("cmdbts");
   Array.prototype.forEach.call(host.querySelectorAll("button"), function(b){
     var n = b.dataset.cmd, ui = CMD_UI[n] || {};
-    b.disabled = busy || !devOnline;
-    if (ui.toggle && n === "led_set"){
-      b.textContent = ledSteady ? "LED 熄灭" : "LED 常亮";
-    } else if (n === "capture_once" && busy){
-      b.textContent = "等待板子回传…";
-    } else {
-      b.textContent = ui.label || n;
-    }
+    var dis = busy || !devOnline;
+    var txt = (ui.toggle && n === "led_set")
+      ? (ledSteady ? "LED 熄灭" : "LED 常亮")
+      : ((n === "capture_once" && busy) ? "等待板子回传…" : (ui.label || n));
+    /* 只在真的变了时才写 —— 和无条件重写说再见：
+       这条路径挂在 10Hz 渲染上，旧实现每秒把每个按钮的 disabled + textContent
+       重写十遍同样的值。白干活之外还有个真隐患：`busy` 翻转的那一瞬，
+       用户（或 E2E）的点击可能正落在 disabled 写入口上被吞掉
+       （手册 T68 弹窗偶发红的嫌疑之一）。写守卫消不掉翻转本身，
+       但把无谓的 DOM 写入降到 0，和 render()/renderDevices() 一个套路。 */
+    if (b.__dis !== dis){ b.__dis = dis; b.disabled = dis; }
+    if (b.__txt !== txt){ b.__txt = txt; b.textContent = txt; }
   });
 }
 /* 破坏性指令（目前只有 sd_format）先弹确认 —— 一键清掉整张卡，点错了没有撤销。
@@ -4827,18 +4836,33 @@ function sendAsk(){
   var t = el ? String(el.value || "").trim() : "";
   if (!t) return;
   el.value = "";
+  /* 必须走 apiFetch 而不是裸 fetch：服务端配了 RW1_API_TOKEN 时，/api/ask
+     就在被门的写入口里（WEB_WRITE_PATHS），裸 fetch 带不上 X-RW1-Token，
+     401 会被下面的 catch 静默吞掉 —— 用户看到的就是"打了字、什么都没发生"。
+     其余三个写入口（指令 / 停止 / 删照片）一直都走 apiFetch，只有这里漏了。 */
   apiFetch("/api/ask" + devQuery(), {
     method: "POST",
     headers: {"Content-Type": "application/json"},
     body: JSON.stringify({text: t})
   }).then(function(r){ return r.json(); }).then(function(d){
+    if (d && d.ok === false){
+      /* 失败也要让人看见。401 时 apiFetch 已经把页脚密钥框摊开了；这里把原因
+         写在回复位上（render() 不会覆盖它：服务端的 ai_reply 没变），
+         并把文字还给输入框 —— 用户填完密钥可以直接重发，不用重打。 */
+      $("reply").textContent = d.error || "发送失败";
+      el.value = t;
+      return;
+    }
     if (d && d.reply){
       aiReply = d.reply;                   /* 直接生效，不等下一次轮询 */
       $("reply").textContent = d.reply;
       speakReply(d.reply);
     }
     pull();
-  }).catch(function(){});
+  }).catch(function(){
+    /* 网络失败：文字还回去，别让用户白打一遍 */
+    el.value = t;
+  });
 }
 
 /* setInterval 只管按节拍往下排，不等上一个请求回来。
