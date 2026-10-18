@@ -188,6 +188,23 @@ def arc(draw, cx, cy, r, start_deg, end_deg, color, width):
 def text(draw, x, y, w, h, s, font, color, align="left", line_gap=0):
     """在 (x,y,w,h) 的框里画文字；垂直居中，水平按 align。返回占用的行数。"""
     lines = s.split("\n")
+    if len(lines) == 1:
+        line = lines[0]
+        tw = draw.textlength(line, font=font)
+        if align == "center":
+            tx = x + (w - tw) / 2
+        elif align == "right":
+            tx = x + w - tw
+        else:
+            tx = x
+        try:
+            bb = draw.textbbox((0, 0), line, font=font)
+            ty = y + (h - (bb[3] - bb[1])) / 2 - bb[1]
+        except Exception:
+            ty = y + max(0, (h - font.size) // 2)
+        draw.text((tx, ty), line, font=font, fill=color)
+        return 1
+
     lh = font.size + line_gap
     total = lh * len(lines)
     ty = y + max(0, (h - total) // 2)
@@ -411,7 +428,14 @@ class Renderer:
                fill=C["MARK"], width=1)
         d.line([(bcx - diag, bcy + diag), (bcx + diag, bcy - diag)],
                fill=C["MARK"], width=1)
-        circle(d, bcx, bcy, e["UI_LEVEL_D"] // 2, outline=C["TRACK"])
+        # 航姿罗盘参照圈：中圈 30° + 内圈水平区
+        circle(d, bcx, bcy, e.get("UI_PITCH_D", 46) // 2, outline=C["TRACK"])
+        circle(d, bcx, bcy, e["UI_LEVEL_D"] // 2, outline=C["MARK"])
+        # 罗盘 4 轴端点微刻度
+        d.line([(bcx, by0), (bcx, by0 + 3)], fill=C["MARK"])
+        d.line([(bcx, by0 + bd - 4), (bcx, by0 + bd - 1)], fill=C["MARK"])
+        d.line([(bx0, bcy), (bx0 + 3, bcy)], fill=C["MARK"])
+        d.line([(bx0 + bd - 4, bcy), (bx0 + bd - 1, bcy)], fill=C["MARK"])
 
         ox = int(max(-1.0, min(1.0, st["x"])) * e["UI_BUBBLE_MAX"])
         oy = int(max(-1.0, min(1.0, st["y"])) * e["UI_BUBBLE_MAX"])
@@ -458,19 +482,22 @@ class Renderer:
             text(d, e["UI_AXIS_LBL_X"], ry, e["UI_AXIS_LBL_W"], e["UI_AXIS_ROW_H"],
                  name, self.num[14], ac, "left")
             byy = ry + (e["UI_AXIS_ROW_H"] - e["UI_AXIS_BAR_H"]) // 2
-            box(d, e["UI_AXIS_BAR_X"], byy, e["UI_AXIS_BAR_W"], e["UI_AXIS_BAR_H"],
-                fill=C["TRACK"], radius=e["UI_AXIS_BAR_H"] // 2)
+            bx = e["UI_AXIS_BAR_X"]
+            bw = e["UI_AXIS_BAR_W"]
+            bh = e["UI_AXIS_BAR_H"]
+            box(d, bx, byy, bw, bh, fill=C["TRACK"], radius=bh // 2)
+            # ±1g 物理基准刻度线（-1g 与 +1g 位置，即 ±50% 处）
+            d.line([(bx + bw // 4, byy), (bx + bw // 4, byy + bh - 1)], fill=C["LINE"])
+            d.line([(bx + 3 * bw // 4, byy), (bx + 3 * bw // 4, byy + bh - 1)], fill=C["LINE"])
             frac = max(-1.0, min(1.0, val / 2.0))
             if abs(frac) > 0.02:
-                half_w = e["UI_AXIS_BAR_W"] / 2 * abs(frac)
-                x0 = e["UI_AXIS_BAR_X"] + (e["UI_AXIS_BAR_W"] / 2 if frac >= 0
-                                           else e["UI_AXIS_BAR_W"] / 2 - half_w)
-                box(d, x0, byy, half_w, e["UI_AXIS_BAR_H"], fill=ac,
-                    radius=e["UI_AXIS_BAR_H"] // 2)
+                half_w = bw / 2 * abs(frac)
+                x0 = bx + (bw / 2 if frac >= 0 else bw / 2 - half_w)
+                box(d, x0, byy, half_w, bh, fill=ac, radius=bh // 2)
             # 0 位中轴亮线（比轨道高 1px，最后画，压在最上层）
-            box(d, e["UI_AXIS_BAR_X"] + e["UI_AXIS_BAR_W"] // 2,
-                ry + (e["UI_AXIS_ROW_H"] - (e["UI_AXIS_BAR_H"] + 2)) // 2,
-                1, e["UI_AXIS_BAR_H"] + 2, fill=C["MARK"], radius=0)
+            box(d, bx + bw // 2,
+                ry + (e["UI_AXIS_ROW_H"] - (bh + 2)) // 2,
+                1, bh + 2, fill=C["MARK"], radius=0)
             text(d, e["UI_AXIS_VAL_X"], ry, e["UI_AXIS_VAL_W"], e["UI_AXIS_ROW_H"],
                  "%+.2f" % val, self.num[14], ac, "right")
 
@@ -489,16 +516,17 @@ class Renderer:
         d = sheen(img, e["UI_CARD_X"], cy0 + 1, e["UI_CARD_W"],
                   tuple(min(255, C["CARD"][k] + 14) for k in range(3)))
 
-        # 左侧 AI 蓝竖条（在渐变叠色之后画，避免被盖）
+        # 左侧 AI 竖条：生成中或真回复用琥珀，未提问用蓝
+        ai_accent = C["AMBER"] if (st.get("pending") or st.get("reply")) else C["BLUE"]
         box(d, e["UI_CARD_X"], cy0 + 12, e["UI_STRIPE_W"], e["UI_CARD_H"] - 24,
-            fill=C["BLUE"], radius=2)
+            fill=ai_accent, radius=2)
 
-        tag_bg = tuple(int(C["CARD"][k] + (C["BLUE"][k] - C["CARD"][k]) * 48 / 255)
+        tag_bg = tuple(int(C["CARD"][k] + (ai_accent[k] - C["CARD"][k]) * 48 / 255)
                        for k in range(3))
         box(d, e["UI_TAG_X"], cy0 + e["UI_TAG_Y"], e["UI_TAG_W"], e["UI_TAG_H"],
             fill=tag_bg, radius=7)
         text(d, e["UI_TAG_X"], cy0 + e["UI_TAG_Y"], e["UI_TAG_W"], e["UI_TAG_H"],
-             "AI", self.num[14], C["BLUE"], "center")
+             "AI", self.num[14], ai_accent, "center")
 
         body = st["reply"] if st["reply"] else "按 BOOT 键向电脑服务器的 AI 提问"
         _, total = reply_page(body, 0, e["UI_REPLY_COLS"])

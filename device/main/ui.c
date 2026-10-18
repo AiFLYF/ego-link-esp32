@@ -130,7 +130,8 @@ static const char *TAG = "ui";
 #define UI_BALL_W       1                       /* 外圈线宽 */
 #define UI_BUBBLE_D     18                      /* 重力球直径 */
 #define UI_BUBBLE_MAX   26                      /* 球心最大偏移（px），对应 1g */
-#define UI_LEVEL_D      22                      /* 中心「水平区」参考圈 */
+#define UI_LEVEL_D      20                      /* 中心「水平区」参考圈 */
+#define UI_PITCH_D      46                      /* 航姿罗盘 30° / 0.5g 参照圈 */
 #define UI_CROSS_LEN    52
 #define UI_CROSS_DIAG   34                      /* 45° 斜辅助线（水平仪刻度感） */
 
@@ -251,6 +252,9 @@ static lv_obj_t *s_lbl_reply;
 static lv_obj_t *s_lbl_page;
 static lv_obj_t *s_pdot[UI_PDOTS_N];           /* 分页圆点（总页数 ≤ N） */
 static lv_obj_t *s_spinner;
+static lv_obj_t *s_ai_stripe;
+static lv_obj_t *s_ai_tag;
+static lv_obj_t *s_ai_tag_lbl;
 
 /* 只在值变化时才动控件，避免 500ms 定时器把动画一次次重置 */
 #define UI_NONE (-1000000)
@@ -263,6 +267,10 @@ static int      s_last_abs = -1;
 static int      s_last_axis[3] = {UI_NONE, UI_NONE, UI_NONE};
 static int      s_last_badge = -1;
 static bool     s_last_online = true;
+static const char *s_last_link_text = NULL;
+static uint32_t s_last_link_color = 0;
+static uint32_t s_last_posts_ok = 0xFFFFFFFF;
+static char     s_last_tilt[32];
 static bool     s_fall_on;
 static int      s_bubble_tx = UI_NONE, s_bubble_ty = UI_NONE;
 static uint32_t s_last_ball_color;
@@ -482,14 +490,24 @@ static void build_detail(act_kind_t kind, const char *activity,
         return;
     case ACT_STILL:
     case ACT_IDLE:      /* 离线：服务器文案是空的，只能本地算 */
-        if (strstr(activity, "向左") || strstr(activity, "左")) {
-            snprintf(out, out_sz, "向左倾斜");
-        } else if (strstr(activity, "向右") || strstr(activity, "右")) {
+        if (strstr(activity, "向右上")) {
+            snprintf(out, out_sz, "向右上倾斜");
+        } else if (strstr(activity, "向右下")) {
+            snprintf(out, out_sz, "向右下倾斜");
+        } else if (strstr(activity, "向左上")) {
+            snprintf(out, out_sz, "向左上倾斜");
+        } else if (strstr(activity, "向左下")) {
+            snprintf(out, out_sz, "向左下倾斜");
+        } else if (strstr(activity, "向右")) {
             snprintf(out, out_sz, "向右倾斜");
-        } else if (strstr(activity, "向上") || strstr(activity, "上")) {
+        } else if (strstr(activity, "向左")) {
+            snprintf(out, out_sz, "向左倾斜");
+        } else if (strstr(activity, "向上")) {
             snprintf(out, out_sz, "向上倾斜");
-        } else if (strstr(activity, "向下") || strstr(activity, "下")) {
+        } else if (strstr(activity, "向下")) {
             snprintf(out, out_sz, "向下倾斜");
+        } else if (strstr(activity, "水平")) {
+            snprintf(out, out_sz, "水平");
         } else {
             const char *w = local_tilt_word(x_g, y_g);
             if (strcmp(w, "水平") == 0) {
@@ -566,9 +584,18 @@ static int reply_page(const char *src, int page, char *out, size_t out_sz)
             p = brk;
         }
 
-        /* 防御：一页至少要吃掉一个字符，否则死循环 */
+        /* 防御：一页至少要吃掉一个字符，否则死循环（按 UTF-8 字符长度步进） */
         if (p == start) {
-            p += 1;
+            unsigned char c = (unsigned char)*p;
+            int clen = 1;
+            if (c >= 0xF0) {
+                clen = 4;
+            } else if (c >= 0xE0) {
+                clen = 3;
+            } else if (c >= 0xC0) {
+                clen = 2;
+            }
+            p += clen;
         }
 
         if (idx == page) {
@@ -703,6 +730,9 @@ static void move_bubble(int tx, int ty)
         return;
     }
 
+    lv_anim_delete(s_bubble, anim_translate_x);
+    lv_anim_delete(s_bubble, anim_translate_y);
+
     lv_anim_t a;
     lv_anim_init(&a);
     lv_anim_set_var(&a, s_bubble);
@@ -755,9 +785,13 @@ static void ui_timer_cb(lv_timer_t *timer)
         s_prov_shown = false;
         s_last_reply[0] = '\0';
         s_last_activity[0] = '\0';
+        s_last_detail[0] = '\0';
         s_last_abs = UI_NONE;
         s_last_badge = -1;
         s_last_online = false;      /* 强制下一帧重画在线状态 */
+        s_last_link_text = NULL;
+        s_last_posts_ok = 0xFFFFFFFF;
+        s_last_tilt[0] = '\0';
         lv_obj_set_hidden(s_prov_panel, true);
     }
 
@@ -792,9 +826,13 @@ static void ui_timer_cb(lv_timer_t *timer)
         link_text = "无服务";
         link_color = UI_C_RED;
     }
-    lv_label_set_text(s_lbl_link, link_text);
-    lv_obj_set_style_text_color(s_lbl_link, lv_color_hex(link_color), 0);
-    lv_obj_set_style_bg_color(s_dot, lv_color_hex(link_color), 0);
+    if (link_text != s_last_link_text || link_color != s_last_link_color) {
+        s_last_link_text = link_text;
+        s_last_link_color = link_color;
+        lv_label_set_text(s_lbl_link, link_text);
+        lv_obj_set_style_text_color(s_lbl_link, lv_color_hex(link_color), 0);
+        lv_obj_set_style_bg_color(s_dot, lv_color_hex(link_color), 0);
+    }
 
     if (online != s_last_online) {
         s_last_online = online;
@@ -803,11 +841,18 @@ static void ui_timer_cb(lv_timer_t *timer)
     }
 
     /* ---------- 状态胶囊：采样率 / 上报数 ---------- */
-    snprintf(buf, sizeof(buf), "%dHz", (int)(1000 / CONFIG_RW1_SAMPLE_PERIOD_MS));
-    lv_label_set_text(s_lbl_hz, buf);
+    static bool s_hz_init = false;
+    if (!s_hz_init) {
+        s_hz_init = true;
+        snprintf(buf, sizeof(buf), "%dHz", (int)(1000 / CONFIG_RW1_SAMPLE_PERIOD_MS));
+        lv_label_set_text(s_lbl_hz, buf);
+    }
 
-    snprintf(buf, sizeof(buf), "↑%u", (unsigned)st.posts_ok);
-    lv_label_set_text(s_lbl_posts, buf);
+    if (st.posts_ok != s_last_posts_ok) {
+        s_last_posts_ok = st.posts_ok;
+        snprintf(buf, sizeof(buf), "↑%u", (unsigned)st.posts_ok);
+        lv_label_set_text(s_lbl_posts, buf);
+    }
 
     /* ---------- 远程指令徽标 / 语音状态（互斥，出现时临时顶替上报数） ----------
      * 语音**优先于**远程指令：用户刚按完键，"它在听"是此刻最该看到的信息。
@@ -950,10 +995,18 @@ static void ui_timer_cb(lv_timer_t *timer)
     static float s_deg = 0.0f;
     static bool s_deg_primed = false;
     if (mag < 0.05f) {
-        snprintf(buf, sizeof(buf), show_ori ? "无读数 o%d" : "无读数", ori);
+        if (show_ori) {
+            snprintf(buf, sizeof(buf), "无读数 o%d", ori);
+        } else {
+            snprintf(buf, sizeof(buf), "无读数");
+        }
     } else if (mag < 0.35f) {
         s_deg_primed = false;          /* 失重后重新起滤，别拿旧值 */
-        snprintf(buf, sizeof(buf), show_ori ? "失重 o%d" : "失重", ori);
+        if (show_ori) {
+            snprintf(buf, sizeof(buf), "失重 o%d", ori);
+        } else {
+            snprintf(buf, sizeof(buf), "失重");
+        }
     } else {
         float c = fabsf(dz) / mag;
         if (c > 1.0f) {
@@ -970,9 +1023,17 @@ static void ui_timer_cb(lv_timer_t *timer)
         /* 去掉「倾角」和数字之间的空格：这个 CJK 字体里 ASCII 是**全角**的，
          * 一个空格就是 12px —— 带上它会顶破 100px 的标签宽度而**换行**，
          * 第二行又被 14px 的行高裁掉（用户拍到的"显示不全"就是这个）。 */
-        snprintf(buf, sizeof(buf), show_ori ? "倾角%d° o%d" : "倾角%d°", deg, ori);
+        if (show_ori) {
+            snprintf(buf, sizeof(buf), "倾角%d° o%d", deg, ori);
+        } else {
+            snprintf(buf, sizeof(buf), "倾角%d°", deg);
+        }
     }
-    lv_label_set_text(s_lbl_tilt, buf);
+    if (strcmp(s_last_tilt, buf) != 0) {
+        strncpy(s_last_tilt, buf, sizeof(s_last_tilt) - 1);
+        s_last_tilt[sizeof(s_last_tilt) - 1] = '\0';
+        lv_label_set_text(s_lbl_tilt, buf);
+    }
 
     /* ---------- 三轴对称条 ---------- */
     float axis[3] = {dx, dy, dz};
@@ -1006,6 +1067,13 @@ static void ui_timer_cb(lv_timer_t *timer)
         /* 生成中压暗；空引导语用弱化灰，只有真正的 AI 回复才用琥珀色 */
         uint32_t reply_c = st.ai_pending ? UI_C_DIM : has_reply ? UI_C_AMBER : UI_C_FAINT;
         lv_obj_set_style_text_color(s_lbl_reply, lv_color_hex(reply_c), 0);
+
+        uint32_t accent = st.ai_pending ? UI_C_AMBER : (has_reply ? UI_C_AMBER : UI_C_BLUE);
+        if (s_ai_stripe != NULL) {
+            lv_obj_set_style_bg_color(s_ai_stripe, lv_color_hex(accent), 0);
+            lv_obj_set_style_bg_color(s_ai_tag, lv_color_hex(accent), 0);
+            lv_obj_set_style_text_color(s_ai_tag_lbl, lv_color_hex(accent), 0);
+        }
 
         lv_obj_set_hidden(s_spinner, !st.ai_pending);
         refresh_pager(0, s_page_total, st.ai_pending);
@@ -1150,8 +1218,17 @@ static void build_tilt_panel(lv_obj_t *scr)
         lv_obj_set_style_line_rounded(ln, true, 0);
     }
 
-    make_box(disc, cx - UI_LEVEL_D / 2, cx - UI_LEVEL_D / 2, UI_LEVEL_D, UI_LEVEL_D,
+    /* 30° / 0.5g 航姿罗盘参照圈 + 中心水平区参考圈 */
+    make_box(disc, cx - UI_PITCH_D / 2, cx - UI_PITCH_D / 2, UI_PITCH_D, UI_PITCH_D,
              0, UI_C_TRACK, LV_RADIUS_CIRCLE);
+    make_box(disc, cx - UI_LEVEL_D / 2, cx - UI_LEVEL_D / 2, UI_LEVEL_D, UI_LEVEL_D,
+             0, UI_C_MARK, LV_RADIUS_CIRCLE);
+
+    /* 罗盘 4 轴端点微刻度（顶底左右边缘） */
+    make_box(disc, cx, 1, 1, 3, UI_C_MARK, 0, 0);
+    make_box(disc, cx, UI_BALL_D - 4, 1, 3, UI_C_MARK, 0, 0);
+    make_box(disc, 1, cx, 3, 1, UI_C_MARK, 0, 0);
+    make_box(disc, UI_BALL_D - 4, cx, 3, 1, UI_C_MARK, 0, 0);
 
     s_bubble = make_box(disc, cx - UI_BUBBLE_D / 2, cx - UI_BUBBLE_D / 2,
                         UI_BUBBLE_D, UI_BUBBLE_D, UI_C_GREEN, 0, LV_RADIUS_CIRCLE);
@@ -1204,6 +1281,14 @@ static void build_axis_rows(lv_obj_t *scr)
                                        lv_color_hex(axis_color[i] & 0x7F7F7F), LV_PART_INDICATOR);
         lv_obj_set_style_bg_grad_dir(s_axis_bar[i], LV_GRAD_DIR_HOR, LV_PART_INDICATOR);
 
+        /* ±1g 物理基准刻度线（-1g 与 +1g 位置，即 ±50% 量程处） */
+        make_box(scr, UI_AXIS_BAR_X + UI_AXIS_BAR_W / 4,
+                 y + (UI_AXIS_ROW_H - UI_AXIS_BAR_H) / 2,
+                 1, UI_AXIS_BAR_H, UI_C_LINE, 0, 0);
+        make_box(scr, UI_AXIS_BAR_X + 3 * UI_AXIS_BAR_W / 4,
+                 y + (UI_AXIS_ROW_H - UI_AXIS_BAR_H) / 2,
+                 1, UI_AXIS_BAR_H, UI_C_LINE, 0, 0);
+
         /* 0 位中轴亮线：比轨道高一个像素，正负两边的刻度尺，始终压在最上层 */
         make_box(scr, UI_AXIS_BAR_X + UI_AXIS_BAR_W / 2,
                  y + (UI_AXIS_ROW_H - (UI_AXIS_BAR_H + 2)) / 2,
@@ -1232,14 +1317,14 @@ static void build_reply_card(lv_obj_t *scr)
     add_sheen(card, UI_CARD_W);
 
     /* 左侧 AI 蓝色竖条：整条消息的语义锚点 */
-    make_box(card, 0, 12, UI_STRIPE_W, UI_CARD_H - 24, UI_C_BLUE, 0, 2);
+    s_ai_stripe = make_box(card, 0, 12, UI_STRIPE_W, UI_CARD_H - 24, UI_C_BLUE, 0, 2);
 
-    lv_obj_t *tag = make_box(card, UI_TAG_X, UI_TAG_Y, UI_TAG_W, UI_TAG_H, UI_C_BLUE, 0, 7);
-    lv_obj_set_style_bg_opa(tag, 48, 0);        /* 半透明徽标，不抢正文 */
-    lv_obj_t *tag_lbl = make_label(tag, 0, 0, UI_TAG_W, UI_TAG_H,
-                                   &lv_font_montserrat_14, UI_C_BLUE, LV_TEXT_ALIGN_CENTER);
-    lv_label_set_long_mode(tag_lbl, LV_LABEL_LONG_CLIP);
-    lv_label_set_text(tag_lbl, "AI");
+    s_ai_tag = make_box(card, UI_TAG_X, UI_TAG_Y, UI_TAG_W, UI_TAG_H, UI_C_BLUE, 0, 7);
+    lv_obj_set_style_bg_opa(s_ai_tag, 48, 0);        /* 半透明徽标，不抢正文 */
+    s_ai_tag_lbl = make_label(s_ai_tag, 0, 0, UI_TAG_W, UI_TAG_H,
+                              &lv_font_montserrat_14, UI_C_BLUE, LV_TEXT_ALIGN_CENTER);
+    lv_label_set_long_mode(s_ai_tag_lbl, LV_LABEL_LONG_CLIP);
+    lv_label_set_text(s_ai_tag_lbl, "AI");
 
     /* 生成中：转圈，与右侧分页指示器互斥 */
     s_spinner = lv_spinner_create(card);
