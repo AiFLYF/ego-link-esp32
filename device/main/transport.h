@@ -63,7 +63,7 @@ typedef struct {
     float x_g, y_g, z_g;                               /*!< last sent sample (screen frame) */
     uint32_t posts_ok, posts_fail;
     uint16_t batch_last;                               /*!< samples in the last batch */
-    uint8_t  orient;                                   /*!< active tilt calibration 0..7 */
+    uint8_t  orient;                                   /*!< active tilt calibration 0..15 */
     bool  ai_pending;                                  /*!< server is still generating the reply */
     uint8_t  cmd_state;                                /*!< transport_cmd_state_t */
     uint16_t cmd_count;                                /*!< commands executed since boot */
@@ -71,7 +71,9 @@ typedef struct {
     uint8_t  voice_state;                              /*!< transport_voice_state_t */
 } transport_status_t;
 
-/** Start the telemetry task (waits for WiFi internally). */
+/** Start the sampling/upload tasks. Sampling runs without WiFi; uploads are
+ *  simply skipped until the link comes up (2026-09-28 起不再等 WiFi —— 等，
+ *  没网时板子连采样/界面都会停，像死机). */
 void transport_start(void);
 
 /**

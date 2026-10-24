@@ -1534,7 +1534,7 @@ void transport_start(void)
 
 void transport_reload_config(void)
 {
-    /* 地址与设备 id 都来自 net_config（NVS 优先 / 回退 Kconfig），配网改完立即生效。
+    /* 地址与设备 id 都来自 net_config（配网写进 NVS，是唯一来源），配网改完立即生效。
      * 缓存成静态而不是每次上报都读 NVS：post_batch 和采样循环在同一个任务里，
      * 每次 2 Hz 去开关 NVS 句柄会白占锁、拖慢采样。 */
     net_config_t cfg;
