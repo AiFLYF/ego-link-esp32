@@ -2577,7 +2577,8 @@ h1,h2,h3{font-family:var(--font-display);text-wrap:balance}
   border-bottom:1px solid var(--color-line);
   padding-block:var(--sp-16);
   background-image:
-    radial-gradient(880px 320px at 4% 0%, rgb(var(--act-rgb) / .10), transparent 64%),
+    radial-gradient(880px 360px at 12% 0%, rgb(var(--act-rgb) / .15), transparent 64%),
+    radial-gradient(640px 300px at 88% 10%, oklch(0.800 0.130 178 / .06), transparent 60%),
     var(--stage-veil);
   transition:background-image var(--dur-4) var(--ease-out);
 }
@@ -2596,6 +2597,7 @@ h1,h2,h3{font-family:var(--font-display);text-wrap:balance}
 .hero-ring{position:relative;width:168px;height:168px;flex:none}
 .hero-ring svg{width:100%;height:100%;display:block;transform:rotate(135deg)}
 .hero-ring .track{fill:none;stroke:var(--color-surface-3);stroke-width:9;stroke-linecap:round;stroke-dasharray:263.9 351.9}
+.hero-ring .ticks{fill:none;stroke:var(--color-line-strong);stroke-width:3;stroke-linecap:round;stroke-dasharray:2 19.8;opacity:.55}
 .hero-ring .val{
   fill:none;stroke:var(--color-idle);stroke-width:9;stroke-linecap:round;
   stroke-dasharray:0 351.9;
@@ -2642,6 +2644,14 @@ h1,h2,h3{font-family:var(--font-display);text-wrap:balance}
   position:absolute;left:50%;top:50%;width:34%;height:34%;
   transform:translate(-50%,-50%);border-radius:50%;border:1px dashed var(--color-line);
 }
+.ball .ring3{
+  position:absolute;left:50%;top:50%;width:64%;height:64%;
+  transform:translate(-50%,-50%);border-radius:50%;border:1px solid var(--color-line-strong);opacity:.45;
+}
+.ball .ticks{position:absolute;inset:0}
+.ball .ticks::before,.ball .ticks::after{content:"";position:absolute;background:var(--color-line-strong);opacity:.65}
+.ball .ticks::before{left:50%;top:2px;width:1px;height:4px;transform:translateX(-.5px);box-shadow:0 calc(100% - 6px) 0 0 var(--color-line-strong)}
+.ball .ticks::after{top:50%;left:2px;height:1px;width:4px;transform:translateY(-.5px);box-shadow:calc(100% - 6px) 0 0 0 var(--color-line-strong)}
 .ball .cross::before,.ball .cross::after{content:"";position:absolute;background:var(--color-line)}
 .ball .cross::before{left:50%;top:14%;bottom:14%;width:1px}
 .ball .cross::after{top:50%;left:14%;right:14%;height:1px}
@@ -2661,6 +2671,7 @@ h1,h2,h3{font-family:var(--font-display);text-wrap:balance}
 .bar em{font:600 var(--fs-meta)/1 var(--font-mono);font-style:normal}
 .bar .t{position:relative;height:6px;border-radius:var(--radius-control);background:var(--color-surface-3)}
 .bar .t i{position:absolute;top:0;height:100%;border-radius:var(--radius-control);left:50%;width:0;transition:left var(--dur-2) var(--ease-out),width var(--dur-2) var(--ease-out),background var(--dur-2) var(--ease-out)}
+.bar .t::before{content:"";position:absolute;top:-2px;bottom:-2px;left:25%;width:1px;transform:translateX(-.5px);background:var(--color-line-strong);opacity:.45;box-shadow:calc(50% * 1) 0 0 0 var(--color-line-strong)}
 .bar .t::after{content:"";position:absolute;left:50%;top:-2px;bottom:-2px;width:1px;transform:translateX(-.5px);background:var(--color-line-strong)}
 .bar .v{text-align:right;font:500 var(--fs-meta)/1 var(--font-mono)}
 
@@ -2688,6 +2699,16 @@ h1,h2,h3{font-family:var(--font-display);text-wrap:balance}
    不加第二个实心主操作（设计系统：全页只允许 1 个 primary）。 */
 .askrow{display:flex;align-items:center;gap:var(--sp-2);flex-wrap:wrap;margin-top:var(--sp-3)}
 .askrow input{flex:1 1 200px;min-width:0}
+.ask-chips{display:flex;align-items:center;gap:var(--sp-2);flex-wrap:wrap;margin-top:var(--sp-2)}
+.ask-chip{
+  height:24px;padding:0 var(--sp-2);
+  border-radius:var(--radius-control);border:1px solid var(--color-line);
+  background:var(--color-surface-2);color:var(--color-text-muted);
+  font:500 var(--fs-micro)/1 var(--font-mono);cursor:pointer;
+  display:inline-flex;align-items:center;white-space:nowrap;
+  transition:background var(--dur-1) var(--ease-out),border-color var(--dur-1) var(--ease-out),color var(--dur-1) var(--ease-out);
+}
+.ask-chip:hover{background:var(--tint-primary);border-color:var(--tint-primary-line);color:var(--color-action-primary)}
 .reply-foot{
   margin-top:auto;display:flex;justify-content:space-between;gap:var(--sp-4);flex-wrap:wrap;
   font:400 var(--fs-micro)/1.5 var(--font-mono);color:var(--color-text-faint);
@@ -3128,6 +3149,7 @@ dialog.modal[open]::backdrop{animation:modal-veil var(--dur-2) var(--ease-out)}
         <div class="hero-ring">
           <svg viewBox="0 0 140 140" aria-hidden="true">
             <circle class="track" cx="70" cy="70" r="56"></circle>
+            <circle class="ticks" cx="70" cy="70" r="56"></circle>
             <circle class="val" id="ring" cx="70" cy="70" r="56"></circle>
           </svg>
           <div class="ring-mid">
@@ -3151,8 +3173,10 @@ dialog.modal[open]::backdrop{animation:modal-veil var(--dur-2) var(--ease-out)}
           <span class="src mono" id="tilt">倾角 —</span>
         </div>
         <div class="ball">
+          <div class="ticks"></div>
           <div class="cross"></div>
           <div class="cross2"></div>
+          <div class="ring3"></div>
           <div class="ring2"></div>
           <div class="dot" id="ball"></div>
         </div>
@@ -3181,6 +3205,12 @@ dialog.modal[open]::backdrop{animation:modal-veil var(--dur-2) var(--ease-out)}
                    aria-label="打字下达任务">
             <button id="asksend" class="sm" type="button">发送</button>
             <button id="ttsbtn" class="sm" type="button" aria-pressed="true">播报 开</button>
+          </div>
+          <div class="ask-chips" id="askchips">
+            <button class="ask-chip" type="button" data-ask="拍张照">📷 拍张照</button>
+            <button class="ask-chip" type="button" data-ask="闪三下灯">💡 闪三下</button>
+            <button class="ask-chip" type="button" data-ask="切到第3档方向">🔄 调到第3档</button>
+            <button class="ask-chip" type="button" data-ask="分析当前运动状态">⏱ 状态分析</button>
           </div>
         </div>
       </div>
@@ -3660,17 +3690,23 @@ function drawChart(){
   ctx.lineTo(pts[n-1][0], padT+plotH); ctx.closePath();
   ctx.fillStyle = grad; ctx.fill();
 
+  ctx.save();
+  ctx.shadowColor = cssVar("--color-move", .38);
+  ctx.shadowBlur = 6 * dpr;
   ctx.beginPath();
   pts.forEach(function(p, i){ i ? ctx.lineTo(p[0],p[1]) : ctx.moveTo(p[0],p[1]); });
   ctx.strokeStyle = cMove; ctx.lineWidth = 2*dpr;
   ctx.lineJoin = "round"; ctx.stroke();
+  ctx.restore();
 
-  /* 末端点 */
+  /* 末端点与光晕脉冲 */
   var last = pts[n-1];
-  ctx.beginPath(); ctx.arc(last[0], last[1], 4*dpr, 0, 6.2832);
+  ctx.beginPath(); ctx.arc(last[0], last[1], 10*dpr, 0, 6.2832);
+  ctx.fillStyle = cssVar("--color-move", .12); ctx.fill();
+  ctx.beginPath(); ctx.arc(last[0], last[1], 6*dpr, 0, 6.2832);
+  ctx.fillStyle = cssVar("--color-move", .30); ctx.fill();
+  ctx.beginPath(); ctx.arc(last[0], last[1], 3.5*dpr, 0, 6.2832);
   ctx.fillStyle = cMove; ctx.fill();
-  ctx.beginPath(); ctx.arc(last[0], last[1], 8*dpr, 0, 6.2832);
-  ctx.fillStyle = cssVar("--color-move", .20); ctx.fill();
 
   /* 末端读数胶囊：半透明深色底 + 当前活动色描边，贴在末端点上方，不出右界 */
   var label = last[2].toFixed(2) + " g";
@@ -3865,6 +3901,12 @@ function update3d(x, y, z){
     }
   }
   d3.target.copy(best || base);
+  var srcEl = $("d3src");
+  if (srcEl && (Math.abs(x) > 0.05 || Math.abs(y) > 0.05 || Math.abs(z) > 0.05)) {
+    var pitch = Math.round(Math.atan2(-y, Math.sqrt(x*x + z*z)) * 180 / Math.PI);
+    var roll = Math.round(Math.atan2(x, z) * 180 / Math.PI);
+    srcEl.textContent = "俯仰 " + (pitch >= 0 ? "+" : "") + pitch + "° · 翻滚 " + (roll >= 0 ? "+" : "") + roll + "°";
+  }
 }
 
 function setBall(x, y, mag){
@@ -5035,11 +5077,21 @@ fetch("/api/commands" + devQuery()).then(function(r){ return r.json(); }).then(f
       .then(function(){ btn.disabled = false; })
       .catch(function(){ btn.disabled = false; });
   };
-  /* 第 5 周：文字入口 + 播报开关 */
+  /* 第 5 周：文字入口 + 播报开关 + 快捷任务 Chip */
   if ($("asksend")) $("asksend").onclick = sendAsk;
   if ($("asktext")) $("asktext").onkeydown = function(e){
     if (e.key === "Enter"){ e.preventDefault(); sendAsk(); }
   };
+  var chips = $("askchips");
+  if (chips) {
+    Array.prototype.forEach.call(chips.querySelectorAll(".ask-chip"), function(btn){
+      btn.onclick = function(){
+        var ask = btn.getAttribute("data-ask") || "";
+        var inp = $("asktext");
+        if (inp) { inp.value = ask; sendAsk(); }
+      };
+    });
+  }
   if ($("ttsbtn")) $("ttsbtn").onclick = function(){
     ttsOn = !ttsOn;
     this.textContent = "播报 " + (ttsOn ? "开" : "关");

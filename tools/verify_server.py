@@ -33,6 +33,17 @@ ROOT = os.path.dirname(HERE)
 SERVER_PY = os.path.join(ROOT, "server", "server.py")
 PY = sys.executable
 
+if sys.stdout and hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+if sys.stderr and hasattr(sys.stderr, "reconfigure"):
+    try:
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 # 沙箱/本机可能有全局 http_proxy，会把 127.0.0.1 的请求也劫走
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
@@ -61,7 +72,12 @@ RESULTS = []
 
 def check(name, ok, detail=""):
     RESULTS.append((name, bool(ok), detail))
-    print("  [%s] %s%s" % ("PASS" if ok else "FAIL", name, ("  — " + detail) if detail else ""))
+    try:
+        print("  [%s] %s%s" % ("PASS" if ok else "FAIL", name, ("  — " + detail) if detail else ""))
+    except UnicodeEncodeError:
+        safe_detail = detail.encode("ascii", errors="backslashreplace").decode("ascii")
+        safe_name = name.encode("ascii", errors="backslashreplace").decode("ascii")
+        print("  [%s] %s%s" % ("PASS" if ok else "FAIL", safe_name, ("  — " + safe_detail) if detail else ""))
     return ok
 
 
@@ -234,7 +250,7 @@ def feed(port, scenario, seconds, ask_at=None, expect_steps=None):
         cmd += ["--ask-at", str(a)]
     if expect_steps is not None:
         cmd += ["--expect-steps", str(expect_steps)]
-    p = subprocess.run(cmd, capture_output=True, text=True, env=CHILD_ENV)
+    p = subprocess.run(cmd, capture_output=True, encoding="utf-8", errors="replace", env=CHILD_ENV)
     return p.returncode, p.stdout + p.stderr
 
 
@@ -289,7 +305,7 @@ def main():
                             "--data-dir", data_dir, "--retain-days", "0",
                             "--cmd-timeout", "5"],
                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                           text=True, env=env, cwd=ROOT)
+                           encoding="utf-8", errors="replace", env=env, cwd=ROOT)
     mock = ThreadingHTTPServer(("127.0.0.1", llm_port), MockLLM)
     threading.Thread(target=mock.serve_forever, daemon=True).start()
 
@@ -1048,7 +1064,8 @@ def main():
             [PY, os.path.join(HERE, "fake_board.py"),
              "--url", nbase, "--device", nl_dev, "--scenario", "idle",
              "--period", "0.25", "--seconds", "60", "--quiet"],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=CHILD_ENV)
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            encoding="utf-8", errors="replace", env=CHILD_ENV)
         for _ in range(BOARD_WAIT_STEPS):
             live = [d["id"] for d in get_json(nbase + "/api/devices").get("devices", [])]
             if nl_dev in live:
@@ -1295,7 +1312,7 @@ def main():
         srv2 = subprocess.Popen([PY, "-u", SERVER_PY, "--port", str(port2),
                                  "--data-dir", data_dir + "2", "--retain-days", "0"],
                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                text=True, env=token_env, cwd=ROOT)
+                                encoding="utf-8", errors="replace", env=token_env, cwd=ROOT)
         up = False
         for _ in range(50):
             try:
