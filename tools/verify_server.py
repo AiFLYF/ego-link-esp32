@@ -322,6 +322,23 @@ def main():
             print("服务器没起来")
             return 1
 
+        # ---- 0. 静态自检：看护线程每天要调的方法，现在就必须存在 -------------
+        # 2026-10-25 事故：JsonlLogger 的清理方法曾叫 _purge_old，而看护线程调的
+        # 是 LOGGER.purge_old() —— 服务端连跑 24 小时后那里抛 AttributeError，
+        # **看护线程整个死掉**（设备离线判定/指令超时/日志清理全部静默停摆）。
+        # 短期回归测不到它（谁也不会把测试跑满 24 小时），所以这里用 importlib
+        # 把 server.py 当模块加载（import 只定义、不执行 main()），点名
+        # 「长期路径上要调的东西，现在就存在」——T69「工具写好了 ≠ 生效」的变体：
+        # 方法改了名，调用点未必跟上。
+        print("\n[0] 静态自检")
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("rw1_server_static", SERVER_PY)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        check("看护线程每日调用的 JsonlLogger.purge_old 存在（24h 看护死亡的静态门禁）",
+              callable(getattr(mod.JsonlLogger, "purge_old", None)),
+              "实际: %r" % getattr(mod.JsonlLogger, "purge_old", None))
+
         # ---- 1. 静置 ----------------------------------------------------
         print("\n[1] 静置")
         feed(port, "idle", 6)
