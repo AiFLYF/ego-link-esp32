@@ -677,7 +677,7 @@ class JsonlLogger:
         self._fhs = {}                 # path -> 文件句柄（遥测与事件是两个文件，
                                        # 必须各持一个句柄，否则会互相串写）
         os.makedirs(root, exist_ok=True)
-        self._purge_old()
+        self.purge_old()
         threading.Thread(target=self._run, name="jsonl", daemon=True).start()
 
     # ---- 生产者 ----------------------------------------------------------
@@ -760,8 +760,16 @@ class JsonlLogger:
         fh.flush()
         self.written += 1
 
-    def _purge_old(self):
-        """启动时删掉超过保留期的日志，避免一个学期把磁盘写满。"""
+    def purge_old(self):
+        """删掉超过保留期的日志。构造时跑一次；之后看护线程每天调一次（P1-11）。
+
+        ⚠️ 必须是**公开名**：watchdog 调的就是 `LOGGER.purge_old()`。
+        2026-10-25 事故：这个方法曾叫 `_purge_old`，而看护线程调的是不带下划线的
+        名字 —— 服务端连跑 24 小时后那里抛 AttributeError，**看护线程整个死掉**
+        （设备离线判定 / 指令超时 / 日志清理全部静默停摆）。短期回归全测不到它，
+        谁也不会把测试跑满 24 小时；tools/verify_server.py 第 [0] 节因此加了
+        一条静态门禁点名这个方法的存在。
+        """
         if self.retain_days <= 0:
             return
         cutoff = time.time() - self.retain_days * 86400
@@ -1876,23 +1884,28 @@ class Handler(BaseHTTPRequestHandler):
             return
         with LOCK:
             dev = get_device(dev_id)
-            if dev.st["voice_state"] in ("transcribing", "thinking"):
-                self._send(429, json.dumps(
-                    {"ok": False, "error": "上一段还在处理"}, ensure_ascii=False))
-                return
-            dev.st["voice_state"] = "transcribing"
-            dev.st["voice_err"] = ""
-            # 计时（第 6 周）：这一轮语音任务从"收到录音"这一刻算起。
-            dev.st["voice_t0"] = time.time()
-            dev.st["voice_ms"] = 0
-            dev.st["total_ms"] = 0
-            # 记下此刻的回合令牌：识别期间用户要是又问了一句，令牌会变，
-            # 这段迟到的识别结果就该丢弃（第 6 周「迟到结果隔离」）。
-            turn = dev.st["ai_cancel"]
-            # 板端立刻有反馈：识别要几秒（云端更久），这段时间屏幕不该一动不动。
-            # 但如果上一轮大模型还在生成，就别把它挤掉 —— 那会把快出结果的那次弄丢。
-            if not dev.st["ai_pending"]:
-                dev.st["ai_reply"] = "正在识别…"
+            busy = dev.st["voice_state"] in ("transcribing", "thinking")
+            if not busy:
+                dev.st["voice_state"] = "transcribing"
+                dev.st["voice_err"] = ""
+                # 计时（第 6 周）：这一轮语音任务从"收到录音"这一刻算起。
+                dev.st["voice_t0"] = time.time()
+                dev.st["voice_ms"] = 0
+                dev.st["total_ms"] = 0
+                # 记下此刻的回合令牌：识别期间用户要是又问了一句，令牌会变，
+                # 这段迟到的识别结果就该丢弃（第 6 周「迟到结果隔离」）。
+                turn = dev.st["ai_cancel"]
+                # 板端立刻有反馈：识别要几秒（云端更久），这段时间屏幕不该一动不动。
+                # 但如果上一轮大模型还在生成，就别把它挤掉 —— 那会把快出结果的那次弄丢。
+                if not dev.st["ai_pending"]:
+                    dev.st["ai_reply"] = "正在识别…"
+        if busy:
+            # 429 的发送必须在 LOCK 之外：持锁写 socket，一个卡住的客户端会连累
+            # 全部板子的上报 —— /api/latest 与 SSE 早就按这条规矩把序列化留在
+            # 锁内、发送挪到锁外，这里不能做例外。
+            self._send(429, json.dumps(
+                {"ok": False, "error": "上一段还在处理"}, ensure_ascii=False))
+            return
         saved = self._audio_save(dev, data)
         push_event(dev, "ask", "收到 %d 字节录音，开始识别" % len(data))
         threading.Thread(target=_voice_worker, args=(dev, data, saved, turn),
@@ -2039,8 +2052,7 @@ class Handler(BaseHTTPRequestHandler):
             st = dev.st
             prev_post = st["last_post"]
             was_online = st["device_online"]
-            # 采样间隔由"本批样本数 / 两批到达的间隔"自校准，不依赖板端上报
-            # dt 由"本批样本数 / 两批到达的间隔"自校准。但**晚到的帧不可信**：
+            # dt 由"本批样本数 / 两批到达的间隔"自校准，不依赖板端上报。但**晚到的帧不可信**：
             # 若某帧因网络抖动晚到 3 秒，50 个样本的推断间隔会被算成 60 ms，
             # 这批样本就被摊到 3 秒的时间轴上 —— MOTION_WINDOW_S(0.6 s) 的短窗里
             # 只剩最后 1~2 个样本，晃动/跌落全部漏检，sample_hz 也会跳变。
