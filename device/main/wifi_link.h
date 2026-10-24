@@ -5,8 +5,8 @@
  * reach the PC server, and keeps Aliyun SNTP running so log timestamps are
  * meaningful.
  *
- * 第 4 周起凭据不再直接来自 Kconfig，而是走 `net_config`（NVS 优先，
- * NVS 为空则回退 Kconfig）——这样配网改完立即生效，不用重编译。
+ * 凭据只从 `net_config`（配网写进 NVS）来 —— **不回退 Kconfig**（2026-09-23
+ * 起删掉了那条路：固件里永远不含 WiFi 密码）。配网改完立即生效，不用重编译。
  *
  * 初始化被拆成两步，因为配网需要"先把 WiFi 栈建起来、但先不连"：
  *   wifi_link_init()  → netif / event loop / wifi init + 注册 handler
