@@ -121,6 +121,11 @@ static char s_url[NET_URL_MAX];/* 上报地址：来自 net_config（运行期�
 /* 设备 id：服务端按它分片（多板场景下仪表盘区分板子的唯一依据）。
  * 由 net_config_device_id() 解析：配网页填了就用填的，留空则按 MAC 生成 rw1-XXXX。 */
 static char s_device[NET_DEV_MAX];
+/* 同上，但**已做 URL 百分号编码**，只给"拼进查询串"的两个接口用
+ * （/api/audio 与 /api/frame）。遥测走 JSON body，用的是上面那个原始值。
+ * 为什么要两份：见 url_encode() 的注释 —— 课堂里最常见的设备名是
+ * 「第三组-07」，原样拼进 URL 会让同一块板在服务端裂成两台。 */
+static char s_device_url[NET_DEV_MAX * 3 + 1];
 static uint32_t s_poll_fail;   /* 连续 accel_input_poll 失败次数（真实源读失败） */
 static char s_last_reply[TRANSPORT_REPLY_LEN];   /* 上一次看到过的服务器回复 */
 /* 语音任务：按钮一按就唤醒它去录音。**必须是独立任务** —— 录音要阻塞 3 秒，
@@ -158,6 +163,65 @@ static void status_lock(void)
 static void status_unlock(void)
 {
     xSemaphoreGive(s_lock);
+}
+
+/* ---------------- 跨任务读配置：一律"锁内拷一份" ---------------------------
+ *
+ * 背景：transport_reload_config() 由**配网的 httpd 任务**调用（配网保存后立即
+ * 生效），而真正发请求的是 upload_task / voice_task。`s_device` 早就加了锁，
+ * `s_url` 却一直是裸读 —— 读到半截就会拼出 `http://192.168.1.` 这种 URL，
+ * 表现为"偶发一次上报失败"，几乎不可能复现。
+ *
+ * 三个小 helper 把这件事收敛成一个口径：**调用方永远拿本地副本**。
+ * 每次开销只是一次 mutex take（2 Hz 量级，可以忽略）。
+ */
+static void copy_url(char *dst, size_t cap)
+{
+    status_lock();
+    strlcpy(dst, s_url, cap);
+    status_unlock();
+}
+
+static void copy_device_url(char *dst, size_t cap)
+{
+    status_lock();
+    strlcpy(dst, s_device_url, cap);
+    status_unlock();
+}
+
+/* 把设备名编码成 URL 查询串可用的形式（RFC 3986 的 unreserved 之外一律 %XX）。
+ *
+ * **为什么必须有**：设备名是用户在配网页手填的，课堂里最常见的就是「第三组-07」。
+ * 遥测把设备名放在 JSON body 里，没问题；但 /api/audio 和 /api/frame 是把它
+ * **拼进 URL** 的。原始 UTF-8 字节写进请求行之后，Python 的 http.server 用
+ * latin-1 解请求行，同一个「第三组-07」在服务端变成「ç¬¬ä¸ç»„-07」——
+ * 于是同一块板在仪表盘上裂成两台：遥测一台、画面/语音另一台，
+ * 实时画面永远 404、照片存进乱码目录。
+ *
+ * ASCII 的 unreserved 字符原样保留（日志里仍然可读），只编码真正需要编码的字节。
+ * 目标缓冲至少要 `sizeof(src) * 3 + 1`。 */
+static void url_encode(const char *src, char *dst, size_t cap)
+{
+    static const char hex[] = "0123456789ABCDEF";
+    size_t o = 0;
+
+    for (const unsigned char *p = (const unsigned char *)src; *p != '\0'; ++p) {
+        const bool plain = (*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
+                           (*p >= '0' && *p <= '9') ||
+                           *p == '-' || *p == '_' || *p == '.' || *p == '~';
+        const size_t need = plain ? 1u : 3u;
+        if (o + need + 1u > cap) {
+            break;              /* 宁可截断也不越界；设备名本身有 NET_DEV_MAX 上限 */
+        }
+        if (plain) {
+            dst[o++] = (char)*p;
+        } else {
+            dst[o++] = '%';
+            dst[o++] = hex[(*p >> 4) & 0x0F];
+            dst[o++] = hex[*p & 0x0F];
+        }
+    }
+    dst[o] = '\0';
 }
 
 /* ---------------- remote commands (week 2 起) ----------------------------- */
@@ -261,8 +325,11 @@ static char s_cfg_url[NET_URL_MAX];
 static int  s_cfg_period;
 
 /* 上报周期（毫秒）—— 做成变量而不是 const，好让 set_config 在运行时改掉它。
- * 「灵敏度」本质上就是这个：周期越短，网页小球跟得越紧。 */
-static TickType_t s_post_ticks;
+ * 「灵敏度」本质上就是这个：周期越短，网页小球跟得越紧。
+ * volatile 的理由：由配网的 httpd 任务在锁内写、由采样循环每 10ms 读。
+ * TickType_t 是 32 位且自然对齐，单次读写在 Xtensa 上是原子的 —— 只会读到
+ * "旧值"或"新值"，不会读到半截；字符串才有这个问题（所以 s_url 走 copy_url）。 */
+static volatile TickType_t s_post_ticks;
 
 /* led_blink 的可选 pattern 参数：让服务端能表达"这是告警/确认/错误"的语义，
  * 而不是只丢一个"闪 N 次"过来。板端映射到对应的预置图案——
@@ -596,7 +663,15 @@ static void run_command(cmd_kind_t kind, const char *id,
             finish_command(false, false, "拍照失败（没插卡 / 摄像头不可用？）");
             break;
         }
-        camera_post_frame(s_url, s_device, true);   /* 留档用，失败不影响结果 */
+        {
+            /* s_url / 设备名都拷出来再用（配网任务随时可能改写它们），
+             * 设备名还要用 **URL 编码** 的那一份 —— 见 url_encode 的注释。 */
+            char base[NET_URL_MAX];
+            char dev[sizeof(s_device_url)];
+            copy_url(base, sizeof(base));
+            copy_device_url(dev, sizeof(dev));
+            camera_post_frame(base, dev, true);   /* 留档用，失败不影响结果 */
+        }
         snprintf(s_cmd.note, sizeof(s_cmd.note), "已存 %s", name);
         status_lock();
         s_st.cmd_count++;
@@ -795,15 +870,18 @@ static bool sanitize3(float x, float y, float z, float out[3])
  * with 15 significant digits, so a float 0.012f comes out as
  * "0.0120000001634057" and a 50-sample batch balloons to ~2.7 kB. "%.3f" gives
  * exactly the precision the analysis needs (1 mg) in a third of the bytes. */
-static char *build_body(const tx_job_t *job, const char *source)
+static char *build_body(const tx_job_t *job, const char *source, const char *device)
 {
     const int n = (int)job->n;
     if (n <= 0) {
         return NULL;
     }
+    if (device == NULL) {
+        device = "";
+    }
     size_t cap = 256 + (size_t)n * 28 + strlen(s_ask_text) * 2 + 64
                  + (job->had_result ? (320 + CMD_NOTE_LEN + 24) : 0) + 32
-                 + strlen(s_device) * 6 + 24;   /* "dev" 字段：设备名是用户输入，转义后可能翻倍 */
+                 + strlen(device) * 6 + 24;   /* "dev" 字段：设备名是用户输入，转义后可能翻倍 */
     char *buf = malloc(cap);
     if (buf == NULL) {
         return NULL;
@@ -815,7 +893,7 @@ static char *build_body(const tx_job_t *job, const char *source)
      * 服务端找 device"这种对不上的静默失败（verify_server.py 的固件格式契约用例
      * 就是钉这个的）。 */
     int off = snprintf(buf, cap, "{\"device\":\"");
-    if (!json_escape_append(buf, cap, &off, s_device)) {
+    if (!json_escape_append(buf, cap, &off, device)) {
         free(buf);
         return NULL;
     }
@@ -1106,15 +1184,22 @@ static esp_err_t http_event_handler(esp_http_client_event_t *evt)
 
 static bool post_batch(const tx_job_t *job)
 {
-    char url[NET_URL_MAX + 16];
-    snprintf(url, sizeof(url), "%s%s", s_url, TX_PATH);
-
+    /* 三个字段一次锁内拷完：url / 原始设备名 / source 都可能被别的任务改
+     * （见 copy_url 上面那段注释）。拷出来的副本在本函数里不再变化，
+     * 之后的 build_body 也就没有"读到半截"的可能了。 */
+    char base[NET_URL_MAX];
+    char device[NET_DEV_MAX];
     char source[16];
     status_lock();
+    strlcpy(base, s_url, sizeof(base));
+    strlcpy(device, s_device, sizeof(device));
     strlcpy(source, s_st.source, sizeof(source));
     status_unlock();
 
-    char *body = build_body(job, source);
+    char url[NET_URL_MAX + 16];
+    snprintf(url, sizeof(url), "%s%s", base, TX_PATH);
+
+    char *body = build_body(job, source, device);
     if (body == NULL) {
         ESP_LOGE(TAG, "out of memory building telemetry body");
         return false;
@@ -1174,8 +1259,16 @@ static bool post_batch(const tx_job_t *job)
  */
 static bool post_audio(const uint8_t *pcm, size_t len)
 {
-    char url[NET_URL_MAX + 64];
-    snprintf(url, sizeof(url), "%s%s?device=%s", s_url, VOICE_PATH, s_device);
+    /* 设备名必须用**已编码**的那一份：这是拼进查询串的。若用原始值，
+     * 「第三组-07」会在服务端被 latin-1 解成乱码，语音就挂到另一台幽灵设备上
+     * （见 url_encode 的注释）。缓冲按 NET_URL_MAX + 128 算：
+     * 128(地址) + 10(路径) + 9("?device=") + 72(编码后设备名最长) < 224。 */
+    char base[NET_URL_MAX];
+    char dev[sizeof(s_device_url)];
+    char url[NET_URL_MAX + 128];
+    copy_url(base, sizeof(base));
+    copy_device_url(dev, sizeof(dev));
+    snprintf(url, sizeof(url), "%s%s?device=%s", base, VOICE_PATH, dev);
 
     /* 不能和 post_batch 共用那块 static —— 两者跑在不同任务里，会互相踩。
      * 同样不放栈上：栈只有 6 KB，4 KB 响应缓冲放上去就没余量了。 */
@@ -1419,8 +1512,14 @@ static void upload_task(void *arg)
         if (xSemaphoreTake(s_tx_wake, pdMS_TO_TICKS(100)) != pdTRUE) {
             if (s_cam_stream &&
                 (xTaskGetTickCount() - s_cam_last) >= s_cam_interval) {
+                /* 同 run_command 里的 cam_capture：URL 与设备名都要"锁内拷一份"，
+                 * 设备名用 URL 编码后的值。 */
+                char base[NET_URL_MAX];
+                char dev[sizeof(s_device_url)];
                 s_cam_last = xTaskGetTickCount();
-                camera_post_frame(s_url, s_device, false);
+                copy_url(base, sizeof(base));
+                copy_device_url(dev, sizeof(dev));
+                camera_post_frame(base, dev, false);
             }
             continue;
         }
@@ -1535,33 +1634,42 @@ void transport_start(void)
 void transport_reload_config(void)
 {
     /* 地址与设备 id 都来自 net_config（配网写进 NVS，是唯一来源），配网改完立即生效。
-     * 缓存成静态而不是每次上报都读 NVS：post_batch 和采样循环在同一个任务里，
-     * 每次 2 Hz 去开关 NVS 句柄会白占锁、拖慢采样。 */
+     * **每次 2 Hz 去读 NVS 是不可接受的开销**，所以缓存成静态量；但本函数会被
+     * 配网的 httpd 任务调用，读它的却是 upload_task / voice_task ——
+     * 所以三个字段全部在锁内写、锁内拷（见 copy_url/copy_device 的注释）。 */
     net_config_t cfg;
     net_config_load(&cfg);
-    strlcpy(s_url, cfg.url, sizeof(s_url));
 
-    /* 上报周期也在这里刷新：`set_config` 改完周期后调本函数即可生效，
-     * 不用重启。夹到 100..2000ms —— 太短会把 WiFi 压满，太长界面就不跟手了。 */
+    /* 上报周期：夹到 100..2000ms。**下限从 50 提到 100**（2026-10-30）：
+     * 50ms = 20Hz 时每批只剩 5 个样本，"批量上报"的红利消失；而 32 块板
+     * × 20 POST/s = 640 连接/秒，配上服务端 `Connection: close`（它先关）
+     * 会在服务端侧堆出数万个 TIME_WAIT。三处（网页 / 服务端 / 这里）必须一致，
+     * 否则会出现"网页选了 100 但板端还是 50"这种对不上的静默偏差。 */
     int per = (int)cfg.period_ms;
-    if (per < 50 || per > 2000) {
+    if (per < 100 || per > 2000) {
         per = CONFIG_RW1_TELEMETRY_PERIOD_MS;
     }
-    s_post_ticks = pdMS_TO_TICKS(per);
 
     /* 设备 id：本函数会被 provisioning 的 httpd 任务调用，而 build_body 在 transport
-     * 任务里读它。**值没变就不写** —— 开机写一次之后基本不再变动，把并发窗口压到最小
-     * （万一真读到半截，服务端只会多出一个设备条目，随后自然过期淘汰，不影响数据）。 */
+     * 任务里读它。**值没变就不写** —— 开机写一次之后基本不再变动，把并发窗口压到最小。 */
     char dev[NET_DEV_MAX];
     net_config_device_id(&cfg, dev, sizeof(dev));
-    if (strcmp(dev, s_device) != 0) {
-        status_lock();
-        strlcpy(s_device, dev, sizeof(s_device));
-        status_unlock();
-    }
+    char dev_url[sizeof(s_device_url)];
+    url_encode(dev, dev_url, sizeof(dev_url));
 
-    ESP_LOGI(TAG, "server url -> '%s' device -> '%s' (source=%s)",
-             s_url, s_device, net_config_source());
+    status_lock();
+    strlcpy(s_url, cfg.url, sizeof(s_url));
+    s_post_ticks = pdMS_TO_TICKS(per);
+    if (strcmp(dev, s_device) != 0) {
+        strlcpy(s_device, dev, sizeof(s_device));
+        strlcpy(s_device_url, dev_url, sizeof(s_device_url));
+    } else if (strcmp(dev_url, s_device_url) != 0) {
+        strlcpy(s_device_url, dev_url, sizeof(s_device_url));
+    }
+    status_unlock();
+
+    ESP_LOGI(TAG, "server url -> '%s' device -> '%s' (url=%s, %d ms, source=%s)",
+             cfg.url, dev, dev_url, per, net_config_source());
 }
 
 void transport_request_ask(const char *question)
