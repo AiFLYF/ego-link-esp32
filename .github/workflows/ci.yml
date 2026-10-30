@@ -3,7 +3,7 @@
 # 只跑**不需要真 Chrome** 的那几项：
 #   - lint_py.py      静态检查，秒级（没用的 import / 未定义名字 / 裸 except / 锁契约）
 #   - test_units.py   纯函数单测，约 1 秒（38 条：方位/话术/参数夹取/计步/失重）
-#   - verify_server.py 服务端端到端 138 项，约 2 分半（起真服务 + 假板子）
+#   - verify_server.py 服务端端到端（当前 154 项），约 2 分半（起真服务 + 假板子）
 #
 # 刻意**不**在 CI 里跑 e2e_dashboard.js / e2e_design.js：
 # 那两个要真 Chrome + playwright-core，装起来重、跑起来慢，
@@ -42,7 +42,7 @@ jobs:
         run: python -m unittest discover -s tools -p "test_*.py" -v
 
   server-e2e:
-    name: 服务端回归（138 项）
+    name: 服务端回归（verify_server）
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
