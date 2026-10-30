@@ -254,6 +254,33 @@ def feed(port, scenario, seconds, ask_at=None, expect_steps=None):
     return p.returncode, p.stdout + p.stderr
 
 
+def feed_observe(port, scenario, seconds, device=None):
+    """跑一段假板子场景，**边跑边采样** `activity`，返回观察到的活动词列表。
+
+    为什么不能跑完再读一次：`activity` 是"随最后一批数据变化"的瞬时字段。
+    场景结束之后再读，读到的是**收尾那一批**的分类结果 —— 晃动场景的尾部
+    幅度已经衰减，很容易被判成"运动/步行"。2026-10-30 实测：同一份代码
+    连跑三次，第三次就报了「判定为剧烈晃动 → 实际: 运动/步行(约16步)」，
+    而前两次都是绿的。根因是观测时机，不是分类器。
+
+    与第 [5] 节的轮询同理：**采样率必须快于被测现象的可见时长**。这里用
+    100 ms（场景持续 6 秒 → 约 60 个采样点），抖动就不再决定结果。
+    """
+    cmd = [PY, os.path.join(HERE, "fake_board.py"),
+           "--url", "http://127.0.0.1:%d" % port,
+           "--scenario", scenario, "--seconds", str(seconds), "--quiet"]
+    p = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         env=CHILD_ENV)
+    seen = []
+    while p.poll() is None:
+        try:
+            seen.append(latest(port, device)["activity"])
+        except (urllib.error.URLError, OSError, ValueError):
+            pass
+        time.sleep(0.1)
+    return seen
+
+
 def latest(port, device=None):
     """取快照。**多板场景下一定要带上 device** ——
     不带就是"最近上报的那台"，同时有别的板子在跑时，谁后上报就查谁，
@@ -377,9 +404,13 @@ def main():
 
         # ---- 4. 晃动 ----------------------------------------------------
         print("\n[4] 晃动 5Hz / 6 秒")
-        feed(port, "shake", 6)
+        # 边跑边采（见 feed_observe 的注释）：只看"这 6 秒里出现过剧烈晃动"，
+        # 不看"收尾那一瞬间是什么" —— 后者由最后一批数据的相位决定，是抛硬币。
+        seen_shake = feed_observe(port, "shake", 6)
         snap = latest(port)
-        check("判定为剧烈晃动", snap["activity"] == "剧烈晃动", "实际: %s" % snap["activity"])
+        check("判定为剧烈晃动", "剧烈晃动" in seen_shake,
+              "采到 %d 个状态，出现过: %s"
+              % (len(seen_shake), sorted(set(seen_shake))))
         check("晃动计数为窗口内计数（非累计）", 0 < snap["shake_count"] <= 20,
               "实际: %d" % snap["shake_count"])
 
@@ -1559,6 +1590,35 @@ def main():
         check("/api/events 的 limit 生效（只要 1 条）",
               len(ev_1.get("events") or []) <= 1, "实际: %d 条"
               % len(ev_1.get("events") or []))
+
+        # ---- 29. 写接口不许"猜"目标设备（2026-10-30）-----------------------
+        # 把设备名拼错一个字，原来会退回到"最近上报过的那台" —— 于是 sd_format
+        # 发给了另一块板，页面上还显示"已下发"。读写语义必须分开：读接口容错，
+        # 写接口一字不差。
+        print("\n[29] 写指令给不存在的设备名 → 拒绝，且一条都不发")
+
+        def _cmd_count(dev_id):
+            got = get_json("http://127.0.0.1:%d/api/commands?device=%s"
+                           % (port, urllib.parse.quote(dev_id)))
+            return len(got.get("commands") or [])
+
+        before_n = _cmd_count(pdev)
+        try:
+            post_json("http://127.0.0.1:%d/api/command" % port,
+                      {"name": "sd_format", "device": "rob-0l"})   # 故意拼错
+            typo_code = 200
+        except urllib.error.HTTPError as e:
+            typo_code = e.code
+        check("拼错的设备名 → 404（不再静默发给另一块板）", typo_code == 404,
+              "实际: HTTP %s" % typo_code)
+        check("被拒之后一条命令都没建（全有或全无）",
+              _cmd_count(pdev) == before_n,
+              "实际: %d → %d" % (before_n, _cmd_count(pdev)))
+        # 不带 device 的老调用方仍要能下发（单板场景的兼容路径）
+        legacy = post_json("http://127.0.0.1:%d/api/command" % port,
+                           {"name": "capture_once"})
+        check("不带 device 的老调用仍能下发（兼容单板场景）",
+              legacy.get("ok") is True, "实际: %s" % legacy)
 
     finally:
         for p in (srv, srv2, nlboard):
