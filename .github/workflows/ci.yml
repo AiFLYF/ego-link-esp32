@@ -1,0 +1,58 @@
+# 持续集成：把"提交前必跑"的门禁搬到每次 push/PR 上
+#
+# 只跑**不需要真 Chrome** 的那几项：
+#   - lint_py.py      静态检查，秒级（没用的 import / 未定义名字 / 裸 except / 锁契约）
+#   - test_units.py   纯函数单测，约 1 秒（38 条：方位/话术/参数夹取/计步/失重）
+#   - verify_server.py 服务端端到端 138 项，约 2 分半（起真服务 + 假板子）
+#
+# 刻意**不**在 CI 里跑 e2e_dashboard.js / e2e_design.js：
+# 那两个要真 Chrome + playwright-core，装起来重、跑起来慢，
+# 而且它们验的是视觉规则（令牌、字号阶梯、对比度），本机改完样式跑一次就够。
+# 留在本地门禁里，不进每次 PR。
+
+name: ci
+
+on:
+  push:
+    branches: [develop, "feature/**", "release/**", "hotfix/**"]
+  pull_request:
+    branches: [develop, main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  static:
+    name: 静态检查 + 单测
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 静态检查（lint_py）
+        run: python tools/lint_py.py
+
+      - name: 纯函数单测（test_units）
+        run: python -m unittest discover -s tools -p "test_*.py" -v
+
+  server-e2e:
+    name: 服务端回归（138 项）
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # verify_server.py 只用标准库：起 server.py + fake_board.py 两个子进程，
+      # 自己找空闲端口，子进程一律传 CHILD_ENV（剥掉代理）—— 不依赖外部服务。
+      - name: verify_server
+        run: python tools/verify_server.py
