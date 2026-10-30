@@ -21,6 +21,7 @@
 #include "cJSON.h"
 #include "esp_http_client.h"
 #include "esp_log.h"
+#include "esp_random.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -1400,6 +1401,26 @@ static void transport_task(void *arg)
     TickType_t last_post = xTaskGetTickCount();
     int n = 0;
     const char *last_source = "?";   /* IMU 型号，只在变化时才写进状态 */
+
+    /* ---- 开机错峰 ------------------------------------------------------------
+     *
+     * 一个班 20~32 块板通常是**同一秒上电**的，而节拍器只看"距上次上报多久"，
+     * 于是所有板子的相位完全一致：每 500 ms 在同一瞬间一起 POST。
+     * 服务端只有一把全局锁，analyze 又要几百微秒到几毫秒，32 个请求一字排开，
+     * 最后那几块就得等几百毫秒 —— 实测 `tools/load_classroom.py --boards 32`：
+     * **p95 = 476 ms、最慢 626 ms**，已经逼近板端 1 s 的 HTTP 超时；
+     * 教室 WiFi 再慢一点就会开始丢批（丢批 = 计步/跌落漏检）。
+     *
+     * 修法：开机时随机偏移 0~1 个上报周期，把相位摊开。之后每次 flush 都会
+     * 重置 last_post，所以这个偏移会一直保持，稳态也是散的。
+     * 代价只是第一帧晚到最多半个周期（屏幕这段时间显示"等待数据…"）。
+     */
+    if (s_post_ticks > 1) {
+        const uint32_t period_ms = (uint32_t)pdTICKS_TO_MS(s_post_ticks);
+        const uint32_t jitter = (period_ms > 1) ? (esp_random() % period_ms) : 0;
+        ESP_LOGI(TAG, "开机错峰 %u ms（避免全班同一瞬间上报）", (unsigned)jitter);
+        vTaskDelay(pdMS_TO_TICKS(jitter));
+    }
 
     while (true) {
         accel_input_sample_t sample = {0};
