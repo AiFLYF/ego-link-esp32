@@ -62,6 +62,17 @@ static const char *TAG = "transport";
  * telemetry periods) instead of retrying forever. */
 #define TX_ASK_MAX_ATTEMPTS 3
 
+/* 上报周期的合法范围（毫秒）。**两个调用点共用这一份**：
+ *   1. run_set_config() —— 接受 set_config 参数时；
+ *   2. transport_reload_config() —— 从 NVS 读出来时的兜底夹取。
+ *
+ * 2026-10-30 之前只有第 2 处改成了 100、第 1 处还留着 50，于是出现
+ * "服务端发 50 → 写进 NVS → 运行时被静默夹成 500 → 日志仍打印 period=50"
+ * 的半改状态：NVS 和内存两份值对不上，看日志根本查不出来。
+ * 服务端 sanitize_params 用的是同一组数字（100/2000），改这里记得同步那边。 */
+#define RW1_PERIOD_MIN_MS 100
+#define RW1_PERIOD_MAX_MS 2000
+
 /* Samples held for one upload. 128 @ 10 ms = 1.28 s, comfortably more than the
  * default 500 ms period; the batch is flushed early if it fills up. */
 #define TX_BATCH_MAX 128
@@ -584,10 +595,11 @@ static void run_set_config(const char *id)
     if (s_cfg_url[0] != '\0') {
         utf8_strlcpy(cfg.url, s_cfg_url, sizeof(cfg.url));
     }
-    /* 下限从 100ms 放宽到 50ms —— 50ms = 20Hz。用户要 20Hz 的实时感，
-     * 100ms 只能到 10Hz。注意 50ms 已接近 WiFi 单次往返的量级，
-     * 实际能跑多快取决于现场网络，跑不到也别指望更低了。 */
-    if (s_cfg_period >= 50 && s_cfg_period <= 2000) {
+    /* 下限 100ms（不是 50）—— 原因见文件顶部的 RW1_PERIOD_MIN_MS。
+     * 这里曾经放宽到 50ms（20Hz）追求"更跟手"，代价不对等：50ms 时每批只剩
+     * 5 个样本，"批量上报"的红利消失；32 块板 × 20 POST/s 配上 Connection: close
+     * 会在服务端堆出数万 TIME_WAIT。 */
+    if (s_cfg_period >= RW1_PERIOD_MIN_MS && s_cfg_period <= RW1_PERIOD_MAX_MS) {
         cfg.period_ms = (uint16_t)s_cfg_period;
     }
     if (!net_config_save(&cfg)) {
@@ -1668,13 +1680,13 @@ void transport_reload_config(void)
     net_config_t cfg;
     net_config_load(&cfg);
 
-    /* 上报周期：夹到 100..2000ms。**下限从 50 提到 100**（2026-10-30）：
-     * 50ms = 20Hz 时每批只剩 5 个样本，"批量上报"的红利消失；而 32 块板
-     * × 20 POST/s = 640 连接/秒，配上服务端 `Connection: close`（它先关）
+    /* 上报周期：夹到 RW1_PERIOD_MIN_MS..RW1_PERIOD_MAX_MS。**下限从 50 提到 100**
+     * （2026-10-30）：50ms = 20Hz 时每批只剩 5 个样本，"批量上报"的红利消失；
+     * 而 32 块板 × 20 POST/s = 640 连接/秒，配上服务端 `Connection: close`（它先关）
      * 会在服务端侧堆出数万个 TIME_WAIT。三处（网页 / 服务端 / 这里）必须一致，
      * 否则会出现"网页选了 100 但板端还是 50"这种对不上的静默偏差。 */
     int per = (int)cfg.period_ms;
-    if (per < 100 || per > 2000) {
+    if (per < RW1_PERIOD_MIN_MS || per > RW1_PERIOD_MAX_MS) {
         per = CONFIG_RW1_TELEMETRY_PERIOD_MS;
     }
 
