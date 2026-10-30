@@ -38,6 +38,7 @@ import math
 import os
 import queue
 import re
+import signal
 import socket
 import struct
 import sys
@@ -734,7 +735,11 @@ class JsonlLogger:
                                        # 必须各持一个句柄，否则会互相串写）
         os.makedirs(root, exist_ok=True)
         self.purge_old()
-        threading.Thread(target=self._run, name="jsonl", daemon=True).start()
+        # 句柄留给 close()：退出时要等这条线程把队列排空，
+        # 否则 Ctrl-C 会把最多 2 万条还没落盘的记录直接扔掉
+        # （2026-10-30 前的实际行为：daemon 线程随进程一起消失）。
+        self._thread = threading.Thread(target=self._run, name="jsonl", daemon=True)
+        self._thread.start()
 
     # ---- 生产者 ----------------------------------------------------------
     def telemetry(self, ts, device, source, pts, dt):
@@ -853,6 +858,37 @@ class JsonlLogger:
             total += size
         return {"dir": self.root, "files": files, "bytes": total,
                 "written": self.written, "dropped": self.dropped}
+
+    def close(self, timeout=2.0):
+        """把队列里剩下的记录写完再退出（Ctrl-C / SIGTERM 时调用）。
+
+        原来 `_run` 是 daemon 线程，进程一退队列里最多 2 万条记录直接消失 ——
+        而"停在旧数据上"恰恰发生在最需要现场的时候（正在演示、突然 Ctrl-C）。
+        现在发一个哨兵让消费线程自然收尾，最多等 `timeout` 秒。
+
+        ⚠️ 队列满的时候**不能**只是 `put_nowait(None)`（会 Full），
+        要先腾出空位再放哨兵，否则消费线程永远等不到它。
+        """
+        if self._thread is None or not self._thread.is_alive():
+            return 0
+        for _ in range(3):
+            try:
+                self.q.put_nowait(None)
+                break
+            except queue.Full:
+                try:
+                    self.q.get_nowait()     # 腾一格（丢最旧的，与 _put 的语义一致）
+                    self.dropped += 1
+                except queue.Empty:
+                    pass
+        self._thread.join(timeout=timeout)
+        for fh in list(self._fhs.values()):
+            try:
+                fh.close()
+            except OSError:
+                pass
+        self._fhs.clear()
+        return self.written
 
 
 # --------------------------------------------------------------------------
@@ -2179,6 +2215,28 @@ class Handler(BaseHTTPRequestHandler):
             targets.append(t)
         if not targets:
             targets = [None]
+
+        # ⚠️ **写接口不许"猜"目标**：只要调用方明确点了设备名，就必须真存在。
+        #
+        # 原来这里对"不在册的名字"会退回到"最近上报过的那台"（`pick_device` 的
+        # 读接口语义），于是把设备名拼错一个字（比如「第三组-07」打成「第三组-7」）
+        # 就会把 sd_format 发给**另一块板**，页面上还显示"已下发"。
+        # 读接口（/api/latest）该容错，写接口不该 —— 破坏性动作的代价不对等。
+        #
+        # 判据用"不在 DEVICES 里"而不是"离线"：离线的板子仍在册，命令排队等它
+        # 回来是**设计行为**（网页上明确提示了"等它们回来才会执行"）。
+        # 全有或全无：只要有一台不认识就一条都不发，避免"20 台里格了 19 台"。
+        with LOCK:
+            missing = [t for t in targets if t is not None and t not in DEVICES]
+            if missing:
+                known = sorted(d.id for d in DEVICES.values() if d.st["last_post"] > 0)
+        if missing:
+            self._send(404, json.dumps(
+                {"ok": False, "error": "device not found", "missing": missing,
+                 "known": known,
+                 "hint": "设备名要以仪表盘列表里显示的为准；不在册的一律不下发"},
+                ensure_ascii=False))
+            return
 
         results = []
         for t in targets:
@@ -4267,7 +4325,7 @@ function doSendCmd(name, btn, overrideParams){
     method:"POST", headers:{"Content-Type":"application/json"},
     body: JSON.stringify(body)
   }).then(function(r){ return r.json(); }).then(function(d){
-    if (!d.ok){ $("cmdhint").textContent = "下发失败：" + (d.error || "未知错误"); return; }
+    if (!d.ok){ $("cmdhint").textContent = "下发失败：" + (d.hint || d.error || "未知错误"); return; }
     if (d.batch){
       var off = (d.results || []).filter(function(x){ return !x.device_online; }).length;
       $("cmdhint").textContent = "已下发给 " + d.count + " 台"
@@ -5456,10 +5514,25 @@ def main():
           "（仅事件）" if args.no_log_telemetry else "（波形 %.0fHz + 事件，保留 %d 天）"
           % (args.log_hz, args.retain_days)))
     print("=" * 66)
+    # SIGTERM（systemd / docker stop / 关机）也走"优雅收尾"这条路：
+    # 默认行为是直接杀进程，队列里没落盘的记录就没了。
+    def _on_sigterm(*_args):
+        raise KeyboardInterrupt
+
+    try:
+        signal.signal(signal.SIGTERM, _on_sigterm)
+    except (ValueError, OSError, AttributeError):
+        pass          # 非主线程 / 平台不支持：保持默认行为，不影响启动
+
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
         print("\nbye")
+    finally:
+        srv.server_close()
+        if LOGGER is not None:
+            written = LOGGER.close()
+            print("   日志已收尾：本次共写 %d 行，丢弃 %d 行" % (written, LOGGER.dropped))
 
 
 if __name__ == "__main__":
