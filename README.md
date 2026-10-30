@@ -858,7 +858,7 @@ python server\server.py
 |---|---|---|---|
 | 静态检查 | `python tools/lint_py.py` | 秒级 | 没用的 import、未定义名字、裸 `except:`、可变默认参数、**锁契约**（docstring 写了"必须持有 LOCK"的函数有没有在没拿锁处被调用） |
 | 纯函数单测 | `python -m unittest discover -s tools -p "test_*.py"` | 约 1 秒 | 38 条：8 方位、30 条话术、参数夹取、计步、失重、UTF-8 截断、设备名清洗 |
-| 服务端回归 | `python tools/verify_server.py` | 约 2 分半 | 138 项端到端（起真服务 + 假板子） |
+| 服务端回归 | `python tools/verify_server.py` | 约 2 分半 | 全部端到端断言（当前 138 项；加固批次合入后 144 项）—— 起真服务 + 假板子 |
 
 本地跑同样的三条即可，行为和 CI 一致：
 
@@ -917,21 +917,6 @@ python tools/verify_server.py
 服务器默认监听 `0.0.0.0:8000`、无鉴权、CORS 放开，遥测接口任何同网设备都能写。
 这在课堂/家庭局域网里没问题，但**不要把它暴露到公网**。需要时用
 `--host 127.0.0.1` 限制为本机访问，或自行加一层反向代理与鉴权。
-
-三条容易被忽略的（按现实风险排序）：
-
-1. **CSRF：老师浏览任意网页时，那个网页能静默操作这台服务器。**
-   服务端所有响应带 `Access-Control-Allow-Origin: *`，且不校验 `Content-Type`
-   —— 一个跨站 `fetch` 就能 POST `/api/command`（格式化 SD 卡、删照片）或
-   `/api/ask`（花掉大模型额度），不需要预检、不需要密钥。
-   在修好之前：**上课用的这台机器别随手开陌生网页**；配了 `RW1_API_TOKEN` 可缓解
-   （但 token 存在 localStorage，跨站读不到，所以挡得住——这是目前唯一的现实防线）。
-2. **录音与人像默认落盘。** `server/data/audio/<设备名>/*.wav`（每设备保留 50 条）与
-   `server/data/shots/<设备名>/*.jpg`（每设备 200 张）。教室里这是学生的**声音与人脸**，
-   属于个人信息。不需要回放的话，定期清空这两个目录，或启动时用
-   `--data-dir` 指到一个临时目录。
-3. **改 WiFi 密码走明文 HTTP。** `set_config` 把 SSID/密码放在 JSON 里过局域网。
-   教室 LAN 风险低，但如果这间教室的 WiFi 本身不可信，改密码请直接在板子上重新配网。
 
 ## License
 
