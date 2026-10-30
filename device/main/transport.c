@@ -199,8 +199,13 @@ static void copy_device_url(char *dst, size_t cap)
  * 实时画面永远 404、照片存进乱码目录。
  *
  * ASCII 的 unreserved 字符原样保留（日志里仍然可读），只编码真正需要编码的字节。
- * 目标缓冲至少要 `sizeof(src) * 3 + 1`。 */
-static void url_encode(const char *src, char *dst, size_t cap)
+ * 目标缓冲至少要 `sizeof(src) * 3 + 1`。
+ *
+ * 返回 false 表示**放不下、被截断了**（调用方应当告警）。注意编码是"整字节
+ * 进整字节出"的：三个字节的 %XX 要么全写、要么不写，绝不会留下半个转义。
+ * 但截断出来的仍是一个"合法但不同的设备名"，那会把一块板悄悄变成另一台，
+ * 所以调用方必须知道这件事。 */
+static bool url_encode(const char *src, char *dst, size_t cap)
 {
     static const char hex[] = "0123456789ABCDEF";
     size_t o = 0;
@@ -211,7 +216,8 @@ static void url_encode(const char *src, char *dst, size_t cap)
                            *p == '-' || *p == '_' || *p == '.' || *p == '~';
         const size_t need = plain ? 1u : 3u;
         if (o + need + 1u > cap) {
-            break;              /* 宁可截断也不越界；设备名本身有 NET_DEV_MAX 上限 */
+            dst[o] = '\0';
+            return false;
         }
         if (plain) {
             dst[o++] = (char)*p;
@@ -222,6 +228,7 @@ static void url_encode(const char *src, char *dst, size_t cap)
         }
     }
     dst[o] = '\0';
+    return true;
 }
 
 /* ---------------- remote commands (week 2 起) ----------------------------- */
@@ -1655,7 +1662,12 @@ void transport_reload_config(void)
     char dev[NET_DEV_MAX];
     net_config_device_id(&cfg, dev, sizeof(dev));
     char dev_url[sizeof(s_device_url)];
-    url_encode(dev, dev_url, sizeof(dev_url));
+    if (!url_encode(dev, dev_url, sizeof(dev_url))) {
+        /* 缓冲按 3 倍留的，正常名字（中文 3 字节 → 9 字符）绝不会到这里。
+         * 真到了就说明设备名太长，截断后服务端会把它当成另一台板 —— 必须可见。 */
+        ESP_LOGW(TAG, "设备名编码后被截断（缓冲 %u 字节）：'%s'",
+                 (unsigned)sizeof(dev_url), dev_url);
+    }
 
     status_lock();
     strlcpy(s_url, cfg.url, sizeof(s_url));
