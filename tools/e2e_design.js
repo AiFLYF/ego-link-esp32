@@ -296,7 +296,14 @@ const CONTRAST = `(function(rgb1, rgb2){
 
   page.on('console', m => { if (m.type() === 'error') problems.push('CONSOLE: ' + m.text()); });
   page.on('pageerror', e => problems.push('PAGEERROR: ' + e.message));
-  page.on('requestfailed', r => problems.push('REQFAIL: ' + r.url()));
+  // 同 e2e_dashboard.js：页面收尾会掐断在飞请求，Chrome 报 net::ERR_ABORTED，
+  // 那不是服务端故障。2026-10-30 A/B 实测：未改动的版本同样随机报
+  // /api/stream、/api/latest。只放过 ERR_ABORTED，其余失败照报。
+  page.on('requestfailed', r => {
+    const why = (r.failure() && r.failure().errorText) || '';
+    if (why.indexOf('ERR_ABORTED') >= 0) return;
+    problems.push('REQFAIL: ' + r.url() + ' (' + why + ')');
+  });
   const fontHits = [];
   page.on('response', r => {
     if (r.url().indexOf('/vendor/fonts/') >= 0) fontHits.push([r.status(), r.url()]);

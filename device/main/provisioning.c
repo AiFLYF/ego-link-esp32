@@ -27,10 +27,27 @@
 static const char *TAG = "prov";
 
 #define PROV_MAX_SSID_LEN 32
+/* 配网成功到真正关掉 Web 服务的延迟：留够把"已连接"响应发到手机的时间。
+ * 看护任务 1 s 一跳，所以实际是 1.5~2.5 s 后关闭。 */
+#define PROV_STOP_DELAY_MS 1500
 
 static httpd_handle_t s_server;
 static volatile bool  s_active;
 static volatile TickType_t s_last_activity;
+/* 配网成功后**延迟**关 httpd 的时刻（0 = 没排队）。
+ *
+ * 为什么不在 h_save 里直接 provisioning_stop()：那会在响应还没发完时就把
+ * socket 关掉，手机上看不到"已连接"。所以排一个 1.5 s 后执行的关闭，
+ * 由 main.c 的看护任务（1 s 一跳）真正执行。
+ *
+ * 为什么必须关（2026-10-30 修）：成功路径原来只置 s_active=false，而
+ * poll_timeout() 第一行就是 `if (!s_active) return;` —— 于是 httpd
+ * **永远不会被关闭**，80 端口的监听 socket（绑在 0.0.0.0）在切到 STA-only
+ * 之后依然存在：配网页的 /save、/clear、/scan、/testurl 变成教室局域网内
+ * 无鉴权可达（/clear 清 NVS，/testurl 是 SSRF 入口）。
+ * 附带后果：再次双击 BOOT 时 start_httpd() 会因为 s_server 非空而失败，
+ * README 里写的"双击重新配网"只能靠重启板子。 */
+static volatile TickType_t s_stop_at;
 static char s_ap_ssid[NET_SSID_MAX];
 static char s_ap_pass[12];         /* 8 位数字 + NUL（WPA2 要求 8–63 位），留点余量 */
 static bool s_netif_ready;         /* AP netif 只建一次，失败重试时不能重复建 */
@@ -278,11 +295,13 @@ static esp_err_t h_save(httpd_req_t *req)
     send_json(req, out);
 
     /* 响应发完再切模式 —— 立刻切会把手机的连接掐断，用户看不到"成功"提示。
-     * 交给 wifi_link 回 STA，AP 由超时看护关掉。 */
+     * 交给 wifi_link 回 STA；httpd 由看护任务在 1.5 s 后关掉（见 s_stop_at 的注释，
+     * 这里**不能**直接 provisioning_stop()，会把还没发完的响应掐断）。 */
     ESP_LOGI(TAG, "provisioned: ssid='%s' ip=%s", cfg.ssid, ip);
     transport_reload_config();       /* 新服务器地址立即生效，不用重启 */
-    wifi_link_resume_sta();
     s_active = false;
+    s_stop_at = xTaskGetTickCount() + pdMS_TO_TICKS(PROV_STOP_DELAY_MS);
+    wifi_link_resume_sta();
     return ESP_OK;
 }
 
@@ -292,6 +311,16 @@ static esp_err_t h_save(httpd_req_t *req)
 
 static esp_err_t start_httpd(void)
 {
+    /* 防御式复位：正常情况下 s_server 在停服时会被置 NULL（见 provisioning_stop）。
+     * 但如果上一次是"配网成功 → 还没来得及关就双击 BOOT"，这里会拿到一个仍在
+     * 运行的句柄，httpd_start() 会直接返回 "already started"，于是整个
+     * provisioning_start() 失败、双击配网看起来毫无反应。先收干净再起。 */
+    if (s_server != NULL) {
+        ESP_LOGW(TAG, "发现残留的 httpd 句柄，先停掉再重启");
+        httpd_stop(s_server);
+        s_server = NULL;
+    }
+
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.max_uri_handlers = 8;
     cfg.lru_purge_enable = true;          /* 手机可能开多个连接，别把池子占满 */
@@ -299,6 +328,7 @@ static esp_err_t start_httpd(void)
 
     esp_err_t err = httpd_start(&s_server, &cfg);
     if (err != ESP_OK) {
+        s_server = NULL;
         return err;
     }
     const httpd_uri_t uris[] = {
@@ -340,6 +370,7 @@ esp_err_t provisioning_start(void)
     if (s_active) {
         return ESP_OK;
     }
+    s_stop_at = 0;          /* 取消上一轮还没执行的"延迟关闭"，否则刚起来就被关 */
 
     build_ap_identity();
     s_last_result[0] = '\0';
@@ -392,6 +423,7 @@ esp_err_t provisioning_start(void)
 
 void provisioning_stop(void)
 {
+    s_stop_at = 0;                  /* 手动停服时把排队中的延迟关闭一起取消 */
     if (s_server != NULL) {
         httpd_stop(s_server);
         s_server = NULL;
@@ -420,9 +452,21 @@ const char *provisioning_last_result(void)
 }
 
 /* 由 main.c 的看护任务调用：5 分钟没人动就关 AP 回 STA。
- * 避免"忘记关热点"长期占道 + 耗电（PROPOSAL §1.4）。 */
+ * 避免"忘记关热点"长期占道 + 耗电（PROPOSAL §1.4）。
+ *
+ * 另外负责**执行配网成功后的延迟关闭**（s_stop_at）。这一条必须放在
+ * `if (!s_active) return;` **之前**：成功后 s_active 已经是 false，
+ * 放在后面就永远执行不到 —— 那正是"配网页一直留在 80 端口"这个 bug 的成因。 */
 void provisioning_poll_timeout(void)
 {
+    if (s_stop_at != 0 &&
+        (int32_t)(xTaskGetTickCount() - s_stop_at) >= 0) {
+        s_stop_at = 0;
+        ESP_LOGI(TAG, "配网已完成，关闭配网 Web 服务（80 端口不再监听）");
+        provisioning_stop();
+        return;
+    }
+
     if (!s_active) {
         return;
     }

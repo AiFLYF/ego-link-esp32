@@ -139,7 +139,16 @@ async function step(name, fn) {
     if (m.type() === 'error') problems.push('CONSOLE: ' + m.text());
   });
   page.on('pageerror', e => problems.push('PAGEERROR: ' + e.message));
-  page.on('requestfailed', r => problems.push('REQFAIL: ' + r.url()));
+  // 页面关闭/跳转时，正在飞的请求（尤其 /api/stream 这条 SSE 长连接）会被
+  // Chrome 标成 net::ERR_ABORTED —— 那不是服务端故障。2026-10-30 做过 A/B：
+  // 在**未改动**的版本上同一条判据也会随机报 /api/stream、/api/latest，
+  // 属于门禁自身的抖动。真正的网络故障是 ERR_CONNECTION_* / ERR_NAME_NOT_RESOLVED /
+  // ERR_EMPTY_RESPONSE 这些，仍然照报。
+  page.on('requestfailed', r => {
+    const why = (r.failure() && r.failure().errorText) || '';
+    if (why.indexOf('ERR_ABORTED') >= 0) return;
+    problems.push('REQFAIL: ' + r.url() + ' (' + why + ')');
+  });
   page.on('response', r => {
     if (r.status() >= 400 && r.url().indexOf('favicon') < 0) {
       problems.push('HTTP ' + r.status() + ' ' + r.url());
