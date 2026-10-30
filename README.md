@@ -857,7 +857,7 @@ python server\server.py
 | 步骤 | 命令 | 耗时 | 验什么 |
 |---|---|---|---|
 | 静态检查 | `python tools/lint_py.py` | 秒级 | 没用的 import、未定义名字、裸 `except:`、可变默认参数、**锁契约**（docstring 写了"必须持有 LOCK"的函数有没有在没拿锁处被调用） |
-| 纯函数单测 | `python -m unittest discover -s tools -p "test_*.py"` | 约 1 秒 | 38 条：8 方位、30 条话术、参数夹取、计步、失重、UTF-8 截断、设备名清洗 |
+| 纯函数单测 | `python -m unittest discover -s tools -p "test_*.py"` | 约 1 秒 | 41 条：8 方位、30 条话术、参数夹取、计步、失重、UTF-8 截断、设备名清洗、**设备名编码跨端契约**；另有 5 条非有限输入用例在加固批次合入后自动启用 |
 | 服务端回归 | `python tools/verify_server.py` | 约 2 分半 | 全部端到端断言（当前 138 项；加固批次合入后 144 项）—— 起真服务 + 假板子 |
 
 本地跑同样的三条即可，行为和 CI 一致：
