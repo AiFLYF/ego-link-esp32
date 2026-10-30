@@ -69,6 +69,7 @@
 | 路径 | 内容 |
 |---|---|
 | `server/server.py` | 电脑服务器（仅 Python 标准库，无需 pip 安装） |
+| `server/web/index.html` | **网页仪表盘本体**（HTML/CSS/JS）。服务端按 mtime 读取，**改完刷新浏览器即生效，不用重启** |
 | `server/data/` | **运行时生成**的 JSONL 日志（git-ignored，见下文"数据落盘"） |
 | `device/` | 开发板 ESP-IDF 工程（ESP-IDF v5.4.x，目标 esp32s3） |
 | `device/main/` | `main.c` 启动、`accel_input.c` IMU驱动（SC7A20/LIS3DH/MPU6050/QMA7981 自动识别）、`wifi_link.c` WiFi STA、`net_config.c` 运行期配置、`provisioning.c` SoftAP 配网、`transport.c` 采样+HTTP遥测、`led_feedback.c` LED图案播放器、`camera.c` 板载摄像头取帧（esp_video / V4L2，见下文"摄像头"）、`ui.c` LVGL 图形化仪表盘（见下文"板端界面"） |

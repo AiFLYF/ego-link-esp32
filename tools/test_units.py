@@ -379,5 +379,41 @@ class TestNonFiniteInputs(unittest.TestCase):
         self.assertEqual(srv.clamp_int("7", 1, 12, 3), 7)      # 正常值不受影响
 
 
+class TestDashboardPage(unittest.TestCase):
+    """仪表盘页面从 `server/web/index.html` 读，不再内嵌在 Python 字符串里。
+
+    2026-10-30 拆出来的：2952 行 HTML/CSS/JS 住在三引号字符串里没有语法高亮、
+    没有 ESLint，还逼出"页面里禁止出现反斜杠"这条古怪规矩（`\\n` 会被 Python
+    先吃成真换行），改完样式还得重启服务端。
+
+    这两条钉住"文件是唯一来源"：谁要是把 HTML 又塞回 Python 字符串，
+    `test_file_is_the_source_of_truth` 立刻红。
+    """
+
+    def test_file_is_the_source_of_truth(self):
+        path = os.path.join(os.path.dirname(_SERVER_PY), "web", "index.html")
+        self.assertTrue(os.path.isfile(path), "缺 %s" % path)
+        with open(path, encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), srv.dashboard_html())
+
+    def test_page_looks_like_the_dashboard(self):
+        html = srv.dashboard_html()
+        self.assertIn("<!doctype html>", html)
+        self.assertIn('id="board3d"', html)          # 3D 姿态那块画布
+        self.assertIn("EventSource", html)           # SSE 客户端
+        self.assertGreater(len(html), 100000)
+
+    def test_missing_file_reports_readably(self):
+        """文件丢了要给人一句能读的话，而不是抛异常让页面白屏。"""
+        import tempfile
+        old = srv._WEB_DIR
+        srv._WEB_DIR = os.path.join(tempfile.gettempdir(), "rw1-no-such-web-dir")
+        try:
+            html = srv.dashboard_html()
+        finally:
+            srv._WEB_DIR = old
+        self.assertIn("仪表盘文件缺失", html)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
