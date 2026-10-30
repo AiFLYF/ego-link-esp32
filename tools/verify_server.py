@@ -254,7 +254,7 @@ def feed(port, scenario, seconds, ask_at=None, expect_steps=None):
     return p.returncode, p.stdout + p.stderr
 
 
-def feed_observe(port, scenario, seconds, device=None):
+def feed_observe(port, scenario, seconds, device=None, with_proc=False, expect_steps=None):
     """跑一段假板子场景，**边跑边采样** `activity`，返回观察到的活动词列表。
 
     为什么不能跑完再读一次：`activity` 是"随最后一批数据变化"的瞬时字段。
@@ -263,14 +263,25 @@ def feed_observe(port, scenario, seconds, device=None):
     连跑三次，第三次就报了「判定为剧烈晃动 → 实际: 运动/步行(约16步)」，
     而前两次都是绿的。根因是观测时机，不是分类器。
 
+    同一天「步行」那条也栽在同一个坑上：它跑完 14 秒只读一次快照，
+    而 1.8 Hz 步行在 0.6 秒短窗里只有约 1 个周期，零穿越率本来就在
+    1.2 Hz 判据附近抖 —— 收尾那一帧撞上边界就报「运动 (峰值 1.6g)」。
+    实测（100 ms 采样跑满 14 秒）：**20 段全是"运动/步行"，没有一次抖动**，
+    所以产品是对的，错的是"只看一眼"的观测方式。
+
     与第 [5] 节的轮询同理：**采样率必须快于被测现象的可见时长**。这里用
     100 ms（场景持续 6 秒 → 约 60 个采样点），抖动就不再决定结果。
+
+    `with_proc=True` 时额外返回 `(seen, returncode, output)`，给需要同时
+    校验假板子自检（`--expect-steps`）的场景用。
     """
     cmd = [PY, os.path.join(HERE, "fake_board.py"),
            "--url", "http://127.0.0.1:%d" % port,
            "--scenario", scenario, "--seconds", str(seconds), "--quiet"]
-    p = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                         env=CHILD_ENV)
+    if expect_steps is not None:
+        cmd += ["--expect-steps", str(expect_steps)]
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                         encoding="utf-8", errors="replace", env=CHILD_ENV)
     seen = []
     while p.poll() is None:
         try:
@@ -278,6 +289,9 @@ def feed_observe(port, scenario, seconds, device=None):
         except (urllib.error.URLError, OSError, ValueError):
             pass
         time.sleep(0.1)
+    if with_proc:
+        out = p.stdout.read() if p.stdout is not None else ""
+        return seen, p.returncode, out
     return seen
 
 
@@ -396,11 +410,18 @@ def main():
 
         # ---- 3. 计步（修复前物理上做不到）--------------------------------
         print("\n[3] 步行 1.8Hz / 14 秒")
-        rc2, out = feed(port, "walk", 14, expect_steps=8)
+        # 边跑边采，别只看收尾那一帧（见 feed_observe 的注释：1.8 Hz 步行在
+        # 0.6 秒短窗里只有约 1 个周期，零穿越率本来就在判据附近抖）。
+        seen_walk, rc2, out = feed_observe(port, "walk", 14, with_proc=True,
+                                           expect_steps=8)
         snap = latest(port)
-        check("检测到步行而非晃动", "步行" in snap["activity"], "实际: %s" % snap["activity"])
+        check("检测到步行而非晃动", any("步行" in a for a in seen_walk),
+              "采到 %d 个状态，出现过: %s"
+              % (len(seen_walk), sorted({a for a in seen_walk if a})))
         check("窗口内步数 >= 8", snap["step_count"] >= 8, "实际: %d" % snap["step_count"])
-        check("fake_board 自检通过", rc2 == 0)
+        _tail = (out or "").strip().splitlines()
+        check("fake_board 自检通过", rc2 == 0,
+              "rc=%d%s" % (rc2, ("  |  " + _tail[-1]) if _tail else ""))
 
         # ---- 4. 晃动 ----------------------------------------------------
         print("\n[4] 晃动 5Hz / 6 秒")
