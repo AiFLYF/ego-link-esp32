@@ -163,7 +163,19 @@ class TestSanitizeParams(unittest.TestCase):
         p = srv.sanitize_params("set_config", {"ssid": "   ", "url": "http://x", "period_ms": 10})
         self.assertNotIn("ssid", p)
         self.assertEqual(p["url"], "http://x")
-        self.assertEqual(p["period_ms"], 50)
+        self.assertEqual(p["period_ms"], 100)     # 下限 100（2026-10-30 从 50 提高）
+
+    def test_period_bounds(self):
+        """上报周期下限 100 ms 是硬约束，不是随手写的数字。
+
+        2026-10-30 从 50 提到 100：50 ms = 20 Hz 时每批只剩 5 个样本，
+        32 块板同时上报会把服务端的连接数打爆（TIME_WAIT 堆到几万）。
+        这条测试同时钉住上下界，避免有人"顺手"把下限调回去。
+        """
+        lo = srv.sanitize_params("set_config", {"period_ms": 0})["period_ms"]
+        hi = srv.sanitize_params("set_config", {"period_ms": 999999})["period_ms"]
+        self.assertEqual(lo, 100)
+        self.assertEqual(hi, 2000)
 
     def test_cam_stream_fps_optional(self):
         self.assertNotIn("fps", srv.sanitize_params("cam_stream", {"on": True}))
