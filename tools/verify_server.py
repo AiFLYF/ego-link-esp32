@@ -395,7 +395,13 @@ def main():
                 seen.append(latest(port)["activity"])
             except (urllib.error.URLError, OSError, ValueError):
                 pass
-            time.sleep(0.3)
+            # ⚠️ 轮询必须**快于被测现象的可见时长**，否则这条断言本身就成了抛硬币。
+            # 「疑似跌落」只在上报周期内可见（约 0.35~0.5 s：失重 250 ms + 下一批
+            # 覆盖它之前的间隔）。原来这里 sleep(0.3)，加上请求本身约 0.1 s 的往返，
+            # 实际采样间隔 ≈ 0.4 s，正好比可见窗长 —— 2026-10-30 实测同一天里
+            # 连跑三次挂了一次，而用 50 ms 间隔复测时"跌落"命中 7 次（检测没问题）。
+            # 所以这里改 0.1 s：抓住现象，而不是降低断言标准。
+            time.sleep(0.1)
         check("检测到疑似跌落", any("跌落" in a for a in seen),
               "采到 %d 个状态" % len(seen))
 
@@ -1412,6 +1418,115 @@ def main():
                           {"name": "capture_once"})
         check("没配密钥的实例完全不设防（与历史行为一致）",
               mbody.get("ok") is True, "实际: %s" % mbody)
+
+        # ---- 26. 外部数据健壮性（2026-10-30 加固）-------------------------
+        # 几条都是"一条外部输入把服务端打出一个异常"的路径。它们都不可能来自
+        # 本仓库的固件（固件有 sanitize3、有 clamp），但教室里任何一台机器都能发。
+        #
+        # 修之前的表现（实测）：`{"batch":[[NaN,NaN,NaN]]}` → analyze 里
+        # `int(nan)` 抛 ValueError，而且抛在 _send() **之前** → 客户端收到的是
+        # "连接被掐断"而不是 500；NaN 留在窗口里，接下来 8 秒内每一帧正常数据
+        # 都会在同一个 int(nan) 上再抛一次；/api/latest 再把 NaN 序列化出去，
+        # 浏览器 JSON.parse 抛错 → 整页停在旧数据上。
+        print("\n[26] 畸形载荷不再打穿数据流（2026-10-30 加固）")
+        pdev = "rob-01"
+        tbase = "http://127.0.0.1:%d/api/telemetry?device=%s" % (
+            port, urllib.parse.quote(pdev))
+
+        def _reject_json_const(name):
+            raise ValueError("非法 JSON 常量: %s" % name)
+
+        nan_body = post_raw(
+            tbase,
+            '{"device":"%s","batch":[[NaN,NaN,NaN],[0,0,1],[0,0,1]]}' % pdev)
+        check("含 NaN 的批次仍被接受（坏点丢弃、好点照常分析）",
+              nan_body.get("ok") is True, "实际: %s" % nan_body)
+
+        raw_latest = OPENER.open(
+            "http://127.0.0.1:%d/api/latest?device=%s" % (port, pdev),
+            timeout=6).read().decode("utf-8")
+        try:
+            json.loads(raw_latest, parse_constant=_reject_json_const)
+            strict_ok = True
+        except ValueError as exc:
+            strict_ok = False
+            print("   严格 JSON 解析失败: %s" % exc)
+        check("快照里不再出现 NaN/Infinity（浏览器 JSON.parse 能过）", strict_ok)
+
+        check("整批都是 NaN 时被拒（一条可用样本都没有 → 400）",
+              _expect_400(tbase, {"device": pdev,
+                                  "batch": [[float("nan")] * 3]}))
+
+        inf_cmd = post_json("http://127.0.0.1:%d/api/command" % port,
+                            {"name": "led_blink", "device": pdev,
+                             "params": {"n": "inf"}})
+        check("params 里的 \"inf\" 不再打出 500（回退默认值）",
+              inf_cmd.get("ok") is True, "实际: %s" % inf_cmd)
+
+        post_json("http://127.0.0.1:%d/api/command" % port,
+                  {"name": "set_config", "device": pdev, "params": {"period_ms": 50}})
+        cmds_out = get_json("http://127.0.0.1:%d/api/commands?device=%s"
+                            % (port, urllib.parse.quote(pdev)))
+        per_sent = ((cmds_out.get("commands") or [{}])[0].get("params") or {}).get("period_ms")
+        check("上报周期下界被夹到 100ms（50ms=20Hz 会打爆连接数）",
+              per_sent == 100, "实际: %s" % per_sent)
+
+        # 照片响应不能同时带 no-store 和 max-age（实测过：浏览器按最严的来，
+        # 于是永远不缓存，每翻一次列表重下一遍）
+        jpeg = b"\xff\xd8" + b"\x00" * 64 + b"\xff\xd9"
+        OPENER.open(urllib.request.Request(
+            "http://127.0.0.1:%d/api/frame?device=%s&save=1"
+            % (port, urllib.parse.quote(pdev)),
+            data=jpeg, headers={"Content-Type": "image/jpeg"}), timeout=10).read()
+        shots = (get_json("http://127.0.0.1:%d/api/shots?device=%s"
+                          % (port, urllib.parse.quote(pdev))).get("shots") or [])
+        if shots:
+            with OPENER.open("http://127.0.0.1:%d/api/shots/%s/%s"
+                             % (port, urllib.parse.quote(pdev), shots[0]["name"]),
+                             timeout=10) as rr:
+                cc = rr.headers.get_all("Cache-Control") or []
+            check("照片响应只有一个 Cache-Control（no-store 与 max-age 不再打架）",
+                  len(cc) == 1, "实际: %s" % cc)
+        else:
+            check("照片接口可用（save=1 之后能在列表里查到）", False, "列表为空")
+
+        # ---- 27. 跨站写请求与花钱接口的限流（2026-10-30）-------------------
+        # CORS 只挡"读响应"，挡不住"请求被执行"。没有这道检查时，老师/同学
+        # 浏览任意网页，那个网页一条 fetch 就能下发 sd_format（格掉学生的卡）。
+        print("\n[27] 跨站写请求被挡 · 花钱接口有冷却（2026-10-30）")
+
+        def _cmd_with(headers, payload):
+            h = {"Content-Type": "application/json"}
+            h.update(headers)
+            req = urllib.request.Request(
+                "http://127.0.0.1:%d/api/command" % port,
+                data=json.dumps(payload).encode("utf-8"), headers=h)
+            try:
+                with OPENER.open(req, timeout=8) as r:
+                    return r.status
+            except urllib.error.HTTPError as e:
+                return e.code
+
+        check("别的网站发来的写请求被拒（403）",
+              _cmd_with({"Origin": "http://evil.example"}, {"name": "capture_once"}) == 403)
+        check("同源写请求照常放行（Origin == Host）",
+              _cmd_with({"Origin": "http://127.0.0.1:%d" % port},
+                        {"name": "capture_once"}) == 200)
+        check("不带 Origin 的脚本调用照常放行（curl / 板端）",
+              _cmd_with({}, {"name": "capture_once"}) == 200)
+
+        adev = "rob-audio"
+        aurl = "http://127.0.0.1:%d/api/audio?device=%s" % (
+            port, urllib.parse.quote(adev))
+        first_ok = post_bytes(aurl, b"\x01\x02" * 800).get("ok") is True
+        try:
+            post_bytes(aurl, b"\x01\x02" * 800)
+            second_code = 200
+        except urllib.error.HTTPError as e:
+            second_code = e.code
+        check("同一台板 1.5 秒内第二次录音被限流（429）",
+              first_ok and second_code == 429, "实际: first=%s second=%s"
+              % (first_ok, second_code))
 
     finally:
         for p in (srv, srv2, nlboard):

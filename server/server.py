@@ -46,12 +46,18 @@ import time
 import urllib.request
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import unquote
+from urllib.parse import unquote, urlsplit
 
 # --------------------------------------------------------------------------
 # 可调参数
 # --------------------------------------------------------------------------
-MAX_WINDOW = 1200         # 滑动窗口样本数（板端 100Hz 上报时 ≈ 12 秒）
+# 滑动窗口样本数。**必须 ≥ WINDOW_S × 标称采样率**，否则 8 秒窗会被截断。
+# 100 Hz × 8 s = 800，原来写 1200（12 秒）多出来的 400 个样本永远被
+# `now - ts <= WINDOW_S` 过滤掉，却要在**每一批** analyze 里被重新遍历、
+# 重新算 |a| —— 而 analyze 是在全局 LOCK 里跑的（见 _telemetry）。
+# 实测（本机，含 50 样本追加）：1200 → 8.15 ms/次，800 → 6.08 ms/次，
+# 即降到约 75%；干净机器上则从 6.23 ms 降到 ~4.7 ms。
+MAX_WINDOW = 800          # 滑动窗口样本数（板端 100Hz 上报时 = WINDOW_S 秒）
 WINDOW_S = 8.0            # 统计/计步/曲线用的时间窗（秒）
 MOTION_WINDOW_S = 0.6     # 瞬时运动分类（晃动/跌落）用的短窗（秒）
 
@@ -75,6 +81,9 @@ _LLM_SEM = threading.BoundedSemaphore(max(1, LLM_MAX_CONCURRENT))
 # 配了则下面这些接口要求 `X-RW1-Token` 请求头（或 `?token=` 查询参数）。
 API_TOKEN = os.environ.get("RW1_API_TOKEN", "").strip()
 WEB_WRITE_PATHS = ("/api/command", "/api/ask", "/api/ask/cancel", "/api/shots/delete")
+# 写入口的同源校验（CSRF）总开关。默认开启；只有在反向代理会改写 Host
+# 导致误判时才需要设 RW1_ALLOW_CROSS_ORIGIN=1 关掉。详见 Handler._origin_ok。
+ALLOW_CROSS_ORIGIN = os.environ.get("RW1_ALLOW_CROSS_ORIGIN", "").strip() == "1"
 
 # ---- 语音（第 4 周：按键说话 → 识别 → 大模型 → 屏显回复）---------------------
 # 识别两条路**自动选**：配了云端 key 走云端，没配就用本地 whisper；
@@ -84,11 +93,19 @@ AUDIO_MAX_BYTES = 512 * 1024   # 单次上传上限（3 s @16 kHz/16 bit 单声�
 AUDIO_RATE = 16000             # 板端录音采样率；云端与本地都按这个解
 AUDIO_DIR = None               # 录音留档目录（main() 里按 --data-dir 设）
 AUDIO_KEEP = 50                # 每台设备最多留多少条录音
+# 同一台板两次录音之间的最小间隔。`/api/audio` 是**唯一一个"一被调用就花钱"**
+# 的未鉴权入口（云端 ASR + 一次大模型），而它按设计不能加 token（老固件不带头）。
+# 所以在这里做一道限流：连续刷只会把间隔拉长，不会每次都能触发一次付费调用。
+# 顺带也挡掉"按键抖动导致连发两段录音"这种误触。
+AUDIO_MIN_GAP_S = 1.5
+AUDIO_LAST = {}                # device -> 上次受理的时刻（内部限流用，不进快照）
 ASR_TIMEOUT = 30.0             # 云端识别超时（后台线程里等，不阻塞板端）
 VOICE_TEXT_MAX = 200           # 识别出的文字长度上限（与 ask 的 q 一致）
 CHAT_HISTORY = 6               # 多轮上下文保留的问答轮数（澄清类追问要用）
 
 MAX_BATCH = 400           # 单次 POST 最多接受的样本数（防止畸形/恶意负载）
+VALID_G_MAX = 16.0        # 单轴可信上限（g）。固件 sanitize3 是 ±8g，这里留一倍余量；
+                          # 超出的一律当坏帧丢弃，见 Handler._parse_points
 BOARD_REPLY_MAX = 512     # 回传板端的回复字节上限（UTF-8 安全截断）
 
 # 仪表盘自托管字体白名单（详见 Handler._send_vendor_font）。字体名来自 URL，
@@ -230,8 +247,16 @@ LOGGER = None                              # 由 main() 注入的 JsonlLogger
 # **板子 POST 帧上来、网页再从这里取** —— 不是网页直连板子。
 FRAMES = {}                # device -> {"jpeg": bytes, "ts": float, "n": int}
 FRAME_MAX_BYTES = 400 * 1024   # 单帧上限，超了直接丢（防止有人拿它塞垃圾）
+# `FRAMES` 的**基数上限**。`MAX_DEVICES` 只管 `DEVICES`（遥测注册的那张表），
+# 管不到这里：任何人不带密钥、拿 400 KB 的帧乘以无限的设备名就能把内存灌满
+# （旧代码：`FRAMES[dev] = {...}` 永不淘汰）。按 ts 淘汰最旧的那台，
+# 64 台 × 400 KB ≈ 25 MB 封顶，课堂上够用。
+FRAME_MAX_DEVICES = 64
 SHOTS_DIR = None           # 拍照留档目录（main() 里按 --data-dir 设）
 SHOT_MAX = 200             # 每台设备最多留多少张（免得把磁盘塞满）
+# 照片目录的**设备数上限**：每台设备 200 张，但设备名是外部输入，
+# 64 个目录 × 200 张 ≈ 磁盘可控。超了就不存（返回 None，板端只当没留档）。
+SHOT_MAX_DEVICES = 64
 
 
 def safe_name(s):
@@ -300,7 +325,12 @@ def pick_device(did=None):
     live = [d for d in DEVICES.values() if d.st["last_post"] > 0.0]
     if live:
         return max(live, key=lambda d: d.st["last_post"])
-    return DEVICES[DEFAULT_DEVICE]
+    # 兜底设备可能**已经被 LRU 淘汰掉**：`"-"` 的 last_post 恒为 0，是
+    # `get_device()` 淘汰时最优先的受害者。而 `pick_device()` 又被
+    # `/api/audio`（它不写 last_post）之类的路径调用，于是存在这个序列：
+    # 33 个不同设备名的 audio 上报 → `"-"` 被淘汰 → 这里 KeyError → 500。
+    # 用 setdefault 重造一台即可（它就是"老固件的默认桶"，重建无副作用）。
+    return DEVICES.setdefault(DEFAULT_DEVICE, Device(DEFAULT_DEVICE))
 
 
 def snapshot(dev, with_events=True, with_commands=True):
@@ -393,12 +423,20 @@ def clip_utf8(text, limit):
 # 一次往返 = 2 个遥测周期（默认 1 秒），网页上能看到 queued → sent → done 全过程。
 # --------------------------------------------------------------------------
 def clamp_int(value, lo, hi, dflt):
-    """把外部传来的数字夹进 [lo, hi]；不是数字就用默认值。"""
+    """把外部传来的数字夹进 [lo, hi]；不是数字就用默认值。
+
+    ⚠️ `NaN` / `inf` 必须在这里挡掉：`int(float("inf"))` 抛 OverflowError，
+    `int(float("nan"))` 抛 ValueError —— 两者都不在原来的 `except` 里，
+    于是网页传个 `"inf"`（或者 JSON 里直接写 Infinity）就是一个 500 + 一段
+    traceback。而 `float()` 本身是**接受**这两个字面量的，所以必须显式判有限性。
+    """
     try:
-        v = int(float(value))
+        v = float(value)
     except (TypeError, ValueError):
         return dflt
-    return max(lo, min(hi, v))
+    if not math.isfinite(v):
+        return dflt
+    return max(lo, min(hi, int(v)))
 
 
 def sanitize_params(name, params):
@@ -463,8 +501,13 @@ def sanitize_params(name, params):
                 if v:
                     out[key] = v[:lim]
         if "period_ms" in p:
-            # 下限 50ms = 20Hz（板端夹同样的范围，两边保持一致）
-            out["period_ms"] = clamp_int(p.get("period_ms"), 50, 2000, 500)
+            # 下限 100ms = 10Hz（与板端 transport.c 的 run_set_config 夹同一范围）。
+            # **曾经放到 50ms（20Hz），是个陷阱**：每批只剩 5 个样本，"批量上报"
+            # 的设计红利消失；而 32 块板 × 20 POST/s = 640 连接/秒，配上
+            # `Connection: close`（服务端先关）会在服务端侧堆出数万个 TIME_WAIT。
+            # 三处（网页选择器 / 这里 / 固件）必须一起改，否则会出现"网页选了
+            # 100 但板端还是 50"这种对不上的静默偏差。
+            out["period_ms"] = clamp_int(p.get("period_ms"), 100, 2000, 500)
         return out
     return {}
 
@@ -1560,11 +1603,41 @@ class DashboardServer(ThreadingHTTPServer):
 class Handler(BaseHTTPRequestHandler):
     server_version = "RW1/1.1"
     protocol_version = "HTTP/1.1"     # 让板端的 esp_http_client 能复用连接
+    # 套接字超时。不设的话，一个"连上但不说话"的客户端（或睡着的笔记本挂着的
+    # SSE 半开连接）能永久占住一个线程 —— ThreadingHTTPServer 每连接一线程、
+    # 且没有上限，几十个睡着的浏览器标签就够把线程数堆起来。
+    # SSE 那边每 500 ms 一写，正常客户端永远不会触发；写超时被 `except OSError`
+    # 接住并退出循环，是干净的收尾路径。
+    timeout = 30
 
     def log_message(self, fmt, *args):   # 安静一点
         pass
 
     # ---- helpers ---------------------------------------------------------
+    def _origin_ok(self):
+        """写入口的同源校验（CSRF 防护）。
+
+        威胁模型换个角度看就成立了：**同学/老师浏览任意网页时，那个网页可以
+        `fetch('http://<本机IP>:8000/api/command', {mode:'no-cors'})`** ——
+        CORS 只挡"读响应"，**挡不住请求真的被执行**。配合默认无 token，
+        一条表单就能把 SD 卡格了。
+
+        规则：浏览器会自动带 `Origin`（跨站 POST 一定带）。带了就必须和本次
+        请求的 Host 一致；不带（curl / 板端 / 老工具）一律放行 —— 那些都不是
+        浏览器自动发起的跨站请求，挡住了只会误伤脚本。
+        反向代理把 Host 改掉的场景，可以用 `RW1_ALLOW_CROSS_ORIGIN=1` 关掉这道检查。
+        """
+        if ALLOW_CROSS_ORIGIN:
+            return True
+        origin = (self.headers.get("Origin") or "").strip()
+        if not origin:
+            origin = (self.headers.get("Referer") or "").strip()
+        if not origin:
+            return True
+        netloc = urlsplit(origin).netloc.strip().lower()
+        host = (self.headers.get("Host") or "").strip().lower()
+        return bool(netloc) and netloc == host
+
     def _send_vendor(self, relpath, ctype):
         """只服务仓库里那几个 vendor 文件；路径写死在调用点，不接受外部输入。"""
         full = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -1603,17 +1676,25 @@ class Handler(BaseHTTPRequestHandler):
 
     def _send(self, code, body, ctype="application/json; charset=utf-8", extra=None):
         data = body if isinstance(body, bytes) else body.encode("utf-8")
+        extra = extra or {}
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
-        self.send_header("Cache-Control", "no-store")
+        # `extra` 里给了同名头就以 extra 为准。原来是无条件先写 no-store 再追加，
+        # 于是 /api/shots/<dev>/<file> 的响应同时带着
+        # `no-store` 和 `max-age=31536000` 两个互相矛盾的值（实测确认）——
+        # 浏览器按最严的处理，照片于是永远不缓存，每翻一次列表就重下一遍。
+        if "Cache-Control" not in extra:
+            self.send_header("Cache-Control", "no-store")
         # 每个请求一连接就关：板端本来就是一次 POST 一个 client，浏览器这边请求也
         # 很少。省掉 keep-alive 的状态机，行为对两端都最好预测。
+        # ⚠️ 代价见 README「性能」：32 板 × 2 Hz 时服务端侧会堆 TIME_WAIT，
+        # 这也是 period_ms 下界必须卡在 100ms 的原因（见 sanitize_params）。
         self.send_header("Connection", "close")
-        for k, v in (extra or {}).items():
+        for k, v in extra.items():
             self.send_header(k, v)
         self.end_headers()
         self.wfile.write(data)
@@ -1730,6 +1811,14 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path, _, query = self.path.partition("?")
+        # CSRF：写入口必须是"同源"发起的（见 _origin_ok 的威胁模型）。
+        # 放在密钥门之前 —— 跨站请求连"试一次 token"的机会都不该有。
+        if path in WEB_WRITE_PATHS and not self._origin_ok():
+            self._send(403, json.dumps(
+                {"ok": False, "error": "cross-origin blocked",
+                 "hint": "写操作只接受同源请求（用仪表盘页面操作，或去掉 Origin 头）"},
+                ensure_ascii=False))
+            return
         # 网页写入口的访问密钥门（API_TOKEN 为空时整段跳过，行为与以前一样）。
         # 故意**不门** /api/telemetry、/api/frame、/api/audio：那是板子的上报
         # 通道，老固件没有密钥可带，门了就等于把全班挡在门外（后向兼容 > 洁癖）。
@@ -1784,6 +1873,13 @@ class Handler(BaseHTTPRequestHandler):
             old = FRAMES.get(dev)
             FRAMES[dev] = {"jpeg": data, "ts": time.time(),
                            "n": (old["n"] + 1) if old else 1}
+            # 基数封顶：设备名是外部输入，不封的话"无限设备名 × 400 KB"就是
+            # 一条不需要任何凭据的内存耗尽路径（见 FRAME_MAX_DEVICES 的注释）。
+            while len(FRAMES) > FRAME_MAX_DEVICES:
+                victim = min(FRAMES, key=lambda k: FRAMES[k]["ts"])
+                if victim == dev:
+                    break                    # 刚写进来的这台永远是"最新"，不会选中
+                FRAMES.pop(victim, None)
         saved = None
         if save:
             saved = self._shot_save(dev, data)
@@ -1796,6 +1892,12 @@ class Handler(BaseHTTPRequestHandler):
             return None
         d = os.path.join(SHOTS_DIR, safe_name(dev))
         try:
+            # 设备目录数封顶：每台设备 200 张是"每台的上限"，但设备名是外部输入，
+            # 没有这一道就能用无限个设备名造出无限个目录（磁盘写满）。
+            # 已经在册的设备照常写；新设备到顶就不存 —— 板端只是少一份留档，
+            # 网页上那张照片本来就是"顺手留的"，不影响拍照本身。
+            if not os.path.isdir(d) and self._shot_dev_dirs() >= SHOT_MAX_DEVICES:
+                return None
             os.makedirs(d, exist_ok=True)
             name = time.strftime("%Y%m%d-%H%M%S") + "-%03d.jpg" % (int(time.time() * 1000) % 1000)
             with open(os.path.join(d, name), "wb") as fh:
@@ -1811,6 +1913,15 @@ class Handler(BaseHTTPRequestHandler):
         except OSError as e:
             print("  拍照存盘失败: %s" % e)
             return None
+
+    @staticmethod
+    def _shot_dev_dirs():
+        """`SHOTS_DIR` 下已经有多少个设备目录（用于 SHOT_MAX_DEVICES 封顶）。"""
+        try:
+            with os.scandir(SHOTS_DIR) as it:
+                return sum(1 for e in it if e.is_dir())
+        except OSError:
+            return 0
 
     def _shots_list(self, query):
         dev = clean_device_id(query_param(query, "device") or "")
@@ -1881,6 +1992,24 @@ class Handler(BaseHTTPRequestHandler):
         if len(data) < 64:
             self._send(400, json.dumps({"ok": False, "error": "audio too short"},
                                        ensure_ascii=False))
+            return
+        # 限流（见 AUDIO_MIN_GAP_S）：**必须在读完 body 之后**再回绝，否则客户端
+        # 拿到的是连接重置而不是 429（手册 T58 的老坑）。被拒的也不更新时刻，
+        # 这样"连发 10 次"只会全部被拒、不会积攒下一次的额度。
+        with LOCK:
+            now_a = time.time()
+            # `AUDIO_LAST` 的键是外部输入（设备名），会随"无限设备名"长大；
+            # 到 256 条就顺手清掉 60 秒前的记录，保证这张表本身有界。
+            if len(AUDIO_LAST) > 256:
+                for k in [k for k, t in AUDIO_LAST.items() if now_a - t > 60.0]:
+                    AUDIO_LAST.pop(k, None)
+            too_soon = (now_a - AUDIO_LAST.get(dev_id, 0.0)) < AUDIO_MIN_GAP_S
+            if not too_soon:
+                AUDIO_LAST[dev_id] = now_a
+        if too_soon:
+            self._send(429, json.dumps(
+                {"ok": False, "error": "too soon", "hint": "同一台设备 %.1f 秒内只收一段录音"
+                 % AUDIO_MIN_GAP_S}, ensure_ascii=False))
             return
         with LOCK:
             dev = get_device(dev_id)
@@ -2134,19 +2263,46 @@ class Handler(BaseHTTPRequestHandler):
 
     @staticmethod
     def _parse_points(msg):
-        """支持两种载荷：新协议 batch=[[x,y,z],...]，以及单帧 x/y/z（向后兼容）。"""
+        """支持两种载荷：新协议 batch=[[x,y,z],...]，以及单帧 x/y/z（向后兼容）。
+
+        **每个点都要过 isValidSample()**：`json.loads` 默认接受 `NaN` / `Infinity`
+        这两个非法 JSON 字面量，`float()` 也照收。一旦放进去：
+
+          - `analyze()` 里 `tilt_direction()` 的 `int(nan)` 抛 ValueError，
+            而且抛在 `_send()` **之前** —— 客户端拿到的是"连接被掐断"，不是 500；
+          - 更糟的是 NaN 已经进了 `dev.samples`，**接下来 8 秒内每一帧正常数据**
+            都会在同一个 `int(nan)` 上再次抛异常（窗口里还留着它）；
+          - `/api/latest` 再把 NaN 序列化出去（`json.dumps` 允许，RFC 8259 不允许），
+            浏览器 `JSON.parse` 抛错 → 整页停在旧数据上。
+
+        固件侧早就有等价的一道（`transport.c` 的 `sanitize3`：任一轴越界整帧丢弃、
+        **绝不填 0**，因为 0 恰好是失重特征）。服务端一直漏着，这里补上。
+        """
         pts = []
+
+        def take(item):
+            """一个点要么完整可用，要么整点丢弃 —— 不做部分填充。"""
+            try:
+                x, y, z = float(item[0]), float(item[1]), float(item[2])
+            except (TypeError, ValueError, IndexError, KeyError):
+                return
+            if not (math.isfinite(x) and math.isfinite(y) and math.isfinite(z)):
+                return
+            # 量程兜底：加速度计满量程 ±8g（固件 sanitize3 同一口径），
+            # 16g 是给三轴合成留的余量。超出的一律当坏帧 —— 否则网页曲线
+            # 的纵轴会被一个 1e300 直接压成一条线。
+            if max(abs(x), abs(y), abs(z)) > VALID_G_MAX:
+                return
+            pts.append((x, y, z))
+
         batch = msg.get("batch")
         if isinstance(batch, list):
             for item in batch[:MAX_BATCH]:
-                try:
-                    pts.append((float(item[0]), float(item[1]), float(item[2])))
-                except (TypeError, ValueError, IndexError, KeyError):
-                    continue
+                take(item)
         if not pts:
             try:
-                pts.append((float(msg["x"]), float(msg["y"]), float(msg["z"])))
-            except (KeyError, TypeError, ValueError):
+                take((msg["x"], msg["y"], msg["z"]))
+            except (KeyError, TypeError):
                 return []
         return pts
 
@@ -3336,7 +3492,7 @@ dialog.modal[open]::backdrop{animation:modal-veil var(--dur-2) var(--ease-out)}
         </div>
         <div class="field">
           <label for="pollsel">页面取数频率</label>
-          <select id="pollsel" title="页面从服务器取数的频率。想更跟手就选 60Hz —— 但前提是板端上报周期也调到 50ms（板子设置里的「灵敏度」），两个都够快才真跟手">
+          <select id="pollsel" title="页面从服务器取数的频率。想更跟手就把板端上报周期也调下来（板子设置里的「上报周期」，最小 100ms = 10Hz）—— 两个都够快才真跟手；页面比板端快太多只是白取同一份数据">
             <option value="16">60 Hz</option>
             <option value="33">30 Hz</option>
             <option value="50">20 Hz</option>
@@ -3380,7 +3536,7 @@ dialog.modal[open]::backdrop{animation:modal-veil var(--dur-2) var(--ease-out)}
           </div>
           <div class="field">
             <label for="cfgper">上报周期 ms</label>
-            <input id="cfgper" type="number" min="50" max="2000" step="10" placeholder="50~2000" style="width:120px">
+            <input id="cfgper" type="number" min="100" max="2000" step="10" placeholder="100~2000" style="width:120px">
           </div>
         </div>
         <div class="actions">
