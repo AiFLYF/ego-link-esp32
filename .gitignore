@@ -55,3 +55,6 @@ Desktop.ini
 
 # 临时产物（探针日志、合成的树、一次性验证脚本）
 /_local_tmp/
+# >>> multi-agent-collab:private >>>
+/.multi-agent-collab/
+# <<< multi-agent-collab:private <<<
