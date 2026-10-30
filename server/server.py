@@ -2442,6 +2442,11 @@ class Handler(BaseHTTPRequestHandler):
                     # 事件仍然是"最近 40 条"的滑动窗口（前端本来就是覆盖式重绘，
                     # 不需要增量协议）；要更多历史时另有 /api/events 可查。
                     snap["events"] = list(dev.events)[:SSE_EVENTS_MAX]
+                    # 事件总条数（缓冲区里实际有多少，最多 200）。前端标题写着
+                    # "最近 N 条" —— 裁剪之后如果还用 `evts.length`，N 会**永远
+                    # 卡在 40**，看起来像"事件只有 40 条"，其实只是没发全。
+                    # 多发一个整数换一句不说谎的文案。
+                    snap["ev_total"] = len(dev.events)
                     snap["commands"] = commands_snapshot(dev)[:SSE_COMMANDS_MAX]
                     # 与 /api/latest 同修：序列化在锁内做，字节发出去在锁外。
                     # SSE 是长连接、每 500ms 一帧；持锁期间客户端网络卡一下，
@@ -4249,6 +4254,11 @@ function setBar(i, v){
 
 /* ---------------- 指令面板 ---------------- */
 var busy = false, devOnline = false, ledSteady = false, cmdNames = [], cmdsSeen = [];
+/* 最近一条**成功**的 sd_ls。必须单独缓存，不能每次去扫 cmdsSeen：
+   SSE 只发最近 SSE_COMMANDS_MAX(8) 条命令，用户读完存储信息后再发 8 条
+   （拍几张照 + 闪几次灯就到了），那条 sd_ls 就从列表里消失，存储面板会
+   莫名退回"还没读过"—— 而用户明明刚点过。换设备时由 selectDevice() 清空。 */
+var lastSd = null;
 /* 多选下发：勾中的设备名集合（空 = 不指定，交给服务端用"最近上报的那台"，
    单板场景与以前完全一样）。**只在"下发指令"时生效**，"查看"仍然是单选。 */
 var selDevices = {};
@@ -4577,11 +4587,13 @@ function setHTML(el, html){
 function renderSd(){
   var host = $("sdring"), list = $("sdfiles");   /* 容器 id 是 sdring（圆环） */
   if (!host || !list) return;
-  /* 取最近一条**成功**的 sd_ls 结果 */
-  var last = null;
+  /* 取最近一条**成功**的 sd_ls 结果。
+     先刷新缓存（新来的命令可能就带一条），再用缓存 —— 见 lastSd 的注释：
+     直接扫 cmdsSeen 的话，8 条新命令之后这条记录就不在列表里了。 */
   (cmdsSeen || []).forEach(function(c){
-    if (c.name === "sd_ls" && c.state === "done" && c.result && c.result.note) last = c;
+    if (c.name === "sd_ls" && c.state === "done" && c.result && c.result.note) lastSd = c;
   });
+  var last = lastSd;
   if (!last){
     setHTML(host, '<div class="hint">还没读过 —— 点上面的「读取存储信息」' +
       '（板子离线时命令会排队，等它回来再执行）</div>');
@@ -4719,9 +4731,11 @@ function renderCmds(cmds){
 
 /* ---------------- 事件流 ---------------- */
 var evHTML = "";
-function renderEvents(evts){
+function renderEvents(evts, total){
   /* 事件流的权威通道也是 SSE。/api/latest 不带 events，所以这里缺字段时
-     **什么都不要做**（包括画"暂无事件"空态）—— 画了就是跟 SSE 打架。 */
+     **什么都不要做**（包括画"暂无事件"空态）—— 画了就是跟 SSE 打架。
+     `total` 是缓冲区里的真实条数（最多 200），SSE 只发最近 40 条；
+     没有这个字段时退回 `evts.length`（老服务端 / 单独调用）。 */
   if (!evts || !evts.length) return;
   var h = evts.slice(0,40).map(function(ev){
     var k = "k-" + (ev.kind || "info");
@@ -4729,10 +4743,17 @@ function renderEvents(evts){
     return '<div class="item"><span class="k ' + k + '"></span><span class="t">' + time + '</span>'
          + '<span>' + esc(ev.text) + '</span></div>';
   }).join("");
+  var n = (total !== undefined && total !== null) ? total : evts.length;
+  var label = (n > evts.length) ? ("最近 " + evts.length + " 条 / 共 " + n + " 条")
+                                : ("最近 " + n + " 条");
   if (h !== evHTML){
     evHTML = h;
     $("feed").innerHTML = h;
-    $("evcount").textContent = "最近 " + evts.length + " 条";
+    $("evcount").textContent = label;
+  } else if ($("evcount").textContent !== label){
+    /* 条数变了但可见的那 40 条没变（比如又来了第 41 条把最旧的挤出去前）——
+       文案也得跟上，否则"共 N 条"会停在旧值。 */
+    $("evcount").textContent = label;
   }
 }
 
@@ -4977,6 +4998,10 @@ function selectDevice(id){
      正在念的半句也该停：没人想听完上一台板子的回答。 */
   spokenText = "";
   try{ if (window.speechSynthesis) speechSynthesis.cancel(); }catch(e){}
+  /* 换设备要**清掉上一条 sd_ls 的缓存**：存储面板是"这台板的卡"，
+     留着上一台的容量/文件列表会显示成新设备的数据（而且看起来完全正常，
+     比空着更误导）。 */
+  lastSd = null;
   pull();              /* 先拉一次快照，不必等下一帧 SSE */
   stream();            /* SSE 是按设备过滤的，换设备要重连 */
 }
@@ -5116,7 +5141,7 @@ function render(s){
     setBar(0, x); setBar(1, y); setBar(2, z);
   }
   renderCmds(s.commands);
-  renderEvents(s.events);
+  renderEvents(s.events, s.ev_total);
 }
 
 /* ---------------- 语音播报（第 5 周） ----------------
