@@ -867,6 +867,33 @@ python server\server.py
 **板子的上报不受影响**（遥测 / 推帧 / 录音永远不要求密钥，老固件零改动）。
 不配 = 完全关闭，行为与以前一样。
 
+## 持续集成（CI）
+
+`.github/workflows/ci.yml` 在每次 push / PR 上跑三件事，全部**不需要真浏览器、不需要真板子**：
+
+| 步骤 | 命令 | 耗时 | 验什么 |
+|---|---|---|---|
+| 静态检查 | `python tools/lint_py.py` | 秒级 | 没用的 import、未定义名字、裸 `except:`、可变默认参数、**锁契约**（docstring 写了"必须持有 LOCK"的函数有没有在没拿锁处被调用） |
+| 纯函数单测 | `python -m unittest discover -s tools -p "test_*.py"` | 约 1 秒 | 41 条：8 方位、30 条话术、参数夹取、计步、失重、UTF-8 截断、设备名清洗、**设备名编码跨端契约**；另有 5 条非有限输入用例在加固批次合入后自动启用 |
+| 服务端回归 | `python tools/verify_server.py` | 约 2 分半 | 全部端到端断言（当前 138 项；加固批次合入后 144 项）—— 起真服务 + 假板子 |
+
+本地跑同样的三条即可，行为和 CI 一致：
+
+```bash
+python tools/lint_py.py
+python -m unittest discover -s tools -p "test_*.py" -v
+python tools/verify_server.py
+```
+
+**为什么 CI 不跑 `e2e_dashboard.js` / `e2e_design.js`**：那两个要真 Chrome + `playwright-core`，
+装起来重、跑起来慢，而且验的是视觉规则（令牌、字号阶梯、对比度、320px 窄屏）。
+它们是**改样式时的本地门禁**，不该挂在每次 PR 上。
+
+**为什么单独有 `tools/test_units.py`**：`verify_server.py` 走端到端，边界用例很难覆盖
+（想验 `tilt_direction` 的 8 个方位，就得发 8 次真实请求）。这些函数是纯的
+（无锁、无 IO、无全局状态），本来就该用毫秒级断言钉死 —— 所以它进每次提交的门禁，
+失败信息直接指到具体边界条件。
+
 ## 常见问题
 
 | 现象 | 处理 |
@@ -886,6 +913,7 @@ python server\server.py
 代码现在按 JPEG 结构自己找结尾：**SOS(FF DA) 之后第一个 FF D9** |
 | 串口出现 `ov2640: get sensor ID failed` / `esp_video_init: failed to detect DVP camera with address=30` | **这是硬件问题，不是配置问题**：摄像头在 I2C 上不响应（0x30 地址 NACK）。排查顺序：① 断电后把摄像头 **FPC 排线重新插紧**（插到底、卡扣扣好）—— 这是最常见的原因；② 换一个模组确认不是模组坏。**判据**：如果同一份日志里 `accel_input: Detected accelerometer` 是正常的，说明 **I2C 总线本身没问题**（加速度计和摄像头共用 GPIO4/5），问题只在摄像头这一端，所以不用去查引脚或 Kconfig |
 | 仪表盘「设备」卡片里有两台，但实际只插了一块板 | 两块板的设备名撞了。配网页的「设备名」留空会自动按 MAC 命名；如果手动填了同名（比如都填 `rw1`）就会合并成一台。双击 BOOT 进配网改掉其中一个 |
+| **设备名是中文（如「第三组-07」）时，实时画面恒 404、照片进乱码目录、语音回复挂到一台幽灵设备** | 2026-10-30 修复前的老固件：`/api/frame`、`/api/audio` 把设备名**裸拼进 URL**，而 Python 的 `http.server` 按 latin-1 解请求行 → 同一块板在服务端变成 `ç¬¬ä¸ç»„-07` 这第二台设备。新固件在 `transport.c` 的 `url_encode()` 里做 percent-encoding（`s_device_url` 是编码后的副本，三处调用点都用它）。**没重刷固件的板子**可以先把设备名改成 ASCII（如 `g3-07`）绕过 |
 | 配网时手机搜不到 `EGO-LINK-XXXX`，或板子一开机就重启循环 | 2026-09-22 前的固件有这个 bug：AP 密码是 4 位，而 WPA2 要求 8–63 位，`esp_wifi_set_config()` 会拒绝；当时那行用的是 `ESP_ERROR_CHECK`，于是直接 `abort()` → 重启循环，连屏幕都看不到。已修（密码改 8 位数字 + 失败不再 abort）。**注意：如果只是个别情况，先确认手机没连在 5GHz-only 的网络**——AP 只跑 2.4GHz channel 1 |
 | 首次编译卡在拉取组件 | 离线场景拷入 `managed_components/`；在线场景检查能否访问 components.espressif.com |
 | 改了 `idf_component.yml` 后编译报 `[safe-delete]` 或重新下载组件 | 删掉 `device/managed_components/` 让它按 `dependencies.lock` 重建即可 |
