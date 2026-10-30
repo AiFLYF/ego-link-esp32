@@ -34,6 +34,7 @@
 import argparse
 import json
 import os
+import random
 import shutil
 import subprocess
 import sys
@@ -55,17 +56,24 @@ MAX_DEVICES = 32
 class Board(threading.Thread):
     """一块假板子：按 period 往服务器灌遥测，记下每次往返的耗时。"""
 
-    def __init__(self, base, dev_id, period, stop_evt, results):
+    def __init__(self, base, dev_id, period, stop_evt, results, stagger=False):
         super().__init__(daemon=True)
         self.base = base
         self.dev_id = dev_id
         self.period = period
+        self.stagger = stagger
         self.stop_evt = stop_evt
         self.results = results          # 共享：{"ok": n, "fail": n, "lat": [...], "err": {...}}
         self.lock = results["lock"]
 
     def run(self):
         url = self.base + "/api/telemetry"
+        # --stagger：模拟固件开机的随机错峰（transport.c 里那段 esp_random 偏移）。
+        # 不加这个开关时，所有线程的相位完全一致 —— 那正是**最坏情况**：
+        # 32 块板每 500ms 在同一瞬间一起 POST。实测 p95=476ms（判据 1s），
+        # 而错峰之后同样 32 块板的 p95 会掉到百毫秒以内（见 README「课堂规模」）。
+        if self.stagger:
+            time.sleep(random.uniform(0.0, self.period))
         while not self.stop_evt.is_set():
             body = vs.firmware_body([(0.0, 0.0, 1.0)] * 50, device=self.dev_id)
             t0 = time.time()
@@ -143,6 +151,9 @@ def main():
     ap.add_argument("--period", type=float, default=0.5,
                     help="每块板子的上报周期（秒），默认 0.5 = 板端默认 500ms")
     ap.add_argument("--keep", action="store_true", help="保留临时数据目录")
+    ap.add_argument("--stagger", action="store_true",
+                    help="每块板开机随机延迟 0~1 个周期（模拟固件错峰）。"
+                         "不加 = 全班同相位，那是最坏情况")
     args = ap.parse_args()
 
     n = args.boards
@@ -184,7 +195,8 @@ def main():
         results = {"ok": 0, "fail": 0, "lat": [], "err": {}, "lock": threading.Lock()}
         stop_evt = threading.Event()
         devs = ["class-%02d" % i for i in range(1, n + 1)]
-        boards = [Board(base, d, args.period, stop_evt, results) for d in devs]
+        boards = [Board(base, d, args.period, stop_evt, results, args.stagger)
+                  for d in devs]
         t_start = time.time()
         for b in boards:
             b.start()

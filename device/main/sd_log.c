@@ -26,6 +26,7 @@
 #include "esp_log.h"
 #include "esp_vfs_fat.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "sd_card.h"
 
@@ -44,6 +45,49 @@ static int s_day = -1;              /* 当前文件的"日"键，-1 = 还没建 
 static unsigned s_lines = 0;
 static unsigned s_lines_total = 0;
 static bool s_low_space = false;
+
+/* ---------------- 跨任务互斥 ------------------------------------------------
+ *
+ * 本模块的调用方有**两个不同任务**：
+ *   - transport_task（100 Hz 采样循环）每 50 个样本调 sd_log_sample()
+ *   - upload_task（上报任务）在活动词变化时调 sd_log_event()
+ *
+ * 原来两边的 `FILE*` 与 `s_file / s_day / s_low_space` 状态机**没有任何保护**：
+ * 一侧正在 fputs，另一侧可能正好走进 sd_log_open_for_today() 把它 fclose 掉；
+ * 结果是文件损坏或写进已关闭的流（后者在 ESP-IDF 上直接 panic）。
+ *
+ * 取值策略沿用本项目一贯的取舍 —— **宁可丢一行，绝不阻塞采样**：
+ *   - 采样侧 xSemaphoreTake(0)：抢不到就丢掉这一行并计数，10 ms 后又是一条好汉；
+ *   - 事件侧给 10 ms 的耐心（它本来就在上报任务里，慢一点无所谓）。
+ * 真正的根治是"环形缓冲 + 独立 sdlog 任务"（下一批做），这里先把正确性补上。
+ */
+static SemaphoreHandle_t s_lock;
+static uint32_t s_dropped;
+
+static bool sd_lock_take(TickType_t wait)
+{
+    if (s_lock == NULL) {
+        return false;
+    }
+    return xSemaphoreTake(s_lock, wait) == pdTRUE;
+}
+
+static void sd_lock_give(void)
+{
+    if (s_lock != NULL) {
+        xSemaphoreGive(s_lock);
+    }
+}
+
+static void sd_note_drop(void)
+{
+    s_dropped++;
+    /* 每 200 次报一声：卡慢到这种程度值得知道，但不能刷屏 */
+    if ((s_dropped % 200u) == 1u) {
+        ESP_LOGW(TAG, "SD 日志连续被跳过（累计 %u 行）—— 卡可能很慢",
+                 (unsigned)s_dropped);
+    }
+}
 
 static bool sd_log_has_clock(void)
 {
@@ -149,11 +193,23 @@ static void sd_log_write(const char *line)
 
 esp_err_t sd_log_init(void)
 {
+    if (s_lock == NULL) {
+        s_lock = xSemaphoreCreateMutex();   /* 必须在第一个调用方之前建好 */
+    }
+    if (s_lock == NULL) {
+        ESP_LOGW(TAG, "建互斥量失败，本地留档关闭");
+        return ESP_ERR_NO_MEM;
+    }
     if (!sd_card_mounted()) {
         ESP_LOGI(TAG, "没有 SD 卡，本地留档功能关闭（其它功能不受影响）");
         return ESP_ERR_INVALID_STATE;
     }
-    if (!sd_log_open_for_today()) {
+    if (!sd_lock_take(portMAX_DELAY)) {
+        return ESP_FAIL;
+    }
+    const bool opened = sd_log_open_for_today();
+    sd_lock_give();
+    if (!opened) {
         return ESP_FAIL;
     }
     ESP_LOGI(TAG, "本地留档已开启（%s）", s_path);
@@ -162,21 +218,32 @@ esp_err_t sd_log_init(void)
 
 void sd_log_close(void)
 {
+    if (!sd_lock_take(portMAX_DELAY)) {
+        return;
+    }
     if (s_file != NULL) {
         fflush(s_file);
         fclose(s_file);
         s_file = NULL;
     }
     s_day = -1;
+    sd_lock_give();
 }
 
 void sd_log_sample(uint32_t uptime_ms, const char *activity,
                    float x, float y, float z, float mag)
 {
+    /* 0 等待：采样循环绝不因为 SD 卡慢而停摆（见文件上方 s_lock 那段） */
+    if (!sd_lock_take(0)) {
+        sd_note_drop();
+        return;
+    }
     if (s_file == NULL && !sd_log_open_for_today()) {
+        sd_lock_give();
         return;
     }
     if (!sd_log_space_ok()) {
+        sd_lock_give();
         return;
     }
     char line[128];
@@ -185,11 +252,17 @@ void sd_log_sample(uint32_t uptime_ms, const char *activity,
              (activity != NULL && activity[0] != '\0') ? activity : "-",
              (double)x, (double)y, (double)z, (double)mag);
     sd_log_write(line);
+    sd_lock_give();
 }
 
 void sd_log_event(const char *kind, const char *text)
 {
+    if (!sd_lock_take(pdMS_TO_TICKS(10))) {
+        sd_note_drop();
+        return;
+    }
     if (s_file == NULL && !sd_log_open_for_today()) {
+        sd_lock_give();
         return;
     }
     char line[160];
@@ -199,6 +272,7 @@ void sd_log_event(const char *kind, const char *text)
              (kind != NULL) ? kind : "?",
              (text != NULL) ? text : "");
     sd_log_write(line);
+    sd_lock_give();
 }
 
 bool sd_log_active(void)
