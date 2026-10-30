@@ -420,9 +420,24 @@ def main():
             check("遥测行数 >= 50", len(lines) >= 50, "实际 %d 行" % len(lines))
         if evt:
             kinds = set()
+            ev_kinds = []
             for ln in open(os.path.join(data_dir, evt[0]), encoding="utf-8"):
-                kinds.add(json.loads(ln).get("k"))
+                rec = json.loads(ln)
+                kinds.add(rec.get("k"))
+                ev_kinds.append(rec.get("kind"))
             check("事件文件里只有事件记录", kinds == {"e"}, "实际: %s" % kinds)
+            # 跌落的**确定性判据**：事件是 append-only 的，不像 activity 字段
+            # 只在那 0.5 秒里可见。上一节按 0.1s 轮询抓瞬时状态（验证的是板端
+            # 屏幕会看到什么），这里再钉一次"事件真的落了盘" —— 两者互补：
+            # 前者管"看得见"，后者管"留得住"，且不受机器忙闲影响。
+            # （2026-10-30 采纳协作者的复核意见：轮询瞬时状态本质是碰运气。）
+            deadline = time.time() + 2.0
+            while "fall" not in ev_kinds and time.time() < deadline:
+                time.sleep(0.1)
+                ev_kinds = [json.loads(ln).get("kind")
+                            for ln in open(os.path.join(data_dir, evt[0]), encoding="utf-8")]
+            check("跌落事件已落盘（确定性判据，不依赖轮询时机）",
+                  "fall" in ev_kinds, "实际事件类型: %s" % sorted(set(ev_kinds)))
 
         # ---- 7. 大模型不阻塞板端（P0 修复的核心）-------------------------
         print("\n[7] 慢速大模型（%d 秒）不阻塞板端" % MockLLM.delay)
@@ -1527,6 +1542,23 @@ def main():
         check("同一台板 1.5 秒内第二次录音被限流（429）",
               first_ok and second_code == 429, "实际: first=%s second=%s"
               % (first_ok, second_code))
+
+        # ---- 28. SSE 瘦身后的两个出口（2026-10-30）-------------------------
+        # SSE 每帧只发"前端真会画出来的那些"（40 条事件 / 8 条命令），
+        # 单页面带宽从 228 KB/s 降到约 59 KB/s。历史要全量就得有另一个出口，
+        # 这条断言钉住它存在、且 limit 真的生效。
+        print("\n[28] 事件历史出口（SSE 瘦身后的全量通道）")
+        ev_all = get_json("http://127.0.0.1:%d/api/events?device=%s"
+                          % (port, urllib.parse.quote(pdev)))
+        check("/api/events 可按设备取事件",
+              ev_all.get("device") == pdev and isinstance(ev_all.get("events"), list),
+              "实际: device=%s, n=%s" % (ev_all.get("device"),
+                                         len(ev_all.get("events") or [])))
+        ev_1 = get_json("http://127.0.0.1:%d/api/events?device=%s&limit=1"
+                        % (port, urllib.parse.quote(pdev)))
+        check("/api/events 的 limit 生效（只要 1 条）",
+              len(ev_1.get("events") or []) <= 1, "实际: %d 条"
+              % len(ev_1.get("events") or []))
 
     finally:
         for p in (srv, srv2, nlboard):

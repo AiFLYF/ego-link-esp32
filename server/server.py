@@ -51,14 +51,18 @@ from urllib.parse import unquote, urlsplit
 # --------------------------------------------------------------------------
 # 可调参数
 # --------------------------------------------------------------------------
-# 滑动窗口样本数。**必须 ≥ WINDOW_S × 标称采样率**，否则 8 秒窗会被截断。
-# 100 Hz × 8 s = 800，原来写 1200（12 秒）多出来的 400 个样本永远被
-# `now - ts <= WINDOW_S` 过滤掉，却要在**每一批** analyze 里被重新遍历、
-# 重新算 |a| —— 而 analyze 是在全局 LOCK 里跑的（见 _telemetry）。
-# 实测（本机，含 50 样本追加）：1200 → 8.15 ms/次，800 → 6.08 ms/次，
-# 即降到约 75%；干净机器上则从 6.23 ms 降到 ~4.7 ms。
-MAX_WINDOW = 800          # 滑动窗口样本数（板端 100Hz 上报时 = WINDOW_S 秒）
-WINDOW_S = 8.0            # 统计/计步/曲线用的时间窗（秒）
+# 统计/计步/曲线用的时间窗（秒）。**必须定义在 MAX_WINDOW 之前** —— 后者要用它。
+WINDOW_S = 8.0
+# 滑动窗口样本数。**上限必须按"服务端愿意信任的最快采样率"算，不是按标称值算。**
+# 窗口本身是按时间过滤的（`now - ts <= WINDOW_S`），deque 只是它的容量上限：
+#   - 标称 100 Hz × 8 s = 800；
+#   - 但 dt 是**推断**出来的，DT_TRUST_MIN=8 ms 也在可信区间内（125 Hz），
+#     那种情况下 8 秒里有 1000 个样本 —— 容量给 800 就会把窗口悄悄截成 6.4 秒，
+#     而 `ai_summary()` 的文案仍写"最近 8 秒内约计步 N 次"，计步会系统性偏低。
+# 所以取 1000 + 64 的余量。代价是每批多遍历两百来个样本（实测 analyze
+# 8.15 ms@1200 → 约 7.1 ms@1064，仍比原来省 13%）—— 正确性优先于这点收益。
+# 真正的根治是"按时间索引 + 追加时缓存 |a|"，留待下一批。
+MAX_WINDOW = int(WINDOW_S / 0.008) + 64      # = 1064
 MOTION_WINDOW_S = 0.6     # 瞬时运动分类（晃动/跌落）用的短窗（秒）
 
 DEVICE_TIMEOUT = 5.0      # 超过该秒数没有新遥测则视为离线
@@ -135,6 +139,15 @@ FREEFALL_MIN_S = 0.05     # 失重判定：至少持续这么久才算疑似跌�
 # 第 3 周在此基础上加了两个「物理反馈」指令：led_blink / led_set —— 板载 LED 在 GPIO3。
 CMD_TIMEOUT_S = 10.0      # 命令下发后多久没收到结果就判超时
 CMD_MAX_HISTORY = 20      # 保留最近多少条命令供网页显示
+# SSE 每帧真正发出去的条数。**必须与前端渲染上限一致**（renderEvents 的
+# `slice(0,40)`、renderCmds 的前 8 条）—— 多发的字节到浏览器就被 DOM 丢掉了。
+# 保留的历史仍然在 dev.events / dev.commands 里（各 200/20 条），
+# /api/events 与 /api/commands 要全量时能拿到。
+SSE_EVENTS_MAX = 40
+SSE_COMMANDS_MAX = 8
+# /api/latest 每帧带多少个曲线点。画布 CSS 宽约 240 px，120 点已经超过可分辨
+# 像素数；240 点时多出来的一半在 drawChart 里落到同一列像素上，是纯字节。
+CURVE_POINTS = 120
 CMD_NAMES = ("capture_once", "led_blink", "led_set", "set_orient",
              "set_config", "sd_format", "sd_ls", "sd_rm",
              "cam_capture", "cam_stream")   # 白名单（不认的名字直接 400）
@@ -853,7 +866,16 @@ TILT_DIRS = ["上", "右上", "右", "右下", "下", "左下", "左", "左上"]
 
 
 def tilt_direction(x, y):
-    """把屏幕坐标系的重力方向 (x 向右, y 向下) 映射成 8 方位。"""
+    """把屏幕坐标系的重力方向 (x 向右, y 向下) 映射成 8 方位。
+
+    非有限值一律返回 None（当"判不出方向"，与放平同档）。这是一道**纵深防御**：
+    正常路径上 `_parse_points()` 已经把 NaN/Inf 滤掉了，但本函数会被
+    `ai_summary()` 直接调用，而 `int(nan)` 抛的 ValueError 会顺着
+    `/api/latest` 的调用栈一路冒出去 —— 那种故障看起来像"整页卡死"，
+    排查成本远高于这一行的代价。（2026-10-30 采纳协作者的复核意见。）
+    """
+    if not (math.isfinite(x) and math.isfinite(y)):
+        return None
     if math.hypot(x, y) < 0.25:
         return None
     deg = math.degrees(math.atan2(y, x)) % 360          # 0°=右, 90°=下
@@ -1764,8 +1786,13 @@ class Handler(BaseHTTPRequestHandler):
                 # （SSE 每 500ms 把它显示出来、/api/latest 每 100ms 又把它藏起来），
                 # 而且大部分时间是不可见的 —— 2026-09-26 用真浏览器才抓到。
                 snap["devices"] = devices_snapshot()
+                # 曲线点数：**按画布宽度取，不按窗口长度取**。
+                # 那块 canvas 的 CSS 宽度约 240 px（高分屏 480 物理像素），
+                # 120 个点已经超过可分辨的像素数；原来发 240 个点，多出来的一半
+                # 在 drawChart 里直接落在同一列像素上 —— 纯字节。实测载荷
+                # 16.3 KB → 约 8.6 KB。
                 snap["samples"] = [[round(t, 2), x, y, z]
-                                   for (t, x, y, z) in decimate(dev.samples, 240)]
+                                   for (t, x, y, z) in decimate(dev.samples, CURVE_POINTS)]
                 # 序列化也必须在锁内：events/commands 的快照与活记录共享可变字段，
                 # 锁外 json.dumps 会把"拍完之后"的迁移混进这一帧（mixed snapshot）。
                 # 只把**字节**先在锁内做好；socket 发送留在锁外 —— 持锁写一个
@@ -1780,6 +1807,19 @@ class Handler(BaseHTTPRequestHandler):
                 did = dev.id
             self._send(200, json.dumps({"ok": True, "device": did, "commands": cmds,
                                         "names": list(CMD_NAMES)}, ensure_ascii=False))
+        elif path == "/api/events":
+            # 事件流的"全量"出口。SSE 每帧只发最近 SSE_EVENTS_MAX 条（那是前端
+            # 真正会画出来的量），想翻更早的历史就走这里 —— 服务端保留 200 条。
+            want = query_param(query, "device")
+            limit = clamp_int(query_param(query, "limit"), 1, 200, 200)
+            with LOCK:
+                dev = pick_device(clean_device_id(want) if want else None)
+                evts = list(dev.events)[:limit]
+                kept = len(dev.events)
+                did = dev.id
+            self._send(200, json.dumps({"ok": True, "device": did,
+                                        "events": evts, "kept": kept},
+                                       ensure_ascii=False))
         elif path == "/api/logs":
             self._send(200, json.dumps(LOGGER.stats() if LOGGER else {}, ensure_ascii=False))
         elif path == "/api/frame":
@@ -2322,10 +2362,21 @@ class Handler(BaseHTTPRequestHandler):
                     # 每轮重新解析一次设备：选中的板子被淘汰/改名时，
                     # 这里会自动退回"最近上报过的那台"，前端看到 device 变了就跟着切。
                     dev = pick_device(clean_device_id(want) if want else None)
-                    snap = snapshot(dev)
+                    snap = snapshot(dev, with_events=False, with_commands=False)
                     snap["devices"] = devices_snapshot(now)
                     snap["sample"] = list(dev.samples[-1]) if dev.samples else None
                     snap["now"] = now
+                    # ⚠️ 只发"前端真的会画出来的那些"，别发整本历史。
+                    #
+                    # 原来这里发的是 snapshot(dev) 的全量：200 条事件 + 20 条命令，
+                    # 单帧 35.3 KB、2 Hz = 69 KB/s —— 而 renderEvents() 只画
+                    # `evts.slice(0,40)`、renderCmds() 只画前 8 条。也就是说
+                    # **八成以上的字节从服务端搬到浏览器，然后在 DOM 里被丢掉**。
+                    # 现在按渲染上限裁剪：40 + 8，单帧降到约 9 KB。
+                    # 事件仍然是"最近 40 条"的滑动窗口（前端本来就是覆盖式重绘，
+                    # 不需要增量协议）；要更多历史时另有 /api/events 可查。
+                    snap["events"] = list(dev.events)[:SSE_EVENTS_MAX]
+                    snap["commands"] = commands_snapshot(dev)[:SSE_COMMANDS_MAX]
                     # 与 /api/latest 同修：序列化在锁内做，字节发出去在锁外。
                     # SSE 是长连接、每 500ms 一帧；持锁期间客户端网络卡一下，
                     # 全校板子的上报都要等它 —— 那正是第一需求场景下最怕的事。
@@ -3496,7 +3547,8 @@ dialog.modal[open]::backdrop{animation:modal-veil var(--dur-2) var(--ease-out)}
             <option value="16">60 Hz</option>
             <option value="33">30 Hz</option>
             <option value="50">20 Hz</option>
-            <option value="100" selected>10 Hz</option>
+            <option value="100">10 Hz</option>
+            <option value="200" selected>5 Hz</option>
             <option value="200">5 Hz</option>
             <option value="500">2 Hz</option>
             <option value="2000">0.5 Hz</option>
@@ -5289,7 +5341,11 @@ function setPoll(ms){
 if ($("pollsel")) {
   $("pollsel").onchange = function(){ setPoll(parseInt(this.value, 10) || 100); };
 }
-setPoll(parseInt(($("pollsel") || {}).value, 10) || 100);
+/* 默认 5 Hz（200ms）。**不必更高**：板端最快也就 10 Hz 上报（period_ms 下限
+   100ms），页面比它快一倍以上只是把同一份数据反复搬一遍 —— 实测单页面
+   10 Hz 轮询要 159 KB/s 上行。3D 那一层有 60 Hz 的 slerp 插值，
+   5 Hz 照样看着连续；真想要更勤可以在「页面取数频率」里自己调。 */
+setPoll(parseInt(($("pollsel") || {}).value, 10) || 200);
 stream();
 })();
 </script>
