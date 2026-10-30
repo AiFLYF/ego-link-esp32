@@ -320,5 +320,52 @@ class TestDeviceNameEncodingContract(unittest.TestCase):
         self.assertEqual(self._firmware_encode("rw1-07"), "rw1-07")
 
 
+@unittest.skipUnless(
+    hasattr(srv, "VALID_G_MAX"),
+    "非有限输入过滤尚未合入（见 feature/p0-hardening）；合入后本组自动生效")
+class TestNonFiniteInputs(unittest.TestCase):
+    """`NaN` / `Infinity` 必须被挡在入口，绝不能进到分析里。
+
+    背景（2026-10-30 复现）：`json.loads` 默认接受 `NaN` / `Infinity` 这两个
+    **非法 JSON 字面量**，`float()` 也照收。于是 `{"batch":[[NaN,NaN,NaN]]}`
+    （30 字节、无需鉴权）会：
+
+      1. 在 `analyze()` → `tilt_direction()` 的 `int(nan)` 抛 ValueError，
+         而且抛在响应头之前 —— 客户端只看到**连接被掐断**，不是 500；
+      2. NaN 已经进了 `dev.samples`，**接下来 8 秒每一帧正常数据**都在同一个
+         `int(nan)` 上再抛一次（窗口里还留着它）；
+      3. `/api/latest` 再把 NaN 序列化出去，浏览器 `JSON.parse` 抛错 → 整页停更。
+
+    固件侧早就有等价的一道（`transport.c` 的 `sanitize3`：任一轴越界整帧丢弃、
+    绝不填 0），服务端一直漏着。本组用例钉住"入口过滤"这个不变量。
+    """
+
+    def test_nan_batch_is_rejected(self):
+        pts = srv.Handler._parse_points({"batch": [[float("nan"), 0.0, 0.0]]})
+        self.assertEqual(pts, [])
+
+    def test_infinity_batch_is_rejected(self):
+        for bad in (float("inf"), float("-inf")):
+            pts = srv.Handler._parse_points({"batch": [[bad, 0.0, 1.0]]})
+            self.assertEqual(pts, [], "值 %r 应当被丢弃" % bad)
+
+    def test_out_of_range_is_rejected(self):
+        """1e300 会让网页曲线纵轴直接压成一条线，按坏帧丢弃。"""
+        self.assertEqual(srv.Handler._parse_points({"batch": [[1e300, 0.0, 0.0]]}), [])
+
+    def test_good_points_survive(self):
+        pts = srv.Handler._parse_points({"batch": [[0.1, -0.2, 0.98], [0.0, 0.0, 1.0]]})
+        self.assertEqual(len(pts), 2)
+        for p in pts:
+            self.assertTrue(all(math.isfinite(v) for v in p))
+
+    def test_clamp_int_rejects_non_finite(self):
+        """`int(float("inf"))` 抛 OverflowError，不在原来的 except 里 → 500 + traceback。"""
+        self.assertEqual(srv.clamp_int("inf", 1, 12, 3), 3)
+        self.assertEqual(srv.clamp_int("nan", 1, 12, 3), 3)
+        self.assertEqual(srv.clamp_int(float("inf"), 0, 15, 0), 0)
+        self.assertEqual(srv.clamp_int("7", 1, 12, 3), 7)      # 正常值不受影响
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
