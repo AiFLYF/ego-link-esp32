@@ -65,7 +65,7 @@ if _SERVER_DIR not in sys.path:
     sys.path.insert(0, _SERVER_DIR)
 
 from analysis import ACTIVITY_IDLE, WINDOW_S, analyze, tilt_direction  # noqa: E402
-from jsonl_log import JsonlLogger  # noqa: E402
+from jsonl_log import JsonlLogger, estimate_mb  # noqa: E402
 
 # --------------------------------------------------------------------------
 # 可调参数
@@ -2288,9 +2288,22 @@ def main():
     print("   AI模式:  %s" % llm)
     print("   指令超时: %.0f 秒" % CMD_TIMEOUT_S)
     print("   多设备:  最多 %d 台；?device=<名字> 可指定，不带则用最近上报的那台" % MAX_DEVICES)
-    print("   落盘:    %s%s" % (args.data_dir,
-          "（仅事件）" if args.no_log_telemetry else "（波形 %.0fHz + 事件，保留 %d 天）"
-          % (args.log_hz, args.retain_days)))
+    # `--retain-days 0` 的语义是"不自动清理"，直接印"保留 0 天"会读成"立刻删"。
+    _what = "仅事件" if args.no_log_telemetry else "波形 %.0fHz + 事件" % args.log_hz
+    _retain_txt = ("保留 %d 天" % args.retain_days) if args.retain_days > 0 else "不自动清理"
+    print("   落盘:    %s（%s，%s）" % (args.data_dir, _what, _retain_txt))
+    # 落盘量预估。**这个数必须给出来**：老师很可能把数据目录放在 C 盘或 U 盘上，
+    # 而"保留 7 天"听起来很小 —— 实测一个班 8 小时就是 170 MB 量级，
+    # 满 7 天是 1 GB 以上（2026-11-01 用 load_classroom 实测锚定，见 jsonl_log.py）。
+    _est = estimate_mb(20, 8, args.log_hz, log_telemetry=not args.no_log_telemetry)
+    if args.retain_days > 0:
+        _keep = _est * args.retain_days
+        _keep_txt = ("，保留 %d 天约 %.1f GB" % (args.retain_days, _keep / 1024.0)
+                     if _keep >= 1024 else
+                     "，保留 %d 天约 %.0f MB" % (args.retain_days, _keep))
+    else:
+        _keep_txt = ""            # 上一行已经说了"不自动清理"，别重复
+    print("   空间:    一个班 20 块板 × 8 小时 ≈ %.0f MB%s" % (_est, _keep_txt))
     print("=" * 66)
     # SIGTERM（systemd / docker stop / 关机）也走"优雅收尾"这条路：
     # 默认行为是直接杀进程，队列里没落盘的记录就没了。
