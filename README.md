@@ -69,6 +69,8 @@
 | 路径 | 内容 |
 |---|---|
 | `server/server.py` | 电脑服务器（仅 Python 标准库，无需 pip 安装） |
+| `server/analysis.py` | **运动分类**：计步 / 晃动 / 跌落的判据与全部阈值常量。想调灵敏度改这一个文件 |
+| `server/jsonl_log.py` | JSONL 落盘（后台线程 + 队列，绝不阻塞 HTTP） |
 | `server/web/index.html` | **网页仪表盘本体**（HTML/CSS/JS）。服务端按 mtime 读取，**改完刷新浏览器即生效，不用重启** |
 | `server/data/` | **运行时生成**的 JSONL 日志（git-ignored，见下文"数据落盘"） |
 | `device/` | 开发板 ESP-IDF 工程（ESP-IDF v5.4.x，目标 esp32s3） |

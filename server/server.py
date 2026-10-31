@@ -29,14 +29,12 @@ AI 交互课 · PC 服务器（无需 VPS，自己的电脑即服务器）
 """
 
 import argparse
-import datetime
 import hashlib
 import hmac
 import io
 import json
 import math
 import os
-import queue
 import re
 import signal
 import socket
@@ -50,10 +48,31 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote, urlsplit
 
 # --------------------------------------------------------------------------
+# 同目录的两个模块（2026-11-01 从本文件拆出：analysis / jsonl_log）
+#
+# ⚠️ **必须先把本文件所在目录放进 sys.path。** 本文件有两条加载路径：
+#   1. `python server/server.py` —— 此时脚本目录自动在 sys.path[0]，没问题；
+#   2. `tools/test_units.py` / `verify_server.py` 用 importlib **按路径**加载
+#      —— 此时 sys.path 里没有 server/，只写 `import analysis` 会 ImportError。
+# 放在这里而不是文件更靠前的位置，是因为下面的 `MAX_WINDOW` 马上要用
+# `analysis.WINDOW_S`（窗口秒数 → deque 容量），必须在它之前完成导入。
+#
+# 为什么拆：依赖图量出来的结果是这两个模块**不碰任何模块级可变状态**
+# （JsonlLogger 的传递依赖是 0 个），把它们留在 2627 行的文件里只有坏处。
+# --------------------------------------------------------------------------
+_SERVER_DIR = os.path.dirname(os.path.abspath(__file__))
+if _SERVER_DIR not in sys.path:
+    sys.path.insert(0, _SERVER_DIR)
+
+from analysis import ACTIVITY_IDLE, WINDOW_S, analyze, tilt_direction  # noqa: E402
+from jsonl_log import JsonlLogger  # noqa: E402
+
+# --------------------------------------------------------------------------
 # 可调参数
 # --------------------------------------------------------------------------
-# 统计/计步/曲线用的时间窗（秒）。**必须定义在 MAX_WINDOW 之前** —— 后者要用它。
-WINDOW_S = 8.0
+# 统计/计步/曲线用的时间窗 `WINDOW_S` 与瞬时短窗 `MOTION_WINDOW_S`
+# 已经搬到 `server/analysis.py`（它们只被那边的分类函数用）。
+# 本文件在顶部 import 了 `WINDOW_S`，所以下面这行照样成立。
 # 滑动窗口样本数。**上限必须按"服务端愿意信任的最快采样率"算，不是按标称值算。**
 # 窗口本身是按时间过滤的（`now - ts <= WINDOW_S`），deque 只是它的容量上限：
 #   - 标称 100 Hz × 8 s = 800；
@@ -64,7 +83,6 @@ WINDOW_S = 8.0
 # 8.15 ms@1200 → 约 7.1 ms@1064，仍比原来省 13%）—— 正确性优先于这点收益。
 # 真正的根治是"按时间索引 + 追加时缓存 |a|"，留待下一批。
 MAX_WINDOW = int(WINDOW_S / 0.008) + 64      # = 1064
-MOTION_WINDOW_S = 0.6     # 瞬时运动分类（晃动/跌落）用的短窗（秒）
 
 DEVICE_TIMEOUT = 5.0      # 超过该秒数没有新遥测则视为离线
 LLM_TIMEOUT = 25.0        # 大模型请求超时（后台线程里等，不影响板端）
@@ -118,8 +136,6 @@ BOARD_REPLY_MAX = 512     # 回传板端的回复字节上限（UTF-8 安全截�
 FONT_FILES = ("sora-400.woff2", "sora-600.woff2", "sora-700.woff2", "sora-800.woff2",
               "plexmono-400.woff2", "plexmono-500.woff2", "plexmono-600.woff2")
 
-STEP_MIN_G = 0.25         # 计步：高出窗口均值的幅度阈值（g）
-STEP_REFRACTORY_S = 0.30  # 计步：两步之间的最小间隔（秒）
 DT_NOMINAL = 0.01         # 标称采样间隔（对应板端 CONFIG_RW1_SAMPLE_PERIOD_MS=10）
 DT_TRUST_MAX = 0.05       # 超过这个推断间隔就认为该帧晚到了、时间轴不可信
 # 下界：dt_est = 两批到达间隔 / 本批样本数，**批越小这个推算越不可信**。
@@ -127,14 +143,9 @@ DT_TRUST_MAX = 0.05       # 超过这个推断间隔就认为该帧晚到了、�
 # (间隔 / 样本数) 能掉到几毫秒 —— sample_hz 直接飘到 311（板子标称才 100）。
 # 它是网页上直接显示的字段，飘高会误导人，所以两头都要钳。
 DT_TRUST_MIN = 0.008      # 8 ms → 125 Hz，给标称的 100 Hz 留 25% 余量
-MOTION_STD = 0.06         # "算得上在动"的短窗标准差阈值（g）
-SHAKE_ZCR = 3.5           # 晃动判定：|a| 起伏频率高于该值（Hz）。步行 1.5~2.5Hz，
-                          # 晃动 3~8Hz —— 只靠幅度分不开两者（走路也有 0.5g 起伏），
-                          # 必须靠频率。
-WALK_ZCR_MIN = 1.2        # 步行判定：起伏频率下限（Hz）
-SHAKE_MIN_GAP_S = 0.6     # 晃动事件的最小间隔（秒），避免一次晃动记成多次
-FREEFALL_G = 0.35         # 失重判定：合加速度阈值（g）
-FREEFALL_MIN_S = 0.05     # 失重判定：至少持续这么久才算疑似跌落（秒）
+# 计步 / 晃动 / 跌落的判定阈值（STEP_* / MOTION_STD / SHAKE_* / WALK_ZCR_MIN /
+# FREEFALL_*）全部搬到 `server/analysis.py` 了 —— 它们是那边的判据参数，
+# 改阈值去那个文件，别在这里加。
 
 # ---- 远程命令（第 2 周：Web 下发「采集一次」，按 request_id 反馈结果）----
 # 第 3 周在此基础上加了两个「物理反馈」指令：led_blink / led_set —— 板载 LED 在 GPIO3。
@@ -168,7 +179,8 @@ CAM_STREAM_FPS_MAX = 10
 # 详见 device/main/camera.c 里 CAM_JPEG_QUALITY_* 的注释与手册 T56。
 FALL_AUTO_ALERT = True    # 判定跌落时自动下发 LED 告警（远端物理反馈）
 
-ACTIVITY_IDLE = "等待数据…"
+# `ACTIVITY_IDLE`（"等待数据…"）在 server/analysis.py 定义，本文件顶部已 import ——
+# 它是**分类器的输出词汇**，归那边管；`Device` 只是拿它当初始值。
 
 # --------------------------------------------------------------------------
 # 全局状态
@@ -714,348 +726,26 @@ def commands_snapshot(dev):
 
 
 # --------------------------------------------------------------------------
-# 落盘：JSONL 追加写，独立线程消费队列，绝不阻塞 HTTP 处理
-# --------------------------------------------------------------------------
-class JsonlLogger:
-    """把遥测与事件追加到 <root>/telemetry-YYYY-MM-DD.jsonl 与 events-*.jsonl。
-
-    写盘在后台线程里做，业务线程只往队列里丢一条记录，所以磁盘慢/满都不会
-    拖慢遥测响应。队列满时丢最旧的（宁可丢日志也不丢实时性）。
-    """
-
-    def __init__(self, root, retain_days=7, log_telemetry=True, log_hz=10.0):
-        self.root = root
-        self.retain_days = retain_days
-        self.log_telemetry = log_telemetry
-        self.log_hz = max(1.0, float(log_hz))
-        self.q = queue.Queue(maxsize=20000)
-        self.dropped = 0
-        self.written = 0
-        self._fhs = {}                 # path -> 文件句柄（遥测与事件是两个文件，
-                                       # 必须各持一个句柄，否则会互相串写）
-        os.makedirs(root, exist_ok=True)
-        self.purge_old()
-        # 句柄留给 close()：退出时要等这条线程把队列排空，
-        # 否则 Ctrl-C 会把最多 2 万条还没落盘的记录直接扔掉
-        # （2026-10-30 前的实际行为：daemon 线程随进程一起消失）。
-        self._thread = threading.Thread(target=self._run, name="jsonl", daemon=True)
-        self._thread.start()
-
-    # ---- 生产者 ----------------------------------------------------------
-    def telemetry(self, ts, device, source, pts, dt):
-        if not self.log_telemetry or not pts:
-            return
-        hz = 1.0 / dt if dt > 0 else 0.0
-        step = max(1, int(round(hz / self.log_hz))) if hz else 1
-        thin = pts[::step]
-        self._put({
-            "k": "t",
-            "ts": round(ts, 3),
-            "dev": device,
-            "src": source,
-            "hz": round(hz, 1),
-            "s": [[round(x, 3), round(y, 3), round(z, 3)] for (x, y, z) in thin],
-        })
-
-    def event(self, device, kind, text):
-        self._put({"k": "e", "ts": round(time.time(), 3), "dev": device,
-                   "kind": kind, "text": text})
-
-    def _put(self, rec):
-        """入队。队列满时**丢最旧的**再进新的（类文档承诺的语义：
-        "宁可丢日志也不丢实时性" —— 旧日志的价值低于新日志，课堂掉线重连时
-        newest 恰是最该留下的现场）。
-
-        2026-10-12 订正：原实现是 put_nowait 失败就 dropped += 1 直接返回，
-        丢的是**最新**一条，与上面的承诺正好相反。
-        这里用有界重试而不是无锁 get+put：两个生产者线程（遥测/事件）可能
-        在同一毫秒都撞上 Full，简单的"出一个进一个"在极端时序下仍会丢新的。
-        """
-        try:
-            self.q.put_nowait(rec)
-            return
-        except queue.Full:
-            pass
-        for _ in range(3):
-            try:
-                self.q.get_nowait()          # 丢最旧的
-                self.dropped += 1
-            except queue.Empty:
-                pass                         # 被消费线程抢先取走了，静默即可
-            try:
-                self.q.put_nowait(rec)
-                return
-            except queue.Full:
-                continue
-        self.dropped += 1                    # 抢了三次还没进（消费线程停摆），丢新的
-
-    # ---- 消费者 ----------------------------------------------------------
-    def _run(self):
-        while True:
-            rec = self.q.get()
-            if rec is None:
-                break
-            try:
-                self._write(rec)
-            except OSError:
-                pass          # 磁盘满/权限问题不该拖垮服务器
-
-    def _path(self, prefix, ts):
-        day = datetime.date.fromtimestamp(ts).isoformat()
-        return os.path.join(self.root, "%s-%s.jsonl" % (prefix, day))
-
-    def _write(self, rec):
-        day = datetime.date.fromtimestamp(rec["ts"]).isoformat()
-        path = self._path("telemetry" if rec["k"] == "t" else "events", rec["ts"])
-        fh = self._fhs.get(path)
-        if fh is None:
-            # 跨天时把昨天的句柄关掉，别让长跑的服务攒一堆打开的 fd
-            for old in [p for p in self._fhs if day not in p]:
-                try:
-                    self._fhs.pop(old).close()
-                except OSError:
-                    pass
-            fh = open(path, "a", encoding="utf-8")
-            self._fhs[path] = fh
-        fh.write(json.dumps(rec, ensure_ascii=False, separators=(",", ":")) + "\n")
-        fh.flush()
-        self.written += 1
-
-    def purge_old(self):
-        """删掉超过保留期的日志。构造时跑一次；之后看护线程每天调一次（P1-11）。
-
-        ⚠️ 必须是**公开名**：watchdog 调的就是 `LOGGER.purge_old()`。
-        2026-10-25 事故：这个方法曾叫 `_purge_old`，而看护线程调的是不带下划线的
-        名字 —— 服务端连跑 24 小时后那里抛 AttributeError，**看护线程整个死掉**
-        （设备离线判定 / 指令超时 / 日志清理全部静默停摆）。短期回归全测不到它，
-        谁也不会把测试跑满 24 小时；tools/verify_server.py 第 [0] 节因此加了
-        一条静态门禁点名这个方法的存在。
-        """
-        if self.retain_days <= 0:
-            return
-        cutoff = time.time() - self.retain_days * 86400
-        for name in os.listdir(self.root):
-            if not (name.startswith("telemetry-") or name.startswith("events-")):
-                continue
-            if not name.endswith(".jsonl"):
-                continue
-            path = os.path.join(self.root, name)
-            try:
-                if os.path.getmtime(path) < cutoff:
-                    os.remove(path)
-                    print("   [日志] 已清理过期文件 %s" % name)
-            except OSError:
-                pass
-
-    def stats(self):
-        files = []
-        total = 0
-        for name in sorted(os.listdir(self.root)):
-            if not name.endswith(".jsonl"):
-                continue
-            size = os.path.getsize(os.path.join(self.root, name))
-            files.append({"name": name, "bytes": size})
-            total += size
-        return {"dir": self.root, "files": files, "bytes": total,
-                "written": self.written, "dropped": self.dropped}
-
-    def close(self, timeout=2.0):
-        """把队列里剩下的记录写完再退出（Ctrl-C / SIGTERM 时调用）。
-
-        原来 `_run` 是 daemon 线程，进程一退队列里最多 2 万条记录直接消失 ——
-        而"停在旧数据上"恰恰发生在最需要现场的时候（正在演示、突然 Ctrl-C）。
-        现在发一个哨兵让消费线程自然收尾，最多等 `timeout` 秒。
-
-        ⚠️ 队列满的时候**不能**只是 `put_nowait(None)`（会 Full），
-        要先腾出空位再放哨兵，否则消费线程永远等不到它。
-        """
-        if self._thread is None or not self._thread.is_alive():
-            return 0
-        for _ in range(3):
-            try:
-                self.q.put_nowait(None)
-                break
-            except queue.Full:
-                try:
-                    self.q.get_nowait()     # 腾一格（丢最旧的，与 _put 的语义一致）
-                    self.dropped += 1
-                except queue.Empty:
-                    pass
-        self._thread.join(timeout=timeout)
-        for fh in list(self._fhs.values()):
-            try:
-                fh.close()
-            except OSError:
-                pass
-        self._fhs.clear()
-        return self.written
-
-
-# --------------------------------------------------------------------------
-# 运动分析：本地规则"AI"
+# 落盘：JSONL 追加写 —— 已搬到 `server/jsonl_log.py`（本文件顶部 import 了它）
 #
-# 坐标契约：板端上报的 x/y 已经是**屏幕坐标系**（+x 右、+y 下），板端在发送前
-# 应用了自己的 NVS 方向校准（accel_input 的 orientation）。服务端不再做任何
-# 轴向假设，两端对"上/下/左/右"的定义因此天然一致。
+# 那个类和 HTTP / IMU / 指令通道一点关系都没有，依赖图算下来它引用的模块级
+# 名字是 **0 个**。留在 2600 行的文件里唯一的效果是让文件更长、让它没法被
+# 单独测试。设计要点（丢最旧而非最新、close() 排空队列、purge_old 必须是
+# 公开名）都写在那个文件的模块 docstring 里。
 # --------------------------------------------------------------------------
-TILT_DIRS = ["上", "右上", "右", "右下", "下", "左下", "左", "左上"]
 
 
-def tilt_direction(x, y):
-    """把屏幕坐标系的重力方向 (x 向右, y 向下) 映射成 8 方位。
-
-    非有限值一律返回 None（当"判不出方向"，与放平同档）。这是一道**纵深防御**：
-    正常路径上 `_parse_points()` 已经把 NaN/Inf 滤掉了，但本函数会被
-    `ai_summary()` 直接调用，而 `int(nan)` 抛的 ValueError 会顺着
-    `/api/latest` 的调用栈一路冒出去 —— 那种故障看起来像"整页卡死"，
-    排查成本远高于这一行的代价。（2026-10-30 采纳协作者的复核意见。）
-    """
-    if not (math.isfinite(x) and math.isfinite(y)):
-        return None
-    if math.hypot(x, y) < 0.25:
-        return None
-    deg = math.degrees(math.atan2(y, x)) % 360          # 0°=右, 90°=下
-    idx = int(((deg + 22.5) % 360) // 45)               # 0=右
-    order = [2, 3, 4, 5, 6, 7, 0, 1]                    # 右,右下,下,左下,左,左上,上,右上 → 方位表
-    return TILT_DIRS[order[idx]]
-
-
-def count_steps(win, mags, mean):
-    """对 |a| 序列做局部极大值检测（带不应期），返回窗口内步数。
-
-    用局部极大值而不是"高于均值就算一步"，否则一段持续的高幅运动会
-    被每一个采样点都数成一步（100Hz 下会夸张到上百步）。
-    """
-    if len(win) < 3:
-        return 0
-    thr = mean + STEP_MIN_G
-    steps = 0
-    last_t = None
-    for i in range(1, len(win) - 1):
-        m = mags[i]
-        if m <= thr or m < mags[i - 1] or m < mags[i + 1]:
-            continue
-        t = win[i][0]
-        if last_t is None or (t - last_t) >= STEP_REFRACTORY_S:
-            steps += 1
-            last_t = t
-    return steps
-
-
-def max_freefall_run(mags, dt):
-    """返回 mags 中最长的连续失重样本数，用来判跌落。"""
-    need = max(2, int(round(FREEFALL_MIN_S / dt))) if dt > 0 else 2
-    best = run = 0
-    for m in mags:
-        if m < FREEFALL_G:
-            run += 1
-            if run > best:
-                best = run
-        else:
-            run = 0
-    return best if best >= need else 0
-
-
-def zero_cross_rate(mags, dt):
-    """估算 |a| 起伏的主频率（Hz）：去均值后数符号穿越，再折算成周期数。
-
-    这是把"步行"和"晃动"分开的关键——两者幅度可以一样大，频率却差一倍以上。
-    """
-    if len(mags) < 4 or dt <= 0:
-        return 0.0
-    mean = sum(mags) / len(mags)
-    dead = 0.02                     # 死区，避免噪声在均值附近反复穿越
-    sign = 0
-    crossings = 0
-    for m in mags:
-        d = m - mean
-        if d > dead:
-            s = 1
-        elif d < -dead:
-            s = -1
-        else:
-            continue
-        if sign != 0 and s != sign:
-            crossings += 1
-        sign = s
-    span = (len(mags) - 1) * dt
-    return (crossings / span / 2.0) if span > 0 else 0.0
-
-
-def analyze(dev, now, pts, dt):
-    """把一批样本并入该设备的滑动窗口，返回 (活动标签, 事件列表)。"""
-    events = []
-    prev_activity = dev.st["activity"]
-    prev_fall = dev.st.get("fall_active", False)
-
-    n = len(pts)
-    for i, (x, y, z) in enumerate(pts):
-        dev.samples.append((now - (n - 1 - i) * dt, x, y, z))
-
-    # 建窗口与算 |a| **一趟做完**：原来分两个列表推导各扫一遍窗口，
-    # 750 个样本就要多扫一次（实测省 ~0.06 ms/次，20 板 40 次/秒 ≈ 2.4 ms/s）。
-    # 顺带删掉一个从来没人读的 `std_all`（长窗 |a| 标准差）：它每次上报都要
-    # 对 750 个样本做一遍 (m-mean)**2 求和，实测 0.215 ms —— 占 analyze 的 24%，
-    # 而分类判据用的是**短窗** r_std，这个值算完就丢。删掉不影响任何输出。
-    win, mags = [], []
-    for s in dev.samples:
-        if now - s[0] <= WINDOW_S:
-            win.append(s)
-            ax, ay, az = s[1], s[2], s[3]
-            mags.append(math.sqrt(ax * ax + ay * ay + az * az))
-    if not win:
-        return ACTIVITY_IDLE, events
-
-    mean = sum(mags) / len(mags)
-
-    # ---- 瞬时运动：用短窗，长窗会把一次 0.2s 的晃动稀释到测不出来 ----
-    recent = [s for s in win if now - s[0] <= MOTION_WINDOW_S]
-    r_mags = [math.sqrt(ax * ax + ay * ay + az * az) for (_, ax, ay, az) in recent] or mags[-1:]
-    r_mean = sum(r_mags) / len(r_mags)
-    r_std = math.sqrt(sum((m - r_mean) ** 2 for m in r_mags) / len(r_mags))
-    r_peak = max(r_mags)
-
-    steps = count_steps(win, mags, mean)
-    dev.st["step_count"] = steps
-
-    zcr = zero_cross_rate(r_mags, dt)          # 起伏频率，用来区分步行与晃动
-
-    # ---- 晃动：窗口内计数（修复前是开机累计值，文案却说"最近 8 秒内"）----
-    shaking = r_std > MOTION_STD and zcr > SHAKE_ZCR
-    if shaking:
-        if not dev.shake_times or (now - dev.shake_times[-1]) >= SHAKE_MIN_GAP_S:
-            dev.shake_times.append(now)
-            events.append(("shake", "检测到晃动/敲击（%.1f Hz）" % zcr))
-    while dev.shake_times and (now - dev.shake_times[0]) > WINDOW_S:
-        dev.shake_times.popleft()
-    dev.st["shake_count"] = len(dev.shake_times)
-
-    # ---- 跌落：短窗内的连续失重 ----
-    fall_run = max_freefall_run(r_mags, dt)
-    fall_active = fall_run > 0
-    if fall_active and not prev_fall:
-        events.append(("fall", "检测到疑似跌落（失重 %.0f ms）" % (fall_run * dt * 1000)))
-    dev.st["fall_active"] = fall_active
-
-    # ---- 分类 ----
-    if fall_active:
-        activity = "疑似跌落(失重)!"
-    elif shaking:
-        activity = "剧烈晃动"
-    elif r_std > MOTION_STD and zcr >= WALK_ZCR_MIN:
-        activity = "运动/步行 (峰值 %.1fg, 约%d步)" % (r_peak, steps)
-    elif r_std > MOTION_STD:
-        activity = "运动 (峰值 %.1fg)" % r_peak
-    else:
-        tail = [s for s in win if now - s[0] <= 1.0] or win[-1:]
-        gx = sum(s[1] for s in tail) / len(tail)
-        gy = sum(s[2] for s in tail) / len(tail)
-        d = tilt_direction(gx, gy)
-        activity = ("静置·向%s倾斜" % d) if d else "静置·水平"
-
-    if activity != prev_activity:
-        events.append(("activity", "活动变化：%s → %s" % (prev_activity, activity)))
-    return activity, events
+# --------------------------------------------------------------------------
+# 运动分析：本地规则"AI" —— 已搬到 `server/analysis.py`
+#
+# 那 5 个函数（tilt_direction / count_steps / max_freefall_run /
+# zero_cross_rate / analyze）加上它们的 11 个阈值常量整体搬走了：
+# 依赖图显示它们只互相引用，模块级可变状态一个都不碰。
+# **改计步/晃动/跌落的阈值去那个文件**，别在这里加常量。
+#
+# 本文件顶部 import 了 analyze 与 tilt_direction（后者被下面的 ai_summary 用）。
+# 坐标契约也一并搬过去了：板端上报的 x/y 已是屏幕坐标系（+x 右、+y 下）。
+# --------------------------------------------------------------------------
 
 
 def ai_summary(dev):
