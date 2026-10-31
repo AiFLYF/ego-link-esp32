@@ -199,3 +199,32 @@ class JsonlLogger:
                 pass
         self._fhs.clear()
         return self.written
+
+
+# --------------------------------------------------------------------------
+# 落盘量估算（启动横幅 + README 用的就是这一组数）
+#
+# 2026-11-01 实测（tools/load_classroom.py --boards 20 --seconds 20 --keep）：
+#   20 块板 × 2Hz 上报 × 波形降到 10Hz → 21 秒写 676 条遥测 = 120 KB
+#   → 单条 176 B、合计 5.7 KB/s、每块板约 1 MB/小时
+# 也就是说**一个班 8 小时 ≈ 160 MB/天**，不是 README 原来写的"15–20 MB/天"
+# （那个数其实是"单块板 24 小时"的量级，读起来却像整个服务器一天）。
+#
+# ⚠️ 改 `telemetry()` 的字段就要一起改下面两个锚点 ——
+#    `tools/test_units.py::TestDiskEstimate` 会拿真实记录去量，改漏了会红。
+# --------------------------------------------------------------------------
+RECORD_BYTES_AT_10HZ = 176          # 一条遥测记录（5 个样本）的实测大小
+PER_BOARD_MB_PER_HOUR_AT_10HZ = 1.0  # 每块板每小时（波形 10Hz 时）
+EVENTS_RATIO = 0.07                  # 事件量 ≈ 波形的 7%（实测 7.8 KB vs 120 KB）
+
+
+def estimate_mb(boards, hours, log_hz=10.0, log_telemetry=True):
+    """估算 N 块板跑 hours 小时会写多少 MB。
+
+    纯线性外推，锚点就是上面那两个实测常量：波形量与 `log_hz` 成正比
+    （降采样越稀，每条记录的样本越少，但记录条数不变），事件量按固定比例算。
+    板端上报周期不影响结果 —— 周期变长时单条记录变大、条数变少，总量抵消。
+    """
+    wave = (boards * hours * PER_BOARD_MB_PER_HOUR_AT_10HZ
+            * (max(1.0, float(log_hz)) / 10.0))
+    return wave * (1.0 + EVENTS_RATIO) if log_telemetry else wave * EVENTS_RATIO

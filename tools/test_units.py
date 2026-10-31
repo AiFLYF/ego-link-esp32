@@ -45,6 +45,7 @@ srv = _load_server()
 # `sys.modules["analysis"]` 就是服务端真正在用的那一份（同一个函数对象）。
 # 顺带这也是一条断言：哪天 server.py 不再 import analysis，这里会立刻 KeyError。
 ana = sys.modules["analysis"]
+jlog = sys.modules["jsonl_log"]
 
 
 class TestClipUtf8(unittest.TestCase):
@@ -462,6 +463,66 @@ class TestModuleSplit(unittest.TestCase):
                      "WALK_ZCR_MIN", "SHAKE_MIN_GAP_S", "FREEFALL_G", "FREEFALL_MIN_S"):
             self.assertFalse(hasattr(srv, name), "server.py 里又定义了 %s" % name)
             self.assertTrue(hasattr(ana, name), "analysis.py 里缺 %s" % name)
+
+
+class TestDiskEstimate(unittest.TestCase):
+    """落盘量估算（启动横幅和 README 的数字都来自这里）。
+
+    为什么值得测：这两个数老师会当真 —— 决定数据目录放 C 盘还是 U 盘。
+    2026-11-01 之前 README 写的是"约 15–20 MB/天"，实测一个班是 170 MB/天，
+    **差了十倍**，而且没人会发现（没有断言、也没有人真跑满一天）。
+    """
+
+    def _one_record(self):
+        """用真实的 JsonlLogger 写一条遥测，读回来量字节数。"""
+        import shutil
+        import tempfile
+        d = tempfile.mkdtemp()
+        try:
+            lg = jlog.JsonlLogger(d, retain_days=0)
+            # 模拟板端：2Hz 上报、每批 50 个 100Hz 样本、波形降到 10Hz
+            lg.telemetry(1000.0, "class-01", "SC7A20",
+                         [(0.123, 0.456, 0.987)] * 50, 0.01)
+            lg.close()
+            name = [f for f in os.listdir(d) if f.startswith("telemetry-")][0]
+            with open(os.path.join(d, name), "rb") as fh:
+                return fh.read().splitlines()[0]
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_record_size_anchor_matches_reality(self):
+        """锚点必须和真实记录对得上 —— 改了 telemetry() 的字段要一起改锚点。"""
+        line = self._one_record()
+        self.assertLess(abs(len(line) - jlog.RECORD_BYTES_AT_10HZ), 30,
+                        "遥测记录 %d B，与锚点 %d B 差太多；改了记录格式就同步改 "
+                        "RECORD_BYTES_AT_10HZ / PER_BOARD_MB_PER_HOUR_AT_10HZ"
+                        % (len(line), jlog.RECORD_BYTES_AT_10HZ))
+
+    def test_record_has_the_documented_fields(self):
+        """记录里该有的字段一个都不能少（少了就是回放工具读不出来）。"""
+        import json
+        rec = json.loads(self._one_record().decode("utf-8"))
+        for k in ("k", "ts", "dev", "src", "hz", "s"):
+            self.assertIn(k, rec, "遥测记录缺字段 %s" % k)
+        self.assertEqual(rec["k"], "t")
+        self.assertEqual(len(rec["s"]), 5, "50 个样本降到 10Hz 应当是 5 个")
+
+    def test_class_day_is_hundreds_of_megabytes(self):
+        """一个班 8 小时是**百 MB 量级** —— 这条钉的就是 README 曾经写错的那个数。"""
+        mb = jlog.estimate_mb(20, 8, 10.0)
+        self.assertGreater(mb, 100, "20 板 8 小时只有 %.0f MB？和实测 170 MB 差太远" % mb)
+        self.assertLess(mb, 300, "20 板 8 小时涨到 %.0f MB？先确认是不是记录变胖了" % mb)
+
+    def test_estimate_scales_with_hz_and_boards(self):
+        base = jlog.estimate_mb(20, 8, 10.0)
+        self.assertAlmostEqual(jlog.estimate_mb(20, 8, 20.0), base * 2, places=6)
+        self.assertAlmostEqual(jlog.estimate_mb(10, 8, 10.0), base / 2, places=6)
+        self.assertAlmostEqual(jlog.estimate_mb(20, 16, 10.0), base * 2, places=6)
+
+    def test_events_only_is_much_smaller(self):
+        full = jlog.estimate_mb(20, 8, 10.0)
+        only_ev = jlog.estimate_mb(20, 8, 10.0, log_telemetry=False)
+        self.assertLess(only_ev, full * 0.2, "只落事件应当远小于带波形")
 
 
 if __name__ == "__main__":
