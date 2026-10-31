@@ -147,6 +147,7 @@ python server\server.py
 | `GET /api/commands` | 最近 20 条指令及其状态、执行结果。可加 `?device=` 看指定设备 |
 | `GET /api/latest` | 快照（状态 + 8s 曲线降采样 + 事件流 + 指令列表），JSON。可加 `?device=` |
 | `GET /api/stream` | SSE 实时推送（仪表盘用）。可加 `?device=`；首帧同时带 `devices` 列表 |
+| `GET /api/events` | **事件流的全量出口**（SSE 每帧只发最近 40 条，为的是省带宽）。`?device=` 选设备，`?limit=` 1–200（默认 200）；返回 `{ok, device, events, kept}`。仪表盘事件卡片右上角的「查看全部」走这个 |
 | `GET /api/logs` | 落盘目录与文件大小 |
 | `GET /` | 网页仪表盘 |
 
