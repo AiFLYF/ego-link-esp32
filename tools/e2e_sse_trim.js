@@ -1,8 +1,9 @@
-/* SSE 裁剪后的前端回归：两处"只发最近 N 条"带来的逻辑是否还成立。
+/* SSE 裁剪后的前端回归：「只发最近 N 条」带来的逻辑是否还成立。
  *
  * 覆盖：
  *   1. 事件计数不再恒为 40（服务端发 ev_total=137，40 条可见 → 文案要体现 137）
  *   2. 存储面板不会因为"后面又发了 8 条命令"而退回"还没读过"
+ *   3. 事件流「查看全部」：展开取 /api/events、SSE 不覆盖、收起回到最近 40 条
  *
  * 手法：用 addInitScript 把 window.EventSource 换成一个可以由测试驱动的桩，
  * 于是页面走的是**自己的真实渲染路径**（render → renderEvents/renderSd），
@@ -110,6 +111,43 @@ function frame(over) {
     ring = await page.$eval('#sdring', el => el.textContent);
     check('sd_ls 被挤出 8 条窗口后，存储面板不退回空态', !/还没读过/.test(ring),
           ring.slice(0, 24).replace(/\s+/g, ' '));
+
+    /* ---- 4. 事件流「查看全部」：从 /api/events 取回长列表 ---- */
+    /* 服务端那侧（按设备过滤、limit 生效）由 verify_server 覆盖；这里只验
+       前端的展开/收起两条路径，所以直接给 /api/events 喂一份 137 条的响应 ——
+       页面仍然走自己的 apiFetch → renderEvents，只是数据源被接管。 */
+    const longEvents = Array.from({ length: 137 }, (_, i) => ({
+      ts: Date.now() / 1000 - i, kind: i % 3 ? 'info' : 'cmd', text: '历史事件 ' + i,
+    }));
+    await page.route('**/api/events*', route => route.fulfill({
+      status: 200, contentType: 'application/json',
+      body: JSON.stringify({ ok: true, device: 'E2E-SSE', events: longEvents, kept: 137 }),
+    }));
+    await page.click('#evmore');
+    await page.waitForTimeout(300);
+    let n = await page.$$eval('#feed .item', els => els.length);
+    check('点「查看全部」渲染出全部 137 条', n === 137, `实际 ${n} 条`);
+    let label = await page.$eval('#evcount', el => el.textContent);
+    check('展开态文案为「全部 137 条」', /全部\s*137\s*条/.test(label), `文案「${label}」`);
+    let btn = await page.$eval('#evmore', el => el.textContent.trim());
+    check('按钮变成「只看最近」', btn === '只看最近', `实际「${btn}」`);
+
+    /* ---- 5. 展开期间 SSE 不能把长列表盖回 40 条 ---- */
+    /* 这是这条功能最容易坏的地方：SSE 是 2 Hz，不挡住的话展开后 0.5 秒就被盖掉。 */
+    await page.evaluate(f => window.__push(f), frame({ events, ev_total: 140 }));
+    await page.waitForTimeout(300);
+    n = await page.$$eval('#feed .item', els => els.length);
+    check('展开期间 SSE 重绘不覆盖长列表', n === 137, `实际 ${n} 条`);
+
+    /* ---- 6. 收起后回到「最近 40 条 / 共 140 条」 ---- */
+    /* 收起不能靠 pull()：/api/latest 不带 events，那样会停在长列表上。
+       页面要拿最近一帧 SSE 的缓存重绘。 */
+    await page.click('#evmore');
+    await page.waitForTimeout(300);
+    n = await page.$$eval('#feed .item', els => els.length);
+    label = await page.$eval('#evcount', el => el.textContent);
+    check('收起后回到最近 40 条', n === 40 && /共\s*140\s*条/.test(label),
+          `${n} 条 / 「${label}」`);
 
     check('页面无 JS 异常', errors.length === 0, errors.join(' | '));
   } finally {

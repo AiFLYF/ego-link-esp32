@@ -623,6 +623,10 @@ h1,h2,h3{font-family:var(--font-display);text-wrap:balance}
    整行的基线抬起来，破坏和右端文字的对齐关系。 */
 .ico{width:15px;height:15px;flex:none;display:inline-block;vertical-align:-2px;stroke:currentColor;fill:none}
 .card-head h3 .ico{color:var(--color-action-primary);opacity:.85}
+/* 卡片头右侧的"出处 + 操作"。用 flex 而不是再塞一个 justify-content 子项：
+   .card-head 已经是 space-between，第三个子元素会被推到最右，
+   与 evcount 之间空出一大段。 */
+.card-head .tools{display:flex;align-items:center;gap:var(--sp-3);flex-wrap:wrap}
 .pill .ico{width:11px;height:11px;vertical-align:-1px;opacity:.8}
 /* 区域标题比卡片标题大一级（24 vs 19），图标跟着放大一档，
    否则同一个 .ico 在两种标题上会一边显小一边显大。 */
@@ -1086,7 +1090,10 @@ dialog.modal[open]::backdrop{animation:modal-veil var(--dur-2) var(--ease-out)}
       <div class="card" id="cardfeed">
         <div class="card-head">
           <h3><svg class="ico" viewBox="0 0 24 24" stroke-width="1.8" aria-hidden="true"><path d="M2.5 12h4l2.2-5 3.1 10 2.7-7 1.8 2h5.2"/></svg> 事件流</h3>
-          <span class="src" id="evcount"></span>
+          <span class="tools">
+            <span class="src" id="evcount"></span>
+            <button id="evmore" class="sm" type="button" title="从服务端取回更早的事件（保留上限 200 条）">查看全部</button>
+          </span>
         </div>
         <div id="feed"></div>
       </div>
@@ -2264,18 +2271,33 @@ function renderCmds(cmds){
 
 /* ---------------- 事件流 ---------------- */
 var evHTML = "";
+/* 最近一帧 SSE 给的事件。收起展开态时要靠它重绘 —— /api/latest **不带
+   events**（事件流的权威通道是 SSE），所以收起时再 pull() 一次是没用的，
+   只会把列表留在展开时的长版本上。 */
+var lastEvts = null, lastEvTotal = null;
+/* 展开态：从 /api/events 取回服务端保留的全部（上限 200 条）。
+   为什么要这个开关 —— SSE 每帧只发最近 40 条（那是前端真会画出来的量），
+   课上要追"第三组 10:32 为什么掉线"时，那条早就被挤出窗口了。
+   展开期间**屏蔽 SSE 驱动的重绘**，否则下一帧（2 Hz）立刻把长列表盖回 40 条；
+   但帧本身仍要记进 lastEvts，收起时才有新数据可画。 */
+var evExpanded = false;
+
+function evItem(ev){
+  var k = "k-" + (ev.kind || "info");
+  var time = new Date(ev.ts*1000).toLocaleTimeString("zh-CN", {hour12:false});
+  return '<div class="item"><span class="k ' + k + '"></span><span class="t">' + time + '</span>'
+       + '<span>' + esc(ev.text) + '</span></div>';
+}
+
 function renderEvents(evts, total){
   /* 事件流的权威通道也是 SSE。/api/latest 不带 events，所以这里缺字段时
      **什么都不要做**（包括画"暂无事件"空态）—— 画了就是跟 SSE 打架。
      `total` 是缓冲区里的真实条数（最多 200），SSE 只发最近 40 条；
      没有这个字段时退回 `evts.length`（老服务端 / 单独调用）。 */
+  if (evts && evts.length){ lastEvts = evts; lastEvTotal = total; }
+  if (evExpanded) return;          /* 展开态由 toggleEvents 自己管，别盖 */
   if (!evts || !evts.length) return;
-  var h = evts.slice(0,40).map(function(ev){
-    var k = "k-" + (ev.kind || "info");
-    var time = new Date(ev.ts*1000).toLocaleTimeString("zh-CN", {hour12:false});
-    return '<div class="item"><span class="k ' + k + '"></span><span class="t">' + time + '</span>'
-         + '<span>' + esc(ev.text) + '</span></div>';
-  }).join("");
+  var h = evts.slice(0,40).map(evItem).join("");
   var n = (total !== undefined && total !== null) ? total : evts.length;
   var label = (n > evts.length) ? ("最近 " + evts.length + " 条 / 共 " + n + " 条")
                                 : ("最近 " + n + " 条");
@@ -2288,6 +2310,30 @@ function renderEvents(evts, total){
        文案也得跟上，否则"共 N 条"会停在旧值。 */
     $("evcount").textContent = label;
   }
+}
+
+function setEvExpanded(on){
+  evExpanded = on;
+  var b = $("evmore");
+  if (b) b.textContent = on ? "只看最近" : "查看全部";
+  if (!on && lastEvts){ evHTML = ""; renderEvents(lastEvts, lastEvTotal); }
+}
+
+function toggleEvents(){
+  if (evExpanded){ setEvExpanded(false); return; }
+  var q = devQuery();
+  apiFetch("/api/events" + (q ? q + "&limit=200" : "?limit=200"))
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+      if (!d || !d.ok){ $("evcount").textContent = "取事件失败"; return; }
+      var evts = d.events || [];
+      if (!evts.length){ $("evcount").textContent = "还没有事件"; return; }
+      setEvExpanded(true);
+      evHTML = evts.map(evItem).join("");
+      $("feed").innerHTML = evHTML;
+      $("evcount").textContent = "全部 " + evts.length + " 条";
+    })
+    .catch(function(){ $("evcount").textContent = "取事件失败"; });
 }
 
 /* ---------------- 设备列表（多板） ----------------
@@ -2535,6 +2581,12 @@ function selectDevice(id){
      留着上一台的容量/文件列表会显示成新设备的数据（而且看起来完全正常，
      比空着更误导）。 */
   lastSd = null;
+  /* 展开态的长列表是**上一台板**的事件，换设备必须收起 —— 和 lastSd 同理，
+     留着别人的历史比空着更误导。这里只复位标记与按钮文案，不额外取数：
+     下面那行 pull() 会让 renderEvents 用新设备的数据重画。 */
+  evExpanded = false;
+  evHTML = "";                 /* 逼下一帧按新设备的数据重画，而不是"看起来没变" */
+  if ($("evmore")) $("evmore").textContent = "查看全部";
   pull();              /* 先拉一次快照，不必等下一帧 SSE */
   stream();            /* SSE 是按设备过滤的，换设备要重连 */
 }
@@ -2863,6 +2915,10 @@ if ($("theme")) $("theme").onclick = function(){
   try { localStorage.setItem("rw1-theme", next); } catch (e) { /* 存不了也照样切换 */ }
   applyTheme(next);
 };
+/* 事件流「查看全部 / 只看最近」：展开走 /api/events 取服务端保留的 200 条。
+   单独绑、不放进上面那个 fetch 回调里 —— 它不依赖 /api/commands 的结果，
+   放进去只会平白多一条"拿不到命令名就连按钮都点不动"的耦合。 */
+if ($("evmore")) $("evmore").onclick = toggleEvents;
 fitCanvas();
 fetch("/api/logs").then(function(r){ return r.json(); }).then(function(l){
   if (l && l.dir) $("logdir").textContent = "落盘 " + l.dir;
