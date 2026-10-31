@@ -415,5 +415,56 @@ class TestDashboardPage(unittest.TestCase):
         self.assertIn("仪表盘文件缺失", html)
 
 
+class TestRateWindow(unittest.TestCase):
+    """滑动窗口限流器（录音全局预算用的就是它）。
+
+    这类代码的坑都在**边界**上：窗口滑动的一瞬间、恰好到顶、被拒的请求要不要
+    占额度。所以逐个钉住，而不是只测"大概能用"。
+    """
+
+    def test_allows_up_to_n(self):
+        w = srv.RateWindow(3, 60.0)
+        self.assertEqual([w.allow(100.0 + i) for i in range(4)],
+                         [True, True, True, False])
+
+    def test_rejected_requests_do_not_consume_budget(self):
+        """被拒的不占额度 —— 否则"连发 100 次"会把窗口填满，后来的正常请求一起死。"""
+        w = srv.RateWindow(2, 60.0)
+        self.assertTrue(w.allow(100.0))
+        self.assertTrue(w.allow(101.0))
+        for i in range(20):
+            self.assertFalse(w.allow(102.0 + i * 0.1))
+        # 窗口滑过之后，仍然只放行 2 次（被拒的 20 次没有积攒额度）
+        self.assertTrue(w.allow(161.0))
+        self.assertTrue(w.allow(162.0))
+        self.assertFalse(w.allow(163.0))
+
+    def test_window_slides(self):
+        w = srv.RateWindow(1, 10.0)
+        self.assertTrue(w.allow(0.0))
+        self.assertFalse(w.allow(9.9))     # 还在窗口里
+        self.assertTrue(w.allow(10.1))     # 滑出去了
+
+    def test_boundary_is_strictly_greater(self):
+        """正好等于窗口宽度时**仍算在窗口内**（用 `>` 而不是 `>=`），
+        这样"每 60 秒一次"的配置不会因为浮点抖动多放过一次。"""
+        w = srv.RateWindow(1, 10.0)
+        self.assertTrue(w.allow(0.0))
+        self.assertFalse(w.allow(10.0))
+        self.assertTrue(w.allow(10.0000001))
+
+    def test_reset(self):
+        w = srv.RateWindow(1, 60.0)
+        self.assertTrue(w.allow(1.0))
+        self.assertFalse(w.allow(2.0))
+        w.reset()
+        self.assertTrue(w.allow(3.0))
+
+    def test_n_and_window_are_sane(self):
+        """n < 1 会被夹到 1（否则配置成 0 就永远拒绝，看着像"服务坏了"）。"""
+        self.assertEqual(srv.RateWindow(0, 60).n, 1)
+        self.assertEqual(srv.RateWindow(-5, 60).n, 1)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
