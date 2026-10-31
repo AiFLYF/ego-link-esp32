@@ -39,6 +39,12 @@ def _load_server():
 
 
 srv = _load_server()
+# 分类函数住在 `server/analysis.py`（2026-11-01 从 server.py 拆出）。
+# 这里**直接拿那个模块对象**，而不是 `import analysis` 再加载一遍 ——
+# server.py 在 import 时已经把它装进 sys.modules 了，所以
+# `sys.modules["analysis"]` 就是服务端真正在用的那一份（同一个函数对象）。
+# 顺带这也是一条断言：哪天 server.py 不再 import analysis，这里会立刻 KeyError。
+ana = sys.modules["analysis"]
 
 
 class TestClipUtf8(unittest.TestCase):
@@ -99,11 +105,11 @@ class TestTiltDirection(unittest.TestCase):
             (1.0, -1.0): "右上",
         }
         for (x, y), want in cases.items():
-            self.assertEqual(srv.tilt_direction(x, y), want, "向量 (%.1f, %.1f)" % (x, y))
+            self.assertEqual(ana.tilt_direction(x, y), want, "向量 (%.1f, %.1f)" % (x, y))
 
     def test_flat_returns_none(self):
-        self.assertIsNone(srv.tilt_direction(0.0, 0.0))
-        self.assertIsNone(srv.tilt_direction(0.1, 0.1))   # 阈值 0.25 以内算放平
+        self.assertIsNone(ana.tilt_direction(0.0, 0.0))
+        self.assertIsNone(ana.tilt_direction(0.1, 0.1))   # 阈值 0.25 以内算放平
 
 
 class TestDecimate(unittest.TestCase):
@@ -245,27 +251,27 @@ class TestSignalHelpers(unittest.TestCase):
             mag = 1.0 + 0.5 * math.sin(2 * math.pi * 1.0 * t)
             win.append((t, 0.0, 0.0, mag))
             mags.append(mag)
-        steps = srv.count_steps(win, mags, 1.0)      # 均值按 1.0 给，阈值 = 1.25
+        steps = ana.count_steps(win, mags, 1.0)      # 均值按 1.0 给，阈值 = 1.25
         self.assertGreaterEqual(steps, 7)
         self.assertLessEqual(steps, 9)
 
     def test_count_steps_flat_is_zero(self):
         win = [(i * 0.01, 0.0, 0.0, 1.0) for i in range(100)]
-        self.assertEqual(srv.count_steps(win, [1.0] * 100, 1.0), 0)
+        self.assertEqual(ana.count_steps(win, [1.0] * 100, 1.0), 0)
 
     def test_freefall_run(self):
         # FREEFALL_MIN_S(0.05) / dt(0.01) = 5 个样本才算数 —— 短于这个就是噪声
         mags = [1.0, 0.2, 0.1, 0.15, 0.2, 0.1, 0.12, 1.0]     # 中间连续 6 个 < 0.35
-        self.assertEqual(srv.max_freefall_run(mags, 0.01), 6)
-        self.assertEqual(srv.max_freefall_run([1.0] * 10, 0.01), 0)
+        self.assertEqual(ana.max_freefall_run(mags, 0.01), 6)
+        self.assertEqual(ana.max_freefall_run([1.0] * 10, 0.01), 0)
         # 只有 3 个失重样本 → 不够长，判 0
-        self.assertEqual(srv.max_freefall_run([1.0, 0.2, 0.1, 0.15, 1.0], 0.01), 0)
+        self.assertEqual(ana.max_freefall_run([1.0, 0.2, 0.1, 0.15, 1.0], 0.01), 0)
 
     def test_zero_cross_rate_frequency(self):
         """5 Hz 的正弦，零穿越率应当算回 ~5 Hz。"""
         dt = 0.01
         mags = [1.0 + 0.5 * math.sin(2 * math.pi * 5.0 * i * dt) for i in range(200)]
-        zcr = srv.zero_cross_rate(mags, dt)
+        zcr = ana.zero_cross_rate(mags, dt)
         self.assertAlmostEqual(zcr, 5.0, delta=1.0)
 
 
@@ -277,21 +283,21 @@ class TestAnalyze(unittest.TestCase):
         dev = self._fresh()
         now = 1000.0
         pts = [(0.0, 0.0, 1.0)] * 50
-        activity, _events = srv.analyze(dev, now, pts, 0.01)
+        activity, _events = ana.analyze(dev, now, pts, 0.01)
         self.assertIn("静置", activity)
 
     def test_freefall_detected(self):
         dev = self._fresh()
         now = 2000.0
-        srv.analyze(dev, now - 0.5, [(0.0, 0.0, 1.0)] * 50, 0.01)
-        activity, events = srv.analyze(dev, now, [(0.0, 0.0, 0.05)] * 20, 0.01)
+        ana.analyze(dev, now - 0.5, [(0.0, 0.0, 1.0)] * 50, 0.01)
+        activity, events = ana.analyze(dev, now, [(0.0, 0.0, 0.05)] * 20, 0.01)
         self.assertIn("跌落", activity)
         self.assertTrue(any(k == "fall" for k, _ in events))
 
     def test_samples_window_bounded(self):
         dev = self._fresh()
         for i in range(300):
-            srv.analyze(dev, 3000.0 + i * 0.01, [(0.0, 0.0, 1.0)] * 10, 0.01)
+            ana.analyze(dev, 3000.0 + i * 0.01, [(0.0, 0.0, 1.0)] * 10, 0.01)
         self.assertLessEqual(len(dev.samples), srv.MAX_WINDOW)
 
 
@@ -413,6 +419,49 @@ class TestDashboardPage(unittest.TestCase):
         finally:
             srv._WEB_DIR = old
         self.assertIn("仪表盘文件缺失", html)
+
+
+class TestModuleSplit(unittest.TestCase):
+    """钉住 2026-11-01 的拆分边界（analysis / jsonl_log 搬出 server.py）。
+
+    为什么值得有这几条：拆分的**全部价值**在于"这两个模块不依赖服务端"。
+    一旦有人图省事在里面写 `from server import LOCK` 或把逻辑抄回 server.py，
+    文件又会慢慢长回原样，而所有功能测试**照样全绿** —— 只有这类结构性断言能拦住。
+    """
+
+    def test_analysis_is_the_same_object_server_uses(self):
+        """server.analyze 必须**就是** analysis.analyze，不是复制的一份。"""
+        self.assertIs(srv.analyze, ana.analyze)
+        self.assertIs(srv.tilt_direction, ana.tilt_direction)
+        self.assertEqual(os.path.abspath(ana.__file__),
+                         os.path.join(os.path.dirname(_HERE), "server", "analysis.py"))
+
+    def test_analysis_holds_no_server_state(self):
+        """analysis 里不该出现任何服务端全局状态 —— 它必须能单独 import。"""
+        for name in ("LOCK", "DEVICES", "LOGGER", "SHOTS_DIR", "AUDIO_DIR",
+                     "FRAMES", "API_TOKEN", "Handler", "Device"):
+            self.assertFalse(hasattr(ana, name),
+                             "analysis 里出现了服务端状态 %s —— 它就不再是叶子模块了" % name)
+
+    def test_analysis_does_not_import_server(self):
+        """源码层面也不许反向 import（那会变成循环依赖，按路径加载时直接炸）。"""
+        src = open(ana.__file__, encoding="utf-8").read()
+        for bad in ("import server", "from server import"):
+            self.assertNotIn(bad, src, "analysis.py 反向 import 了服务端")
+
+    def test_jsonl_logger_is_self_contained(self):
+        """JsonlLogger 同样不许碰服务端状态（它的依赖数本来就是 0）。"""
+        import jsonl_log
+        self.assertIs(srv.JsonlLogger, jsonl_log.JsonlLogger)
+        for name in ("LOCK", "DEVICES", "LOGGER", "Handler"):
+            self.assertFalse(hasattr(jsonl_log, name))
+
+    def test_thresholds_live_in_analysis_only(self):
+        """阈值只能有一份。server.py 里再定义一次 = 两份慢慢走偏。"""
+        for name in ("STEP_MIN_G", "STEP_REFRACTORY_S", "MOTION_STD", "SHAKE_ZCR",
+                     "WALK_ZCR_MIN", "SHAKE_MIN_GAP_S", "FREEFALL_G", "FREEFALL_MIN_S"):
+            self.assertFalse(hasattr(srv, name), "server.py 里又定义了 %s" % name)
+            self.assertTrue(hasattr(ana, name), "analysis.py 里缺 %s" % name)
 
 
 if __name__ == "__main__":
