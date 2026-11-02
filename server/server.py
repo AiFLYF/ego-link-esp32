@@ -116,6 +116,12 @@ AUDIO_MAX_BYTES = 512 * 1024   # 单次上传上限（3 s @16 kHz/16 bit 单声�
 AUDIO_RATE = 16000             # 板端录音采样率；云端与本地都按这个解
 AUDIO_DIR = None               # 录音留档目录（main() 里按 --data-dir 设）
 AUDIO_KEEP = 50                # 每台设备最多留多少条录音
+# 录音留档的**设备目录数上限**。照片那条路（_shot_save）早就有 SHOT_MAX_DEVICES，
+# 录音这里却一直漏着（2026-11-02 审查发现的）：/api/audio 不需要密钥、设备名又是
+# 外部输入 —— 全局预算 120 段/分钟挡得住钱，挡不住"每段都换一个新名字"：
+# 120 × 512 KB ≈ 每小时 3.5 GB 的新目录，一节课就能把数据盘灌满。
+# 与照片同一档：64 个目录 × 每台 50 条 = 磁盘开销有界；正常一个班远用不到。
+AUDIO_MAX_DEVICES = 64
 # 同一台板两次录音之间的最小间隔。`/api/audio` 是**唯一一个"一被调用就花钱"**
 # 的未鉴权入口（云端 ASR + 一次大模型），而它按设计不能加 token（老固件不带头）。
 # 所以在这里做一道限流：连续刷只会把间隔拉长，不会每次都能触发一次付费调用。
@@ -136,7 +142,7 @@ AUDIO_LAST_MAX = 512
 # 即使有人伪造 20 个设备名同时刷，费用也被压在 120 段/分钟以内，而且
 # 超限会打到控制台（老师能看见"有人在刷语音"）。
 # 120 的依据：一个班 20 块板，正常演示每分钟几十次；120 留了一倍余量。
-# 想要更严可以设 RW1_AUDIO_MAX_PER_MIN（测试就用这个把预算压到 2）。
+# 想要更严可以设 RW1_AUDIO_MAX_PER_MIN（verify_server 的预算用例用它压到 1）。
 # ⚠️ 限流器实例 `AUDIO_BUDGET` 定义在 `RateWindow` 类之后（类还没定义时不能实例化）。
 AUDIO_MAX_PER_MIN = int(os.environ.get("RW1_AUDIO_MAX_PER_MIN", "120") or 120)
 ASR_TIMEOUT = 30.0             # 云端识别超时（后台线程里等，不阻塞板端）
@@ -1513,14 +1519,42 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def _read_json(self):
-        n = int(self.headers.get("Content-Length") or 0)
-        if n <= 0 or n > 4 * 1024 * 1024:
+        """读一个 JSON body，返回 dict。
+
+        三种结果，调用方必须区分：
+          - 没带 body（Content-Length 为 0/缺省）→ `{}`：老调用方的"默认值"路径照旧；
+          - 带了但读不了（Content-Length 不是数字 / 超 4MB / 不是合法 JSON /
+            不是对象）→ `None`：**一律 400**，不许悄悄当空对象处理；
+          - 正常 → 解析出的 dict。
+
+        为什么必须区分（2026-11-02 实测才修的）：原来坏 body 一律返回 `{}`，
+        而 `_command` 对空对象会兜出默认名 `capture_once` —— 一坨非 JSON 垃圾
+        POST 到 /api/command，服务端**真的下发了一条合法命令**（HTTP 200）；
+        JSON 数组则更糟，`list.get` 直接 AttributeError → 500 + traceback。
+        `Content-Length: abc` 也是同一族：`int()` 抛 ValueError，
+        `_frame`/`_audio` 早就各自挡了，唯独这里漏着。
+        """
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            return None
+        if n <= 0:
             return {}
+        if n > 4 * 1024 * 1024:
+            # 拒绝也要把话说完整（T58 的老规矩）：读掉一部分再回 400，
+            # 客户端拿到的才是我们写的错误而不是连接重置。
+            # 陪它读的上限就是合法上限本身，再大就不奉陪了。
+            try:
+                self.rfile.read(4 * 1024 * 1024)
+            except OSError:
+                pass
+            return None
         try:
             # errors="replace": 即使个别字节异常也不影响数字字段解析
-            return json.loads(self.rfile.read(n).decode("utf-8", errors="replace"))
+            obj = json.loads(self.rfile.read(n).decode("utf-8", errors="replace"))
         except (ValueError, UnicodeDecodeError):
-            return {}
+            return None
+        return obj if isinstance(obj, dict) else None
 
     def _drain(self, n):
         """把请求体读掉再回绝。
@@ -1754,6 +1788,15 @@ class Handler(BaseHTTPRequestHandler):
         except OSError:
             return 0
 
+    @staticmethod
+    def _audio_dev_dirs():
+        """`AUDIO_DIR` 下已经有多少个设备目录（用于 AUDIO_MAX_DEVICES 封顶）。"""
+        try:
+            with os.scandir(AUDIO_DIR) as it:
+                return sum(1 for e in it if e.is_dir())
+        except OSError:
+            return 0
+
     def _shots_list(self, query):
         dev = clean_device_id(query_param(query, "device") or "")
         out = []
@@ -1787,6 +1830,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def _shot_delete(self):
         msg = self._read_json()
+        if msg is None:
+            self._send(400, json.dumps({"ok": False, "error": "bad json body"},
+                                       ensure_ascii=False))
+            return
         dev = clean_device_id(str(msg.get("device", "")))
         fn = str(msg.get("name", ""))
         if (not dev or not fn or "/" in fn or "\\" in fn or ".." in fn or not SHOTS_DIR):
@@ -1902,6 +1949,11 @@ class Handler(BaseHTTPRequestHandler):
             return None
         try:
             d = os.path.join(AUDIO_DIR, safe_name(dev.id))
+            # 设备目录数封顶（与 _shot_save 的 SHOT_MAX_DEVICES 同一个道理，
+            # 见 AUDIO_MAX_DEVICES 的注释）：已经在册的设备照常写，
+            # 新设备到顶就不存 —— 板端只少一份留档，识别与回复完全不受影响。
+            if not os.path.isdir(d) and self._audio_dev_dirs() >= AUDIO_MAX_DEVICES:
+                return None
             os.makedirs(d, exist_ok=True)
             name = time.strftime("%Y%m%d-%H%M%S") + "-%03d.wav" % (int(time.time() * 1000) % 1000)
             wav = data if data[:4] == b"RIFF" else _pcm_to_wav(data)
@@ -1930,6 +1982,10 @@ class Handler(BaseHTTPRequestHandler):
         真正的回答会通过后续 SSE 推送过来（网页不用轮询）。
         """
         msg = self._read_json()
+        if msg is None:
+            self._send(400, json.dumps({"ok": False, "error": "bad json body"},
+                                       ensure_ascii=False))
+            return
         text = str(msg.get("text", "")).strip()[:200]
         if not text:
             self._send(400, json.dumps({"ok": False, "error": "empty text"},
@@ -1963,6 +2019,12 @@ class Handler(BaseHTTPRequestHandler):
     # ---- command (网页 → 服务器 → 板 → 服务器 → 网页) -----------------------
     def _command(self):
         msg = self._read_json()
+        if msg is None:
+            # 坏 body 一律拒（见 _read_json 的 docstring）：
+            # 修复前这里会把垃圾当空对象、兜出默认 capture_once 真的下发出去。
+            self._send(400, json.dumps({"ok": False, "error": "bad json body"},
+                                       ensure_ascii=False))
+            return
         name = str(msg.get("name", "capture_once"))[:32]
         if name not in CMD_NAMES:
             self._send(400, json.dumps(
@@ -2048,6 +2110,11 @@ class Handler(BaseHTTPRequestHandler):
         # 其实大头是测试进程排队。分开报这两个数，才能判断到底谁慢。
         _t0 = time.perf_counter()
         msg = self._read_json()
+        if msg is None:
+            # 坏 body（非法 Content-Length / 超 4MB / 不是 JSON 对象）：
+            # 板端只发 JSON body，坏了就归并到下面的"bad payload"那条 400 出路，
+            # 不能让 None 溜进 _parse_points（msg.get 会 AttributeError）。
+            msg = {}
         now = time.time()
 
         pts = self._parse_points(msg)

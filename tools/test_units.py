@@ -634,5 +634,59 @@ class TestAudioLastBound(unittest.TestCase):
         self.assertGreater(srv.AUDIO_LAST_MAX, srv.AUDIO_MAX_PER_MIN * 2)
 
 
+class TestAudioSaveDirCap(unittest.TestCase):
+    """录音留档的**设备目录数**必须封顶（2026-11-02 修复）。
+
+    照片那条路（`_shot_save`）一直有 `SHOT_MAX_DEVICES`，录音这里漏着：
+    `/api/audio` 不需要密钥、设备名又是外部输入，全局预算挡得住钱、
+    挡不住"每段换一个新名字"—— 实测 70 个名字 → 70 个目录，按 512 KB/段
+    算就是每小时 GB 级的新目录。
+
+    与 `TestAudioLastBound` 不同，这里**直接调 Handler 方法**（不复制逻辑）：
+    `_audio_save` 只依赖 `AUDIO_DIR` 这个模块全局和它自己的静态 helper，
+    用临时目录顶替后就能在单测里跑到那条闸门。
+    """
+
+    class _Dev:
+        def __init__(self, did):
+            self.id = did
+
+    def setUp(self):
+        import tempfile
+        self._td = tempfile.TemporaryDirectory()
+        self._old = srv.AUDIO_DIR
+        srv.AUDIO_DIR = self._td.name
+
+    def tearDown(self):
+        srv.AUDIO_DIR = self._old
+        self._td.cleanup()
+
+    def _fill_to_cap(self):
+        for i in range(srv.AUDIO_MAX_DEVICES):
+            os.makedirs(os.path.join(self._td.name, "d%02d" % i))
+
+    def test_new_device_refused_at_cap(self):
+        """到顶之后，新设备名不再建目录（返回 None，识别与回复不受影响）。"""
+        self._fill_to_cap()
+        out = srv.Handler._audio_save(srv.Handler, self._Dev("fresh-name"), b"\x01\x02" * 64)
+        self.assertIsNone(out)
+        self.assertFalse(os.path.exists(os.path.join(self._td.name, "fresh-name")))
+
+    def test_known_device_still_saved_at_cap(self):
+        """到顶之后，已经在册的设备照常写 —— 闸门挡的是"新名字"，不是老用户。"""
+        self._fill_to_cap()
+        out = srv.Handler._audio_save(srv.Handler, self._Dev("d00"), b"\x01\x02" * 64)
+        self.assertTrue(out, "在册设备应当照常留档")
+        wavs = [f for f in os.listdir(os.path.join(self._td.name, "d00"))
+                if f.endswith(".wav")]
+        self.assertEqual(len(wavs), 1)
+
+    def test_below_cap_saves_normally(self):
+        """没到顶时行为与修复前一字不差（第一个目录照建）。"""
+        out = srv.Handler._audio_save(srv.Handler, self._Dev("first"), b"\x01\x02" * 64)
+        self.assertTrue(out)
+        self.assertTrue(os.path.isdir(os.path.join(self._td.name, "first")))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
