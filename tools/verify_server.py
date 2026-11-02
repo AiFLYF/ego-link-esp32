@@ -909,6 +909,16 @@ def main():
         check("非 JPEG 的帧被拒（400）", st == 400, "实际: %s" % st)
         st, _ = cam_get("/api/shots/" + camdev + "/..%2F..%2Fserver.py")
         check("照片路径穿越被拒（404）", st == 404, "实际: %s" % st)
+        # 文件名里的冒号也要拒（2026-11-02 补）：Windows 上它是 NTFS 备用数据流的
+        # 分隔符。读取那条原本也会 404（文件不存在），但**走的是校验之后**的
+        # isfile；删除那条修复前是 404（os.remove 报错），现在必须在**校验层**
+        # 就拦成 400 —— 白名单就该在门口拦，不该靠"碰巧没有这个文件"。
+        st, _ = cam_get("/api/shots/%s/x.jpg:evil" % camdev)
+        check("照片名带冒号被拒（404，NTFS 数据流不可达）", st == 404, "实际: %s" % st)
+        st, _ = cam_post("/api/shots/delete",
+                         json.dumps({"device": camdev, "name": "x.jpg:evil"}).encode(),
+                         "application/json")
+        check("删除接口在校验层拒绝带冒号的文件名（400）", st == 400, "实际: %s" % st)
 
         # 删除
         if shots.get("shots"):

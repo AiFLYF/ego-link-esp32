@@ -688,5 +688,32 @@ class TestAudioSaveDirCap(unittest.TestCase):
         self.assertTrue(os.path.isdir(os.path.join(self._td.name, "first")))
 
 
+class TestRuleAiReplyEventKind(unittest.TestCase):
+    """配了大模型但调用失败、回退规则 AI 时，回复事件的类型必须是 info。
+
+    2026-11-02 修复：原来记的是 warn —— 但 warn 该留给真告警（识别失败 /
+    大模型调用失败），一条**正常送达的回复**记成 warn，事件流里全是不存在的
+    警告。顺带的实情：前端 CSS 只有 .k-info 没有 .k-warn，warn 事件的
+    圆点一直是无色的。
+
+    直调 `_llm_worker`（它是普通函数，不在 HTTP 层也能跑）：不配 LLM key
+    时 ask_llm 返回 None，正好就是"调用失败回退规则 AI"的那条路径。
+    """
+
+    def test_fallback_reply_records_info_not_warn(self):
+        old = os.environ.pop("RW1_LLM_API_KEY", None)   # 强制走"无 key"分支
+        try:
+            dev = srv.Device("unit-ruleai")
+            srv._llm_worker(dev, "现在怎么样？", dev.st["ai_cancel"])
+        finally:
+            if old is not None:
+                os.environ["RW1_LLM_API_KEY"] = old
+        kinds = [e["kind"] for e in dev.events]
+        self.assertIn("info", kinds, "实际事件类型: %s" % kinds)
+        self.assertNotIn("warn", kinds, "规则 AI 的正常回复不该记成 warn: %s" % kinds)
+        text = next(e["text"] for e in dev.events if e["kind"] == "info")
+        self.assertIn("规则AI回复", text, "实际: %s" % text)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

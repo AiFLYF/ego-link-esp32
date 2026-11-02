@@ -1043,7 +1043,10 @@ def _llm_worker(dev, question, token):
         # 记进对话历史（第 4 周「澄清」的原料）
         dev.chat.append(("user", question))
         dev.chat.append(("assistant", reply))
-    push_event(dev, "ai" if mode == "大模型" else "warn",
+    # 规则 AI 的正常回复记 info：warn 留给真正的告警（识别失败、大模型调用失败）。
+    # 前端 CSS 里只有 .k-info 没有 .k-warn —— 原来 warn 事件的圆点是"无色"的，
+    # 这条顺带把"规则 AI 回复在事件流里没有颜色"一起修了。
+    push_event(dev, "ai" if mode == "大模型" else "info",
                "%s回复：%s" % (mode, reply[:60]))
 
 
@@ -1317,7 +1320,12 @@ def _voice_worker(dev, data, saved, turn=None):
     那种情况下这段**迟到的识别结果属于上一轮**，不能再拿它去调 request_ai，
     否则会用一个旧问题顶掉用户刚得到的新答案。
     """
-    t0 = dev.st.get("voice_t0") or 0.0
+    with LOCK:
+        # voice_t0 是共享状态（_ask 会清零、下一轮录音会改写），读它必须持锁 ——
+        # 全文件其它对 dev.st 的读都在锁内，唯独这里漏着。就在 worker 启动这一刻
+        # 取值：语义与原来的无锁读**完全一致**（CPython 下本来也读不坏），只是补上
+        # 锁纪律；若挪到 transcribe 之后反而会改变行为（识别期间被清零时耗时会算成 0）。
+        t0 = dev.st.get("voice_t0") or 0.0
     text, err = transcribe(data)
     now = time.time()
     with LOCK:
@@ -1816,8 +1824,11 @@ class Handler(BaseHTTPRequestHandler):
         """按设备+文件名取一张留档照片。**路径必须夹紧**，不能让它读到目录外。"""
         name = urllib.parse.unquote(name)
         dev, _, fn = name.rpartition("/")
+        # ":" 一并拒绝：Windows 上它是 NTFS 备用数据流的分隔符（"x.jpg:evil"），
+        # 虽然服务端自生成的文件名不含冒号、当前没有实际攻击面，但校验是白名单
+        # 性质 —— 越紧越不容易被将来的改动绕出意外。
         if (not dev or not fn or "/" in fn or "\\" in fn or ".." in fn
-                or ".." in dev or not SHOTS_DIR):
+                or ":" in fn or ".." in dev or not SHOTS_DIR):
             self._send(404, b"", "image/jpeg")
             return
         full = os.path.join(SHOTS_DIR, safe_name(dev), fn)
@@ -1836,7 +1847,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         dev = clean_device_id(str(msg.get("device", "")))
         fn = str(msg.get("name", ""))
-        if (not dev or not fn or "/" in fn or "\\" in fn or ".." in fn or not SHOTS_DIR):
+        if (not dev or not fn or "/" in fn or "\\" in fn or ".." in fn
+                or ":" in fn or not SHOTS_DIR):
             self._send(400, json.dumps({"ok": False, "error": "bad request"},
                                        ensure_ascii=False))
             return
