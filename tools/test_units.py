@@ -575,5 +575,64 @@ class TestRateWindow(unittest.TestCase):
         self.assertEqual(srv.RateWindow(-5, 60).n, 1)
 
 
+class TestAudioLastBound(unittest.TestCase):
+    """`AUDIO_LAST` 这张表必须**自己**有界。
+
+    键是 `?device=` 这个外部输入，"设备就那么几块"不是保证。历史实现写的是
+    "长度超 256 才清一遍、且只清 60 秒前的"—— 一串新设备名在 60 秒内轮流上场时，
+    一条都清不掉，表跟着名字数量涨（实测 40 秒 2000 个名字 → 2000 条）。
+
+    这里复刻的是 `/api/audio` 里那段清理逻辑（HTTP 层跑不到单测），
+    所以**改那边必须同步改这里**；两边一起错的话，下面的 `test_prune_keeps_recent`
+    会因为"按时间清"这条硬约束红掉。
+    """
+
+    @staticmethod
+    def _prune(aud, now, max_n=None):
+        max_n = srv.AUDIO_LAST_MAX if max_n is None else max_n
+        if len(aud) > max_n:
+            for k in [k for k, t in aud.items() if now - t > 60.0]:
+                aud.pop(k, None)
+        if len(aud) > max_n:
+            for k in sorted(aud, key=aud.get)[:len(aud) - max_n]:
+                aud.pop(k, None)
+
+    def test_bound_holds_under_name_flood(self):
+        """2000 个不同名字轮流来，表不许涨过上限。
+
+        （旧逻辑下这条是红的：这些名字全在 60 秒内，过期清理一条也删不掉。）
+        """
+        aud, now = {}, 1000.0
+        for i in range(2000):
+            aud["dev-%d" % i] = now
+            self._prune(aud, now)
+            now += 0.02          # 40 秒内发完 2000 个名字
+        self.assertLessEqual(len(aud), srv.AUDIO_LAST_MAX,
+                             "表涨到 %d 条（上限 %d）" % (len(aud), srv.AUDIO_LAST_MAX))
+
+    def test_prune_keeps_recent(self):
+        """丢的是**最旧**的：留下的必须是最近记的那批，冷却判定才不会形同虚设。"""
+        aud = {"d%d" % i: 1000.0 + i for i in range(10)}
+        self._prune(aud, 1009.0, max_n=3)
+        self.assertEqual(sorted(aud), ["d7", "d8", "d9"])
+
+    def test_expired_entries_are_dropped_first(self):
+        """过期的先走 —— 不需要动用 LRU 就近 60 秒内的记录。"""
+        aud = {"old-1": 900.0, "old-2": 901.0,
+               "new-1": 1000.0, "new-2": 1001.0}
+        self._prune(aud, 1001.0, max_n=4)      # 长度 4 不超上限 → 什么都不做
+        self.assertEqual(len(aud), 4)
+        aud["new-3"] = 1001.5
+        self._prune(aud, 1001.5, max_n=4)      # 超了 → 两条过期的先走
+        self.assertEqual(sorted(aud), ["new-1", "new-2", "new-3"])
+
+    def test_normal_traffic_never_hits_the_bound(self):
+        """正常一分钟 120 段（全局预算上限）根本碰不到这个兜底。
+
+        这条用来防"把上限调得太小、把真板子的冷却悄悄关掉"。
+        """
+        self.assertGreater(srv.AUDIO_LAST_MAX, srv.AUDIO_MAX_PER_MIN * 2)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

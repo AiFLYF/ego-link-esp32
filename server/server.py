@@ -122,6 +122,13 @@ AUDIO_KEEP = 50                # 每台设备最多留多少条录音
 # 顺带也挡掉"按键抖动导致连发两段录音"这种误触。
 AUDIO_MIN_GAP_S = 1.5
 AUDIO_LAST = {}                # device -> 上次受理的时刻（内部限流用，不进快照）
+# `AUDIO_LAST` 的键是**外部输入**（`?device=`），所以它不能靠"设备就那么几块"来保证有界。
+# 每设备冷却只在放行的请求上记一笔，正常一分钟最多 `AUDIO_MAX_PER_MIN` 条、60 秒后自然过期；
+# 但历史实现写的是"长度超 256 才清一遍、且只清 60 秒前的"—— 一串**新设备名**每秒来几发，
+# 60 秒内的条目一条都清不掉，表就跟着名字数量涨（实测 40 秒 2000 个名字 → 2000 条）。
+# 现在改成两道：过期就清；清完还超 `AUDIO_LAST_MAX` 就丢最旧的（近似 LRU）。
+# 丢最旧的代价只是"那台设备的下一次录音少挡一次冷却"，不涉及钱 —— 钱由全局预算管。
+AUDIO_LAST_MAX = 512
 # 全服务器每分钟最多受理多少段录音。**这是"花钱接口"的最后一道闸**：
 # `/api/audio` 是唯一一个"一被调用就产生 ASR + 一次大模型费用"的未鉴权入口
 # （按设计不能要求 token —— 老固件没有密钥可带）。
@@ -1822,10 +1829,15 @@ class Handler(BaseHTTPRequestHandler):
         # 这样"连发 10 次"只会全部被拒、不会积攒下一次的额度。
         with LOCK:
             now_a = time.time()
-            # `AUDIO_LAST` 的键是外部输入（设备名），会随"无限设备名"长大；
-            # 到 256 条就顺手清掉 60 秒前的记录，保证这张表本身有界。
-            if len(AUDIO_LAST) > 256:
+            # `AUDIO_LAST` 的键是外部输入（设备名），会随"无限设备名"长大。
+            # 先清 60 秒前的（这些记录已经不可能再挡住谁：冷却只有 1.5 秒），
+            # 清完还超上限就丢最旧的 —— 只丢冷却记录，不丢钱（钱归 AUDIO_BUDGET 管）。
+            if len(AUDIO_LAST) > AUDIO_LAST_MAX:
                 for k in [k for k, t in AUDIO_LAST.items() if now_a - t > 60.0]:
+                    AUDIO_LAST.pop(k, None)
+            if len(AUDIO_LAST) > AUDIO_LAST_MAX:
+                for k in sorted(AUDIO_LAST, key=AUDIO_LAST.get)[
+                        :len(AUDIO_LAST) - AUDIO_LAST_MAX]:
                     AUDIO_LAST.pop(k, None)
             too_soon = (now_a - AUDIO_LAST.get(dev_id, 0.0)) < AUDIO_MIN_GAP_S
             if not too_soon:
