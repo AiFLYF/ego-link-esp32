@@ -1648,20 +1648,36 @@ function init3d(){
   g.quaternion.copy(flat);
   $("card3d").hidden = false;
 
-  /* 画面 60Hz 走、数据按「刷新」选择器的频率到：每帧朝目标姿态 slerp 一点点，
-     所以即使数据来得慢，画面也是连续转的（取数越快越跟手）。 */
-  (function loop(){
-    requestAnimationFrame(loop);
-    d3.cur.slerp(d3.target, 0.18);
-    d3.group.quaternion.copy(d3.cur);
+  /* prefers-reduced-motion：CSS 媒体查询管不到 WebGL 的 rAF 循环。
+     开了"减少动态效果"就跑**静止渲染**：不转圈、不做 slerp 缓动，
+     数据到达时直接落到目标姿态画一帧（功能一样不少，只是不演）。
+     这样 3D 与页面上其它动画遵守的是同一个系统偏好。 */
+  var reduceMotion = false;
+  try {
+    reduceMotion = !!(window.matchMedia &&
+                      window.matchMedia("(prefers-reduced-motion: reduce)").matches);
+  } catch (e) {}
+  d3.reduced = reduceMotion;
+
+  if (reduceMotion) {
     d3.renderer.render(d3.scene, d3.camera);
-  })();
+  } else {
+    /* 画面 60Hz 走、数据按「刷新」选择器的频率到：每帧朝目标姿态 slerp 一点点，
+       所以即使数据来得慢，画面也是连续转的（取数越快越跟手）。 */
+    (function loop(){
+      requestAnimationFrame(loop);
+      d3.cur.slerp(d3.target, 0.18);
+      d3.group.quaternion.copy(d3.cur);
+      d3.renderer.render(d3.scene, d3.camera);
+    })();
+  }
 
   window.addEventListener("resize", function(){
     var w = Math.max(200, cv3.clientWidth || 320);
     renderer.setSize(w, H, false);
     camera.aspect = w / H;
     camera.updateProjectionMatrix();
+    if (d3 && d3.reduced) d3.renderer.render(d3.scene, d3.camera);
   });
 }
 
@@ -1732,6 +1748,12 @@ function update3d(x, y, z){
     }
   }
   d3.target.copy(best || base);
+  /* 减少动态效果：不跑循环，数据一到直接落位画一帧（见 init3d 里的说明） */
+  if (d3.reduced){
+    d3.cur.copy(d3.target);
+    d3.group.quaternion.copy(d3.cur);
+    d3.renderer.render(d3.scene, d3.camera);
+  }
   var srcEl = $("d3src");
   if (srcEl && (Math.abs(x) > 0.05 || Math.abs(y) > 0.05 || Math.abs(z) > 0.05)) {
     var pitch = Math.round(Math.atan2(-y, Math.sqrt(x*x + z*z)) * 180 / Math.PI);
