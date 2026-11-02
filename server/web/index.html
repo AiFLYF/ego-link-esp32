@@ -911,19 +911,6 @@ dialog.modal[open]::backdrop{animation:modal-veil var(--dur-2) var(--ease-out)}
   /* 手机上输入框小于 16px 时，iOS 聚焦会强制放大页面 —— 很难受 */
   input[type=text],input[type=password],input[type=number],select{font-size:16px}
 }
-
-/* ==========================================================================
-   动效偏好：系统里开了"减少动态效果"就把所有动画/过渡压到几乎为 0。
-   这个页面有呼吸点、活动词淡入、曲线过渡、3D slerp —— 对前庭敏感的人是干扰。
-   只压缩**时长**，不删动画本身：布局和最终状态完全不变。
-   ========================================================================== */
-@media (prefers-reduced-motion: reduce){
-  *,*::before,*::after{
-    animation-duration:.01ms !important;
-    animation-iteration-count:1 !important;
-    transition-duration:.01ms !important;
-  }
-}
 </style>
 </head>
 <body>
