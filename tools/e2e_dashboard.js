@@ -37,6 +37,9 @@ const logs = [];
 function start(args, tag, extraEnv) {
   const env = Object.assign({}, process.env, {
     no_proxy: '127.0.0.1,localhost', NO_PROXY: '127.0.0.1,localhost',
+    // 门禁必须是封闭环境：仓库根目录 .env 里的真实 LLM key 被子进程静默加载的话，
+    // 「提问」断言会去打真实模型（慢、不稳定）。显式置空 = 本实例走本地规则 AI。
+    RW1_LLM_API_KEY: '',
   }, extraEnv || {});
   /* 把子进程输出落盘：失败时能一眼看出是"服务端没起来"还是"产品 bug"，
      而不是对着一个空日志猜。 */

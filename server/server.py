@@ -86,6 +86,11 @@ MAX_WINDOW = int(WINDOW_S / 0.008) + 64      # = 1064
 
 DEVICE_TIMEOUT = 5.0      # 超过该秒数没有新遥测则视为离线
 LLM_TIMEOUT = 25.0        # 大模型请求超时（后台线程里等，不影响板端）
+# 出站请求的 User-Agent。**不能留 urllib 默认值**（Python-urllib/x.y）：
+# 实测（2026-11-03）上游的 Cloudflare 按浏览器签名封禁，默认 UA 直接吃
+# HTTP 403 "error code: 1010"，换成任何显式 UA 立刻 200。服务端自己的
+# server_version 是 RW1/1.1，出站就用同一个标识，对端日志里也好认。
+LLM_USER_AGENT = "RW1/1.1"
 # 同时打大模型的请求上限。一个班 20 块板可能同时提问，没有上限时 20 个线程
 # 一起砸过去，对方一限流就**全部**超时 —— 课堂里表现为"全班的 AI 同时傻了"，
 # 且每个人都要干等 LLM_TIMEOUT 秒。语义：最多 N 个在飞，其余在信号量上排队；
@@ -926,7 +931,10 @@ def _transcribe_cloud(cfg, wav):
     req = urllib.request.Request(
         cfg["base"] + "/audio/transcriptions", data=body,
         headers={"Content-Type": "multipart/form-data; boundary=" + boundary,
-                 "Authorization": "Bearer " + cfg["key"]},
+                 "Authorization": "Bearer " + cfg["key"],
+                 # 与大模型同一原因（LLM_USER_AGENT 的注释）：
+                 # urllib 默认 UA 会被部分网关按签名封禁。
+                 "User-Agent": LLM_USER_AGENT},
     )
     try:
         with urllib.request.urlopen(req, timeout=ASR_TIMEOUT) as resp:
@@ -975,11 +983,10 @@ def ask_llm(dev, question):
     而且只放问答文本 —— 每轮都重塞一遍遥测摘要既费 token 又会把
     上下文淹没在重复内容里。
     """
-    key = os.environ.get("RW1_LLM_API_KEY")
-    if not key:
+    _load_dotenv()
+    cfg = _llm_cfg()
+    if cfg is None:
         return None
-    base = os.environ.get("RW1_LLM_BASE_URL", "https://api.openai.com/v1").rstrip("/")
-    model = os.environ.get("RW1_LLM_MODEL", "gpt-4o-mini")
     with LOCK:
         history = list(dev.chat)
     # ai_summary() 内部要取 LOCK，必须在 with LOCK 之外调用（否则自锁）
@@ -989,19 +996,149 @@ def ask_llm(dev, question):
     messages.extend({"role": r, "content": c} for r, c in history)
     messages.append({"role": "user",
                      "content": "开发板传感器情况：%s\n同学想问：%s" % (ai_summary(dev), question)})
-    payload = {"model": model, "messages": messages, "max_tokens": 300}
-    req = urllib.request.Request(
-        base + "/chat/completions",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json", "Authorization": "Bearer " + key},
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=LLM_TIMEOUT) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-        return data["choices"][0]["message"]["content"].strip()
-    except Exception as exc:  # noqa: BLE001 —— 任何失败都回退本地模板
-        push_event(dev, "warn", "大模型调用失败(%s)，已用本地AI回复" % exc.__class__.__name__)
+    payload = {"model": cfg["model"], "messages": messages, "max_tokens": 300}
+
+    # 实测这个上游（new-api 网关 + Cloudflare）丢包严重：建连成功率约六成。
+    # 所以失败**必须重试**：连接类错误、超时、429、5xx、返回非 JSON 都可能是
+    # 瞬时故障；4xx（除 429）是配置/权限问题，重试没意义，直接报原因。
+    # 任何路径都不许静默卡死 —— 最终一定落一句可读原因进事件流。
+    last_err = "未知错误"
+    attempts = 0
+    for attempt in range(1 + cfg["retries"]):
+        attempts = attempt + 1
+        try:
+            req = urllib.request.Request(
+                cfg["base"] + "/chat/completions",
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json",
+                         "Authorization": "Bearer " + cfg["key"],
+                         # Cloudflare 按 UA 签名封禁 urllib 默认 UA（403/1010），
+                         # 必须显式给 —— 见 LLM_USER_AGENT 的注释。
+                         "User-Agent": LLM_USER_AGENT},
+            )
+            with urllib.request.urlopen(req, timeout=cfg["timeout"]) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            text = _llm_extract_text(data)
+            if text:
+                return text
+            last_err = "响应格式异常（找不到正文）"
+        except json.JSONDecodeError:
+            # 网关抖起来会回 Cloudflare 的 HTML 错误页 —— 按瞬时故障处理（重试）
+            last_err = "响应不是合法 JSON"
+        except urllib.error.HTTPError as exc:
+            last_err = _llm_error_text(exc)
+            if exc.code not in (429,) and not (500 <= exc.code < 600):
+                break                      # 4xx 配置错误，重试无意义
+        except Exception as exc:  # noqa: BLE001 —— 连接/超时/DNS 都按瞬时故障重试
+            last_err = _llm_error_text(exc)
+        if attempt < cfg["retries"]:
+            time.sleep(1.0)              # 退避一拍再来，别把网关刷成真正的限流
+    push_event(dev, "warn", "大模型调用失败（%s，共试 %d 次），已用本地AI回复"
+               % (last_err, attempts))
+    return None
+
+
+def _llm_cfg():
+    """大模型配置；没配 key 返回 None（= 整个功能降级到本地规则 AI）。
+
+    base / model / 超时 / 重试次数全部走环境变量（.env 由 _load_dotenv 补齐），
+    代码里不落地任何密钥。默认值保持 OpenAI 官方端点，换渠道只改配置不改代码。
+    """
+    key = os.environ.get("RW1_LLM_API_KEY")
+    if not key:
         return None
+    return {
+        "key": key,
+        "base": os.environ.get("RW1_LLM_BASE_URL",
+                               "https://api.openai.com/v1").rstrip("/"),
+        "model": os.environ.get("RW1_LLM_MODEL", "gpt-4o-mini"),
+        "timeout": float(os.environ.get("RW1_LLM_TIMEOUT", str(LLM_TIMEOUT))),
+        "retries": max(0, min(5, int(os.environ.get("RW1_LLM_RETRIES", "2")))),
+    }
+
+
+def _llm_extract_text(data):
+    """从 OpenAI 兼容响应里取正文，容忍几种结构变体。取不到返回 None。
+
+    实测记录（2026-11-03，qwen3.8-27b @ new-api 网关）：标准结构之外还带着
+    `reasoning_content`（思考过程）—— 那是**模型的草稿，不是给用户看的**，
+    content 为空的退化场合宁可判格式异常、回退本地 AI，也不拿草稿冒充正文。
+    """
+    try:
+        ch = data.get("choices")
+        if isinstance(ch, list) and ch:
+            first = ch[0]
+            if isinstance(first, dict):
+                msg = first.get("message")
+                if isinstance(msg, dict):
+                    t = msg.get("content")
+                    if isinstance(t, str) and t.strip():
+                        return t.strip()
+                t = first.get("text")
+                if isinstance(t, str) and t.strip():
+                    return t.strip()
+        for k in ("content", "reply", "text", "output", "answer"):
+            t = data.get(k)
+            if isinstance(t, str) and t.strip():
+                return t.strip()
+    except (AttributeError, TypeError, IndexError, KeyError):
+        pass
+    return None
+
+
+def _llm_error_text(exc):
+    """把一次失败的异常翻成给用户看的一句中文原因。**绝不带任何密钥**。"""
+    if isinstance(exc, urllib.error.HTTPError):
+        code = exc.code
+        if code == 401:
+            return "密钥被拒（401）"
+        if code == 403:
+            return "没有权限（403）"
+        if code == 404:
+            return "接口或模型不存在（404）"
+        if code == 429:
+            return "上游限流（429）"
+        if 500 <= code < 600:
+            return "上游服务错误（%d）" % code
+        return "上游拒绝（%d）" % code
+    msg = ("%s: %s" % (exc.__class__.__name__, exc)).lower()
+    if "timed out" in msg or "timeout" in msg or isinstance(exc, (TimeoutError,)):
+        return "请求超时"
+    if "getaddrinfo" in msg or "11001" in msg or "name or service" in msg \
+            or "temporary failure" in msg or "解析" in msg:
+        return "DNS 解析失败"
+    return "连接失败"
+
+
+_DOTENV_LOADED = False
+
+
+def _load_dotenv():
+    """把仓库根目录 `.env` 里的 RW1_* 读进环境变量（**只补缺省，不覆盖**）。
+
+    `.env` 在 .gitignore 里（密钥绝不入库、不打印）。只放行 RW1_ 前缀，
+    防止一个配置文件悄悄改掉进程的其它行为。文件不存在就静默跳过 —
+    和「不配大模型也能完整跑通」是同一条原则。
+    """
+    global _DOTENV_LOADED
+    if _DOTENV_LOADED:
+        return
+    _DOTENV_LOADED = True
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                        ".env")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, _, v = line.partition("=")
+                k = k.strip()
+                v = v.strip().strip('"').strip("'")
+                if k.startswith("RW1_") and k and k not in os.environ:
+                    os.environ[k] = v
+    except OSError:
+        pass
 
 
 def _llm_worker(dev, question, token):
@@ -1249,6 +1386,9 @@ def request_ai(dev, question):
     if intent is not None:
         return run_intent(dev, question, intent)
 
+    # .env 只在这里和 ask_llm 里读一次（幂等）：没有这一行的话，
+    # 只在 .env 里配了 key 的用户会永远走不到大模型这条路。
+    _load_dotenv()
     if os.environ.get("RW1_LLM_API_KEY"):
         with LOCK:
             if dev.st["ai_pending"]:

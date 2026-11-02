@@ -57,6 +57,11 @@ OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 # 它们根本不是"偶发"，是"有多少子进程被代理吃掉"的必然结果。
 CHILD_ENV = dict(os.environ)
 CHILD_ENV["no_proxy"] = CHILD_ENV["NO_PROXY"] = "127.0.0.1,localhost"
+# 门禁必须是封闭环境：仓库根目录的 .env（大模型 key）被子进程静默加载的话，
+# 前半段「没配 key → 本地规则AI」的断言会突然去打真实模型（慢、不稳定、花钱）。
+# 显式置空 = 明确"本实例无 LLM"（_load_dotenv 不覆盖已存在的键）。
+# 需要 LLM 的第 [7] 节自己在 env2 里覆盖成 sk-test。
+CHILD_ENV["RW1_LLM_API_KEY"] = ""
 for _k in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY",
            "all_proxy", "ALL_PROXY"):
     CHILD_ENV.pop(_k, None)
