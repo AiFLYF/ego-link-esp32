@@ -1961,6 +1961,12 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- telemetry (板 → 服务器 → 板) --------------------------------------
     def _telemetry(self):
+        # 服务端自报耗时，随响应回给板子（板子忽略这个字段，只影响调试与压测）。
+        # **为什么要有**：`tools/load_classroom.py` 之前只能量"客户端往返"，
+        # 而它的 20 块假板子是同一进程里的线程、抢同一把 GIL —— 客户端自己
+        # 就是瓶颈。2026-11-01 实测往返 p50=400ms，看起来像服务端很慢，
+        # 其实大头是测试进程排队。分开报这两个数，才能判断到底谁慢。
+        _t0 = time.perf_counter()
         msg = self._read_json()
         now = time.time()
 
@@ -2052,6 +2058,9 @@ class Handler(BaseHTTPRequestHandler):
             "activity": activity,
             "reply": clip_utf8(final_reply, BOARD_REPLY_MAX),
             "pending": pending,
+            # 服务端处理这一段（解析 + 等锁 + 分类）的毫秒数，**不含 socket 收发**。
+            # 客户端往返减去它，就是网络 + 客户端自己的开销。
+            "ms": int((time.perf_counter() - _t0) * 1000),
         }
         if cmd is not None:
             out["cmd"] = cmd
