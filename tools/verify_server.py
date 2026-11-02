@@ -367,6 +367,9 @@ def main():
     # 只有 LLM 密钥的环境，令牌门"没生效"，三个 401 断言集体误报）。
     token_env = dict(CHILD_ENV)  # 照抄 T63 的纪律：别各自 dict(os.environ)
     token_env["RW1_API_TOKEN"] = TOKEN
+    # 顺便在这个实例上验"录音全局预算"：压到 1 段/分钟，这样第二段就必须 429。
+    # 放在这里而不是主实例，是因为主实例的语音用例本身要传好几段。
+    token_env["RW1_AUDIO_MAX_PER_MIN"] = "1"
     try:
         # 等服务器起来
         for _ in range(50):
@@ -1497,6 +1500,21 @@ def main():
         check("没配密钥的实例完全不设防（与历史行为一致）",
               mbody.get("ok") is True, "实际: %s" % mbody)
 
+        # 录音全局预算（这个实例被压到 1 段/分钟）：
+        # 每设备 1.5s 冷却挡不住"换设备名"，所以用**另一个设备名**再发一段 ——
+        # 必须被全局预算拦下，否则"换个名字就能继续烧 ASR/LLM 费用"。
+        a1 = post_bytes("http://127.0.0.1:%d/api/audio?device=budget-a" % port2,
+                        b"\x01\x02" * 800)
+        try:
+            post_bytes("http://127.0.0.1:%d/api/audio?device=budget-b" % port2,
+                       b"\x01\x02" * 800)
+            budget_code = 200
+        except urllib.error.HTTPError as e:
+            budget_code = e.code
+        check("录音全局预算生效（换设备名也绕不过去）",
+              a1.get("ok") is True and budget_code == 429,
+              "实际: first=%s second=%s" % (a1.get("ok"), budget_code))
+
         # ---- 26. 外部数据健壮性（2026-10-30 加固）-------------------------
         # 几条都是"一条外部输入把服务端打出一个异常"的路径。它们都不可能来自
         # 本仓库的固件（固件有 sanitize3、有 clamp），但教室里任何一台机器都能发。
@@ -1651,6 +1669,18 @@ def main():
                            {"name": "capture_once"})
         check("不带 device 的老调用仍能下发（兼容单板场景）",
               legacy.get("ok") is True, "实际: %s" % legacy)
+
+        # ---- 30. 仪表盘页面从文件服务（2026-10-30 拆包后的路由）------------
+        # 单元测试钉的是 dashboard_html() 这个函数；这里钉的是**路由**：
+        # `/` 必须真的返回 text/html 且是那份页面（拆包时最容易漏的就是这一步）。
+        print("\n[30] 页面路由（拆包后仍然服务同一个页面）")
+        with OPENER.open("http://127.0.0.1:%d/" % port, timeout=8) as r:
+            page = r.read().decode("utf-8", "replace")
+            ctype = r.headers.get("Content-Type", "")
+        check("/ 返回 text/html", "text/html" in ctype, "实际: %s" % ctype)
+        check("/ 返回的是真页面（不是「文件缺失」兜底页）",
+              'id="feed"' in page and "仪表盘文件缺失" not in page,
+              "长度 %d 字节" % len(page))
 
     finally:
         for p in (srv, srv2, nlboard):

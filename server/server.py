@@ -122,6 +122,16 @@ AUDIO_KEEP = 50                # 每台设备最多留多少条录音
 # 顺带也挡掉"按键抖动导致连发两段录音"这种误触。
 AUDIO_MIN_GAP_S = 1.5
 AUDIO_LAST = {}                # device -> 上次受理的时刻（内部限流用，不进快照）
+# 全服务器每分钟最多受理多少段录音。**这是"花钱接口"的最后一道闸**：
+# `/api/audio` 是唯一一个"一被调用就产生 ASR + 一次大模型费用"的未鉴权入口
+# （按设计不能要求 token —— 老固件没有密钥可带）。
+# 每设备 1.5 s 的冷却挡不住"换设备名"，所以再加一道**全局**预算：
+# 即使有人伪造 20 个设备名同时刷，费用也被压在 120 段/分钟以内，而且
+# 超限会打到控制台（老师能看见"有人在刷语音"）。
+# 120 的依据：一个班 20 块板，正常演示每分钟几十次；120 留了一倍余量。
+# 想要更严可以设 RW1_AUDIO_MAX_PER_MIN（测试就用这个把预算压到 2）。
+# ⚠️ 限流器实例 `AUDIO_BUDGET` 定义在 `RateWindow` 类之后（类还没定义时不能实例化）。
+AUDIO_MAX_PER_MIN = int(os.environ.get("RW1_AUDIO_MAX_PER_MIN", "120") or 120)
 ASR_TIMEOUT = 30.0             # 云端识别超时（后台线程里等，不阻塞板端）
 VOICE_TEXT_MAX = 200           # 识别出的文字长度上限（与 ask 的 q 一致）
 CHAT_HISTORY = 6               # 多轮上下文保留的问答轮数（澄清类追问要用）
@@ -439,6 +449,46 @@ def clip_utf8(text, limit):
         except UnicodeDecodeError:
             cut = cut[:-1]
     return "…"
+
+
+class RateWindow:
+    """滑动窗口限流器：最近 `window_s` 秒内最多 `n` 次。**调用方负责加锁。**
+
+    为什么单独抽出来：
+      1. 全项目已经有两处限流（每设备录音冷却、全服务器录音预算），各写一份
+         deque 逻辑必然慢慢走偏；
+      2. 它是**纯逻辑、零依赖**的 —— 可以直接进 `tools/test_units.py` 的单测，
+         而那边的单测跑不到 HTTP（没有真服务器）；
+      3. 边界条件（窗口滑动、恰好到顶、跨窗口）最容易写错，值得有独立用例。
+
+    语义细节：`allow()` 只在**放行**时才记一次。被拒的请求不占额度，
+    所以"连发 100 次"不会把窗口填满、也不会把后来的正常请求一起挡死。
+    """
+
+    __slots__ = ("n", "window_s", "_hits")
+
+    def __init__(self, n, window_s):
+        self.n = max(1, int(n))
+        self.window_s = float(window_s)
+        self._hits = deque()
+
+    def allow(self, now):
+        """登记一次（若允许）。返回 True = 放行，False = 超限。"""
+        while self._hits and now - self._hits[0] > self.window_s:
+            self._hits.popleft()
+        if len(self._hits) >= self.n:
+            return False
+        self._hits.append(now)
+        return True
+
+    def reset(self):
+        """清空（测试用；也便于运行时改配置后立即生效）。"""
+        self._hits.clear()
+
+
+# 全服务器录音预算（见 AUDIO_MAX_PER_MIN 的注释）。放在类定义**之后**。
+AUDIO_BUDGET = RateWindow(AUDIO_MAX_PER_MIN, 60.0)
+AUDIO_BUDGET_NOTICE_AT = [0.0]     # 上次打印"超限"的时刻（用 list 当可变盒）
 
 
 # --------------------------------------------------------------------------
@@ -1780,10 +1830,28 @@ class Handler(BaseHTTPRequestHandler):
             too_soon = (now_a - AUDIO_LAST.get(dev_id, 0.0)) < AUDIO_MIN_GAP_S
             if not too_soon:
                 AUDIO_LAST[dev_id] = now_a
+                # 全局预算**只统计真要受理的请求**：被每设备冷却挡掉的不占额度。
+                budget_ok = AUDIO_BUDGET.allow(now_a)
+                notice = False
+                if not budget_ok and (now_a - AUDIO_BUDGET_NOTICE_AT[0]) > 60.0:
+                    AUDIO_BUDGET_NOTICE_AT[0] = now_a
+                    notice = True
+            else:
+                budget_ok, notice = True, False
         if too_soon:
             self._send(429, json.dumps(
                 {"ok": False, "error": "too soon", "hint": "同一台设备 %.1f 秒内只收一段录音"
                  % AUDIO_MIN_GAP_S}, ensure_ascii=False))
+            return
+        if not budget_ok:
+            # 打印而不是 push_event：此刻设备可能还不存在（伪造名字），
+            # 而 push_event 会顺手把它建出来。控制台一行足够老师看见。
+            if notice:
+                print("   [语音] 本机每分钟录音上限 %d 已到，后续请求一律 429" % AUDIO_MAX_PER_MIN)
+            self._send(429, json.dumps(
+                {"ok": False, "error": "audio budget exhausted",
+                 "hint": "本机每分钟最多受理 %d 段录音，请稍后再试" % AUDIO_MAX_PER_MIN},
+                ensure_ascii=False))
             return
         with LOCK:
             dev = get_device(dev_id)
