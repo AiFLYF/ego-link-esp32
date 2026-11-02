@@ -626,6 +626,44 @@ def main():
         check("非法指令名被拒绝", _expect_400(
             "http://127.0.0.1:%d/api/command" % port, {"name": "rm -rf /"}))
 
+        # 坏 body 必须被拒成**可读的 400**（2026-11-02 修复）。修复前的实测：
+        #   - 非 JSON 垃圾 → `_read_json` 返回 {} → `_command` 兜出默认
+        #     capture_once，**真的下发了一条命令**（HTTP 200 + request_id）；
+        #   - JSON 数组 → `list.get` AttributeError → 500 + traceback + 断连；
+        #   - Content-Length 不是数字 → `int()` ValueError，同样是断连。
+        try:
+            post_bytes("http://127.0.0.1:%d/api/command" % port, b"this is not json")
+            ok_g, detail_g = False, "竟然接受了"
+        except urllib.error.HTTPError as e:
+            ok_g, detail_g = e.code == 400, "HTTP %d" % e.code
+        except Exception as e:  # noqa: BLE001
+            ok_g, detail_g = False, "%s: %s" % (type(e).__name__, e)
+        check("非 JSON 的命令 body 被拒（不当默认命令下发）", ok_g, detail_g)
+
+        try:
+            post_raw("http://127.0.0.1:%d/api/command" % port, "[1,2,3]")
+            ok_a, detail_a = False, "竟然接受了"
+        except urllib.error.HTTPError as e:
+            ok_a, detail_a = e.code == 400, "HTTP %d" % e.code
+        except Exception as e:  # noqa: BLE001
+            ok_a, detail_a = False, "%s: %s" % (type(e).__name__, e)
+        check("JSON 数组（不是对象）的命令 body 被拒", ok_a, detail_a)
+
+        # 非法 Content-Length：urllib 发不出这种请求，只能裸 socket。
+        # 期望拿到一行可读的 400，而不是"连接被服务端掐断"（recv 空 / RST）。
+        head, detail_cl = b"", ""
+        try:
+            _s = socket.create_connection(("127.0.0.1", port), timeout=5)
+            _s.sendall(b"POST /api/command HTTP/1.1\r\nHost: t\r\n"
+                       b"Content-Length: abc\r\nConnection: close\r\n\r\n")
+            head = _s.recv(4096)
+            _s.close()
+        except OSError as e:
+            detail_cl = "%s: %s" % (type(e).__name__, e)
+        check("非法 Content-Length 得到可读的 400（不是断连）",
+              head.startswith(b"HTTP/1.1 400"),
+              detail_cl or head.split(b"\r\n", 1)[0].decode("latin-1", "replace"))
+
         r12_dev = "往返-01"        # 固定设备名：不再依赖"最近上报的那台"（见 _wait_cmd 注释）
         board = subprocess.Popen(
             [PY, os.path.join(HERE, "fake_board.py"),
@@ -871,6 +909,16 @@ def main():
         check("非 JPEG 的帧被拒（400）", st == 400, "实际: %s" % st)
         st, _ = cam_get("/api/shots/" + camdev + "/..%2F..%2Fserver.py")
         check("照片路径穿越被拒（404）", st == 404, "实际: %s" % st)
+        # 文件名里的冒号也要拒（2026-11-02 补）：Windows 上它是 NTFS 备用数据流的
+        # 分隔符。读取那条原本也会 404（文件不存在），但**走的是校验之后**的
+        # isfile；删除那条修复前是 404（os.remove 报错），现在必须在**校验层**
+        # 就拦成 400 —— 白名单就该在门口拦，不该靠"碰巧没有这个文件"。
+        st, _ = cam_get("/api/shots/%s/x.jpg:evil" % camdev)
+        check("照片名带冒号被拒（404，NTFS 数据流不可达）", st == 404, "实际: %s" % st)
+        st, _ = cam_post("/api/shots/delete",
+                         json.dumps({"device": camdev, "name": "x.jpg:evil"}).encode(),
+                         "application/json")
+        check("删除接口在校验层拒绝带冒号的文件名（400）", st == 400, "实际: %s" % st)
 
         # 删除
         if shots.get("shots"):

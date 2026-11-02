@@ -247,7 +247,18 @@ static esp_err_t h_save(httpd_req_t *req)
             send_json(req, "{\"ok\":false,\"reason\":\"提交内容过长\"}");
             return ESP_OK;
         }
-        got = httpd_req_recv(req, body, sizeof(body) - 1);
+        /* 循环读满 content_len：httpd_req_recv 是对 recv 的薄封装，TCP 把
+         * body 分几段送过来时单次调用可能短读 —— 拿着半截表单去解析，
+         * 报出来的会是"缺 SSID"这种误导性错误。对端中途断开就带着
+         * 已读到的部分继续（解析自然会拒，理由也是真实的）。 */
+        const int want = (int)req->content_len;
+        while (got < want) {
+            int n = httpd_req_recv(req, body + got, (size_t)(want - got));
+            if (n <= 0) {
+                break;
+            }
+            got += n;
+        }
         if (got <= 0) {
             send_json(req, "{\"ok\":false,\"reason\":\"读取提交内容失败\"}");
             return ESP_OK;

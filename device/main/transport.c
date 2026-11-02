@@ -301,6 +301,12 @@ typedef struct {
     bool     ask;
     bool     had_result;
     char     cmd_rid[TRANSPORT_CMD_ID_LEN];
+    /* 本批要上报的 BOOT 按键次数。在采样侧 flush 时**锁内快照并清零**：
+     * 原先是 upload_task 发送成功后无锁 `s_btn_pending = 0`，而按钮任务是
+     * 锁内读-改-写 —— 两者交错的那一瞬间到达的按键会被清零吞掉（计数想做到
+     * "绝不吞按键"）。快照进 job 之后，发送失败时在 upload_task 里加回，
+     * 与 ask 的重试同一个套路。 */
+    int      btn;
 } tx_job_t;
 
 static tx_job_t          s_tx_slot;
@@ -313,10 +319,22 @@ static void tx_job_post(const tx_job_t *job)
 {
     if (xSemaphoreTake(s_tx_mutex, pdMS_TO_TICKS(50)) != pdTRUE) {
         s_tx_dropped++;                 /* 拿不到锁：宁可丢帧，绝不卡采样 */
+        /* 这一批没进邮箱：把快照出来的按键计数还回去，别吞按键。
+         * （旧实现计数留在全局量上，丢批天然不丢计数；快照进 job 之后
+         *  每一条"job 没发出去"的路径都得把计数还回去，这里是第一条。） */
+        status_lock();
+        s_btn_pending += job->btn;
+        status_unlock();
         return;
     }
     if (s_tx_ready) {
         s_tx_dropped++;                 /* 上一批还没发走 → 用新的覆盖 */
+        /* 被覆盖的那一批连同它的按键计数一起没了：加回去，下一批补报。
+         * 锁序说明：这里持 s_tx_mutex 之内再取 status_lock —— 全工程没有
+         * 反向（持 status_lock 等 s_tx_mutex）的路径，不会死锁。 */
+        status_lock();
+        s_btn_pending += s_tx_slot.btn;
+        status_unlock();
     }
     s_tx_slot = *job;
     s_tx_ready = true;
@@ -1008,14 +1026,14 @@ static char *build_body(const tx_job_t *job, const char *source, const char *dev
         off += snprintf(buf + off, cap - (size_t)off, "}");
     }
 
-    /* 按键触发（第 3 周）：自上次上报以来 BOOT 被按了几次。
+    /* 按键触发（第 3 周）：本批快照到的 BOOT 按键次数（见 tx_job_t.btn 的注释）。
      * 让服务端/网页能看见"物理动作真的发生了"，而不只是间接看到 ask。 */
-    if (s_btn_pending > 0) {
+    if (job->btn > 0) {
         if ((size_t)off + 24 > cap) {
             free(buf);
             return NULL;
         }
-        off += snprintf(buf + off, cap - (size_t)off, ",\"btn\":%d", s_btn_pending);
+        off += snprintf(buf + off, cap - (size_t)off, ",\"btn\":%d", job->btn);
     }
 
     /* Close with an explicit write (not snprintf) so a full buffer can never
@@ -1517,6 +1535,13 @@ static void transport_task(void *arg)
             memcpy(job.xyz, s_batch, (size_t)n * sizeof(s_batch[0]));
             job.n = (uint16_t)n;
             job.ask = s_ask_pending;
+            /* 按键计数锁内快照并清零（原先是 upload_task 成功后无锁清零，
+             * 会与按钮任务的锁内 ++ 交错吞掉一次按键，见 tx_job_t.btn）。
+             * 发送失败时 upload_task 会把它加回去 —— 计数只许换批、不许丢。 */
+            status_lock();
+            job.btn = s_btn_pending;
+            s_btn_pending = 0;
+            status_unlock();
             job.had_result = s_cmd.ready;
             if (job.had_result) {
                 strlcpy(job.cmd_rid, s_cmd.rid, sizeof(job.cmd_rid));
@@ -1575,15 +1600,19 @@ static void upload_task(void *arg)
             ok = post_batch(&job);
         }
 
-        /* 结果与按键计数只在成功送达后才清；失败就下一批重发
-         * （与 ask 的重试策略一致，不丢东西）。
+        /* 结果只在成功送达后才清；失败就下一批重发（与 ask 的重试策略一致）。
          * 按 rid 精确比对：POST 期间可能已经有新命令覆盖了 s_cmd，
-         * 那时 s_cmd.rid != job.cmd_rid，**绝不能清** —— 那清掉的是别人的结果。 */
+         * 那时 s_cmd.rid != job.cmd_rid，**绝不能清** —— 那清掉的是别人的结果。
+         * 按键计数已经在采样侧快照进 job.btn（那边同时清零），这里只在
+         * **发送失败**时把它加回去 —— 成功路径无需再碰 s_btn_pending。 */
         if (ok) {
             if (job.had_result && strcmp(s_cmd.rid, job.cmd_rid) == 0) {
                 s_cmd.ready = false;
             }
-            s_btn_pending = 0;
+        } else if (job.btn > 0) {
+            status_lock();
+            s_btn_pending += job.btn;
+            status_unlock();
         }
 
         status_lock();
