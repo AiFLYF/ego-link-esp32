@@ -385,6 +385,10 @@ h1,h2,h3{font-family:var(--font-display);text-wrap:balance}
 .pill.on{color:var(--color-action-primary);border-color:var(--tint-primary-line);background:var(--tint-primary)}
 .pill.off{color:var(--color-fall);border-color:var(--tint-danger-line);background:var(--tint-danger)}
 .pill.off i{animation:breathe var(--dur-3) var(--ease-in-out) infinite}
+/* 降级态（链路重连中）：琥珀而不是红 —— 红留给"设备离线/出错"，
+   中间态用 shake 一档，与 .st-sent 的状态色同一语义。 */
+.pill.warn{color:var(--color-shake);border-color:var(--color-line-strong);background:var(--tint-shake)}
+.pill.warn i{animation:breathe var(--dur-3) var(--ease-in-out) infinite}
 @keyframes breathe{0%,100%{opacity:1}50%{opacity:.22}}
 
 /* ==========================================================================
@@ -416,6 +420,12 @@ h1,h2,h3{font-family:var(--font-display);text-wrap:balance}
   display:grid;gap:var(--sp-8);align-items:stretch;
   grid-template-columns:minmax(0,1fr) minmax(0,.82fr) minmax(0,1fr);
 }
+/* 板子离线 = hero 里的数据全是陈旧的。离线 5 秒（DEVICE_TIMEOUT）后
+   活动词会被服务端复位成「等待数据…」，但环、球、三轴条仍停在最后一帧 ——
+   没有这层提示时，看着像"板子还活着只是没动"。降不透明度 + 降饱和，
+   交互区（按钮行、stage-head）保持原样：内容陈旧 ≠ 功能不可用。 */
+.stage-grid,.stage-block{transition:opacity var(--dur-2) var(--ease-out),filter var(--dur-2) var(--ease-out)}
+.stage.stale .stage-grid,.stage.stale .stage-block{opacity:.55;filter:saturate(.7)}
 .hero-readout{display:grid;grid-template-columns:168px minmax(0,1fr);gap:var(--sp-6);align-items:center}
 .hero-ring{position:relative;width:168px;height:168px;flex:none}
 .hero-ring svg{width:100%;height:100%;display:block;transform:rotate(135deg)}
@@ -901,19 +911,6 @@ dialog.modal[open]::backdrop{animation:modal-veil var(--dur-2) var(--ease-out)}
   /* 手机上输入框小于 16px 时，iOS 聚焦会强制放大页面 —— 很难受 */
   input[type=text],input[type=password],input[type=number],select{font-size:16px}
 }
-
-/* ==========================================================================
-   动效偏好：系统里开了"减少动态效果"就把所有动画/过渡压到几乎为 0。
-   这个页面有呼吸点、活动词淡入、曲线过渡、3D slerp —— 对前庭敏感的人是干扰。
-   只压缩**时长**，不删动画本身：布局和最终状态完全不变。
-   ========================================================================== */
-@media (prefers-reduced-motion: reduce){
-  *,*::before,*::after{
-    animation-duration:.01ms !important;
-    animation-iteration-count:1 !important;
-    transition-duration:.01ms !important;
-  }
-}
 </style>
 </head>
 <body>
@@ -936,6 +933,10 @@ dialog.modal[open]::backdrop{animation:modal-veil var(--dur-2) var(--ease-out)}
       <span id="dev" class="pill off"><i></i>离线</span>
       <span id="hzp" class="pill"><svg class="ico" viewBox="0 0 24 24" stroke-width="1.8" aria-hidden="true"><path d="M3 15.5c2-4 4-4 6 0s4 4 6 0 4-4 6 0"/></svg> <span id="hzv">— Hz</span></span>
       <span id="postsp" class="pill"><svg class="ico" viewBox="0 0 24 24" stroke-width="1.8" aria-hidden="true"><path d="M12 19V5M6.5 10.5L12 5l5.5 5.5"/></svg> <span id="postv">↑0 帧</span></span>
+      <!-- 链路状态：SSE 出错只静默重试、pull 失败也静默 —— 没有这个胶囊时，
+           服务端挂掉/断网后页面看起来一切正常，数据却已停更（状态提示缺失）。
+           判定只看"最近一次成功拿到数据距今"，与是哪条通道来的无关。 -->
+      <span id="linkp" class="pill warn"><i></i><span id="linkv">连接中…</span></span>
       <button id="theme" class="icon" type="button" title="切换主题" aria-label="切换主题">
         <svg class="i-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true">
           <circle cx="12" cy="12" r="4.2"></circle>
@@ -1160,7 +1161,6 @@ dialog.modal[open]::backdrop{animation:modal-veil var(--dur-2) var(--ease-out)}
             <option value="50">20 Hz</option>
             <option value="100">10 Hz</option>
             <option value="200" selected>5 Hz</option>
-            <option value="200">5 Hz</option>
             <option value="500">2 Hz</option>
             <option value="2000">0.5 Hz</option>
           </select>
@@ -1648,20 +1648,36 @@ function init3d(){
   g.quaternion.copy(flat);
   $("card3d").hidden = false;
 
-  /* 画面 60Hz 走、数据按「刷新」选择器的频率到：每帧朝目标姿态 slerp 一点点，
-     所以即使数据来得慢，画面也是连续转的（取数越快越跟手）。 */
-  (function loop(){
-    requestAnimationFrame(loop);
-    d3.cur.slerp(d3.target, 0.18);
-    d3.group.quaternion.copy(d3.cur);
+  /* prefers-reduced-motion：CSS 媒体查询管不到 WebGL 的 rAF 循环。
+     开了"减少动态效果"就跑**静止渲染**：不转圈、不做 slerp 缓动，
+     数据到达时直接落到目标姿态画一帧（功能一样不少，只是不演）。
+     这样 3D 与页面上其它动画遵守的是同一个系统偏好。 */
+  var reduceMotion = false;
+  try {
+    reduceMotion = !!(window.matchMedia &&
+                      window.matchMedia("(prefers-reduced-motion: reduce)").matches);
+  } catch (e) {}
+  d3.reduced = reduceMotion;
+
+  if (reduceMotion) {
     d3.renderer.render(d3.scene, d3.camera);
-  })();
+  } else {
+    /* 画面 60Hz 走、数据按「刷新」选择器的频率到：每帧朝目标姿态 slerp 一点点，
+       所以即使数据来得慢，画面也是连续转的（取数越快越跟手）。 */
+    (function loop(){
+      requestAnimationFrame(loop);
+      d3.cur.slerp(d3.target, 0.18);
+      d3.group.quaternion.copy(d3.cur);
+      d3.renderer.render(d3.scene, d3.camera);
+    })();
+  }
 
   window.addEventListener("resize", function(){
     var w = Math.max(200, cv3.clientWidth || 320);
     renderer.setSize(w, H, false);
     camera.aspect = w / H;
     camera.updateProjectionMatrix();
+    if (d3 && d3.reduced) d3.renderer.render(d3.scene, d3.camera);
   });
 }
 
@@ -1732,6 +1748,12 @@ function update3d(x, y, z){
     }
   }
   d3.target.copy(best || base);
+  /* 减少动态效果：不跑循环，数据一到直接落位画一帧（见 init3d 里的说明） */
+  if (d3.reduced){
+    d3.cur.copy(d3.target);
+    d3.group.quaternion.copy(d3.cur);
+    d3.renderer.render(d3.scene, d3.camera);
+  }
   var srcEl = $("d3src");
   if (srcEl && (Math.abs(x) > 0.05 || Math.abs(y) > 0.05 || Math.abs(z) > 0.05)) {
     var pitch = Math.round(Math.atan2(-y, Math.sqrt(x*x + z*z)) * 180 / Math.PI);
@@ -2595,6 +2617,8 @@ function selectDevice(id){
 var aiReply = "";
 /* 上一次渲染时服务端报告的设备。见 render() 里的换设备播报重置。 */
 var lastDevSeen = "";
+/* hero 容器：离线陈旧态（.stale）在这里切换，只写变化的值。 */
+var stageEl = document.querySelector(".stage");
 /* ---------------- 计时（第 6 周） ----------------
    课程第 6 周要求语音任务能「澄清、停止、迟到结果隔离、**计时**」。
    板子屏幕上只有回复正文，看不到"等了多久"——识别慢还是模型慢，用户没法判断，
@@ -2640,6 +2664,13 @@ function render(s){
   renderDevices(s.devices, s.device || selDevice);
 
   devOnline = !!s.device_online;
+  /* 板子离线 → hero 数据区整体降饱和：环/球/条/曲线都是最后一帧的旧数据，
+     别让它看起来还"活着"（CSS .stage.stale；交互区不受影响）。
+     页面刚打开、还没有任何数据时不降 —— 那不是陈旧，是真的没数据。 */
+  if (stageEl){
+    var staleData = !devOnline && !!s.latest;
+    if (stageEl.__stale !== staleData){ stageEl.__stale = staleData; stageEl.classList.toggle("stale", staleData); }
+  }
   var dev = $("dev");
   /* 只在"在线状态真的翻转"时才重写这个胶囊。
      无脑 10Hz 重写会**每秒把里面的 <i> 重建十遍** ——
@@ -2816,10 +2847,25 @@ function sendAsk(){
  * 排队强 —— 反正板端 500ms 才上报一次，慢一点拿到的也只是同一份数据。
  * 网络正常时这个判断形同虚设（每次都能立即执行），行为完全不变。 */
 var pullBusy = false;
+/* 链路状态（顶栏 linkp 胶囊）：SSE 出错只静默重试、pull 失败也静默，
+   服务端一挂页面看着一切正常、数据却已停更。这里只认一件事：
+   最近一次**成功拿到数据**距今天有多久 —— 哪条通道来的不重要。 */
+var lastDataAt = 0;
+function syncLink(){
+  var p = $("linkp"), v = $("linkv");
+  if (!p || !v) return;
+  var stale = (Date.now() - lastDataAt) > 4000;
+  var cls = "pill " + (stale ? "warn" : "on");
+  if (p.className !== cls) p.className = cls;
+  var txt = stale ? "重连中…" : "实时";
+  if (v.textContent !== txt) v.textContent = txt;
+}
+function noteData(){ lastDataAt = Date.now(); syncLink(); }
 function pull(){
   if (pullBusy) return;
   pullBusy = true;
   fetch("/api/latest" + devQuery()).then(function(r){ return r.json(); }).then(function(s){
+    noteData();
     samples = s.samples || [];
     drawChart();
     render(s);
@@ -2840,6 +2886,7 @@ function stream(){
   es = s;
   s.onmessage = function(e){
     if (gen !== streamGen) return;
+    noteData();
     render(JSON.parse(e.data));
   };
   s.onerror = function(){
@@ -2870,6 +2917,9 @@ function stream(){
 
 /* ---------------- 启动 ---------------- */
 $("host").textContent = location.host;
+/* 链路状态胶囊：1Hz 自检（数据是否还在来），数据到达时由 noteData() 即时翻回。 */
+setInterval(syncLink, 1000);
+syncLink();
 /* 主题：初始值已由 head 里那段内联脚本在首次绘制前定好（默认明亮）。
    这里只负责把按钮文案对齐、以及接上点击切换。 */
 applyTheme(_themeName());
