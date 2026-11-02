@@ -78,11 +78,15 @@ class Board(threading.Thread):
             body = vs.firmware_body([(0.0, 0.0, 1.0)] * 50, device=self.dev_id)
             t0 = time.time()
             try:
-                vs.post_raw(url, body, timeout=10)
+                resp = vs.post_raw(url, body, timeout=10)
                 dt = time.time() - t0
                 with self.lock:
                     self.results["ok"] += 1
                     self.results["lat"].append(dt)
+                    # 服务端自报的处理耗时（见 server.py 的 `_telemetry`）。
+                    # 老服务端没有这个字段 → 记 -1，统计时过滤掉。
+                    ms = resp.get("ms") if isinstance(resp, dict) else None
+                    self.results["srv"].append(ms if isinstance(ms, int) else -1)
             except Exception as exc:                      # noqa: BLE001
                 with self.lock:
                     self.results["fail"] += 1
@@ -192,7 +196,8 @@ def main():
             return 2
 
         # ---- 并发上报 -----------------------------------------------------
-        results = {"ok": 0, "fail": 0, "lat": [], "err": {}, "lock": threading.Lock()}
+        results = {"ok": 0, "fail": 0, "lat": [], "srv": [], "err": {},
+                   "lock": threading.Lock()}
         stop_evt = threading.Event()
         devs = ["class-%02d" % i for i in range(1, n + 1)]
         boards = [Board(base, d, args.period, stop_evt, results, args.stagger)
@@ -224,6 +229,7 @@ def main():
         with results["lock"]:
             ok, fail = results["ok"], results["fail"]
             lat = sorted(results["lat"])
+            srv_ms = sorted(x for x in results["srv"] if x >= 0)
             err = dict(results["err"])
         total = ok + fail
         expected = int(n * elapsed / args.period)
@@ -234,6 +240,17 @@ def main():
         if lat:
             print("     往返延迟 p50=%.1f ms  p95=%.1f ms  最慢=%.1f ms"
                   % (pct(lat, 50) * 1000, pct(lat, 95) * 1000, lat[-1] * 1000))
+        if srv_ms:
+            print("     服务端处理 p50=%.1f ms  p95=%.1f ms  最慢=%.1f ms"
+                  "（自报，不含网络）"
+                  % (pct(srv_ms, 50), pct(srv_ms, 95), srv_ms[-1]))
+            gap = pct(lat, 50) * 1000 - pct(srv_ms, 50)
+            # 阈值取"绝对 50ms"和"服务端耗时的 5 倍"里更大的那个：
+            # 服务端 p50 只有 2ms 时，环回 + urllib + GIL 让往返到 25ms 是正常的，
+            # 拿 3 倍去卡会天天误报；只有拉开到几十毫秒才值得提醒。
+            if gap > max(50.0, pct(srv_ms, 50) * 5):
+                print("     ⚠️ 往返比服务端处理多 %.0f ms：这段是网络 + 测试进程自身开销"
+                      "（%d 个线程抢一把 GIL），不是服务端慢" % (gap, n))
         if err:
             print("     失败原因: %s" % err)
         print("     仪表盘 /api/devices 延迟 p50=%.1f ms 最慢=%.1f ms"

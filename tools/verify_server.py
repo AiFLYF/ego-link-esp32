@@ -402,6 +402,17 @@ def main():
         act = latest(port)["activity"]
         check("静置·水平", act == "静置·水平", "实际: %s" % act)
 
+        # ---- 1b. 遥测响应里的服务端自报耗时 -------------------------------
+        # `tools/load_classroom.py` 靠它把"服务端慢"和"测试进程自己排队"分开。
+        # 少了这个字段，压测只能量客户端往返，而 20 块假板子是同一进程里的线程、
+        # 抢同一把 GIL —— 那个数会把服务端的问题放大十倍（2026-11-01 实测
+        # 往返 p50=400ms，服务端处理其实只有个位数毫秒）。
+        out_ms = post_raw("http://127.0.0.1:%d/api/telemetry" % port,
+                          firmware_body([(0.0, 0.0, 1.0)] * 50))
+        check("遥测响应带服务端自报耗时 ms",
+              isinstance(out_ms.get("ms"), int) and 0 <= out_ms["ms"] <= 5000,
+              "实际: %r" % (out_ms.get("ms"),))
+
         # ---- 2. 倾斜方向（屏幕坐标系）------------------------------------
         print("\n[2] 向右倾斜")
         feed(port, "tilt", 6)
