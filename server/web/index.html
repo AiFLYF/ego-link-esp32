@@ -719,6 +719,9 @@ button.primary:hover:not(:disabled){
 button.danger{color:var(--color-fall);border-color:var(--tint-danger-line)}
 button.danger:hover:not(:disabled){background:var(--tint-danger);color:var(--color-fall);border-color:var(--color-danger)}
 button.sm{height:28px;padding:0 var(--sp-3);font-size:var(--fs-meta)}
+/* 卡片头工具行里的下拉（事件筛选）：与 .sm 按钮同高，别让 36px 的全局默认
+   把整行撑歪。字号/圆角/配色全部沿用既有令牌。 */
+.card-head .tools select{height:28px;font-size:var(--fs-meta)}
 /* 图标按钮：和状态胶囊同高（28px），走"退下去"那一档 ——
    主题切换是工具，不该跟主操作抢注意力。 */
 button.icon{width:32px;height:28px;padding:0;display:grid;place-items:center;flex:none}
@@ -1092,7 +1095,17 @@ dialog.modal[open]::backdrop{animation:modal-veil var(--dur-2) var(--ease-out)}
         <div class="card-head">
           <h3><svg class="ico" viewBox="0 0 24 24" stroke-width="1.8" aria-hidden="true"><path d="M2.5 12h4l2.2-5 3.1 10 2.7-7 1.8 2h5.2"/></svg> 事件流</h3>
           <span class="tools">
+            <select id="evfilter" title="按类型筛选事件（只看这一类，其余藏起来）">
+              <option value="all" selected>全部</option>
+              <option value="fall">跌落/告警</option>
+              <option value="shake">晃动</option>
+              <option value="activity">活动变化</option>
+              <option value="ask">提问/AI</option>
+              <option value="cmd">指令</option>
+              <option value="sys">系统</option>
+            </select>
             <span class="src" id="evcount"></span>
+            <button id="evcsv" class="sm" type="button" title="把当前筛选下的事件导出成 CSV（UTF-8 带 BOM，Excel 直接打开不乱码；「查看全部」展开时导出全量 200 条）">导出</button>
             <button id="evmore" class="sm" type="button" title="从服务端取回更早的事件（保留上限 200 条）">查看全部</button>
           </span>
         </div>
@@ -2304,6 +2317,28 @@ var lastEvts = null, lastEvTotal = null;
    但帧本身仍要记进 lastEvts，收起时才有新数据可画。 */
 var evExpanded = false;
 
+/* 事件类型筛选（2026-11-03）：课上追"那块板为什么掉线/有没有跌落"时，
+   事件流混着活动变化、提问、系统消息，找一条要翻半天。
+   纯前端筛选，不改服务端：kind 本来就是结构化字段，SSE 与 /api/events 都带。
+   筛选对「最近 40 条」与「查看全部」两个视图同样生效。 */
+var evFilter = "all";
+/* 展开态下取回的全量列表：换筛选时靠它重画，不用重新取。 */
+var evFullList = null;
+var EV_GROUPS = {
+  fall:     {fall:1, alert:1},
+  shake:    {shake:1},
+  activity: {activity:1},
+  ask:      {ask:1, ai:1},
+  cmd:      {cmd:1},
+  sys:      {info:1, warn:1, btn:1}
+};
+
+function evMatch(ev){
+  if (evFilter === "all") return true;
+  var g = EV_GROUPS[evFilter] || {};
+  return !!g[ev.kind || "info"];
+}
+
 function evItem(ev){
   var k = "k-" + (ev.kind || "info");
   var time = new Date(ev.ts*1000).toLocaleTimeString("zh-CN", {hour12:false});
@@ -2319,10 +2354,15 @@ function renderEvents(evts, total){
   if (evts && evts.length){ lastEvts = evts; lastEvTotal = total; }
   if (evExpanded) return;          /* 展开态由 toggleEvents 自己管，别盖 */
   if (!evts || !evts.length) return;
-  var h = evts.slice(0,40).map(evItem).join("");
+  var list = evts.filter(evMatch);
+  var h = list.length ? list.slice(0,40).map(evItem).join("")
+                      : '<div class="empty">该类型暂无事件</div>';
   var n = (total !== undefined && total !== null) ? total : evts.length;
   var label = (n > evts.length) ? ("最近 " + evts.length + " 条 / 共 " + n + " 条")
                                 : ("最近 " + n + " 条");
+  if (evFilter !== "all"){
+    label += " · 筛选后 " + list.length + " 条";
+  }
   if (h !== evHTML){
     evHTML = h;
     $("feed").innerHTML = h;
@@ -2336,9 +2376,25 @@ function renderEvents(evts, total){
 
 function setEvExpanded(on){
   evExpanded = on;
+  if (!on) evFullList = null;      /* 收起后丢掉全量缓存，下次展开重新取 */
   var b = $("evmore");
   if (b) b.textContent = on ? "只看最近" : "查看全部";
   if (!on && lastEvts){ evHTML = ""; renderEvents(lastEvts, lastEvTotal); }
+}
+
+/* 展开态（或收起态）换筛选时的重画。展开用全量缓存，收起用最近一帧 SSE。 */
+function refilterEvents(){
+  evHTML = "";
+  if (evExpanded && evFullList){
+    var list = evFullList.filter(evMatch);
+    evHTML = list.length ? list.map(evItem).join("")
+                         : '<div class="empty">该类型暂无事件</div>';
+    $("feed").innerHTML = evHTML;
+    $("evcount").textContent = "全部 " + evFullList.length + " 条"
+      + (evFilter !== "all" ? (" · 筛选后 " + list.length + " 条") : "");
+  } else if (lastEvts){
+    renderEvents(lastEvts, lastEvTotal);
+  }
 }
 
 function toggleEvents(){
@@ -2351,11 +2407,43 @@ function toggleEvents(){
       var evts = d.events || [];
       if (!evts.length){ $("evcount").textContent = "还没有事件"; return; }
       setEvExpanded(true);
-      evHTML = evts.map(evItem).join("");
-      $("feed").innerHTML = evHTML;
-      $("evcount").textContent = "全部 " + evts.length + " 条";
+      evFullList = evts;
+      evHTML = "";                 /* 强制重画（筛选可能挡掉一部分） */
+      refilterEvents();
     })
     .catch(function(){ $("evcount").textContent = "取事件失败"; });
+}
+
+/* 事件导出 CSV：课上复盘要把"那一节课发生了什么"带走时，
+   复制粘贴 200 条 HTML 不现实。导出的是**当前筛选下**的集合 ——
+   展开态导全量 200 条，收起态导最近一帧（与屏幕上看到的一致）。 */
+function csvCell(s){
+  return '"' + String(s === null || s === undefined ? "" : s).replace(/"/g, '""') + '"';
+}
+function exportEventsCsv(){
+  var src = (evExpanded && evFullList) ? evFullList : (lastEvts || []);
+  var list = src.filter(evMatch);
+  if (!list.length){
+    $("evcount").textContent = "没有可导出的事件";
+    return;
+  }
+  var pad = function(n){ return (n < 10 ? "0" : "") + n; };
+  var rows = ["time,kind,text"];
+  list.forEach(function(ev){
+    var d = new Date(ev.ts * 1000);
+    var ts = d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate())
+           + " " + pad(d.getHours()) + ":" + pad(d.getMinutes()) + ":" + pad(d.getSeconds());
+    rows.push(csvCell(ts) + "," + csvCell(ev.kind || "info") + "," + csvCell(ev.text || ""));
+  });
+  /* BOM 不能省：Windows 的 Excel 按 ANSI 猜无 BOM 的 CSV，中文必乱码。
+     写成 \ufeff 转义而不是字面字符 —— 字面 BOM 不可见，编辑器可能把它剥掉。 */
+  var blob = new Blob(["\ufeff" + rows.join("\r\n")], {type: "text/csv;charset=utf-8"});
+  var a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "rw1-events.csv";
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(function(){ URL.revokeObjectURL(a.href); a.remove(); }, 0);
 }
 
 /* ---------------- 设备列表（多板） ----------------
@@ -2969,6 +3057,9 @@ if ($("theme")) $("theme").onclick = function(){
    单独绑、不放进上面那个 fetch 回调里 —— 它不依赖 /api/commands 的结果，
    放进去只会平白多一条"拿不到命令名就连按钮都点不动"的耦合。 */
 if ($("evmore")) $("evmore").onclick = toggleEvents;
+/* 事件类型筛选：纯前端，切换时按当前视图（收起=最近一帧 SSE / 展开=全量缓存）重画 */
+if ($("evfilter")) $("evfilter").onchange = function(){ evFilter = this.value; refilterEvents(); };
+if ($("evcsv")) $("evcsv").onclick = exportEventsCsv;
 fitCanvas();
 fetch("/api/logs").then(function(r){ return r.json(); }).then(function(l){
   if (l && l.dir) $("logdir").textContent = "落盘 " + l.dir;
