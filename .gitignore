@@ -55,6 +55,8 @@ Desktop.ini
 
 # 临时产物（探针日志、合成的树、一次性验证脚本）
 /_local_tmp/
+# 本地密钥（RW1_LLM_API_KEY 等）：server.py 的 _load_dotenv 只读它，绝不入库
+/.env
 # >>> multi-agent-collab:private >>>
 /.multi-agent-collab/
 # <<< multi-agent-collab:private <<<

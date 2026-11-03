@@ -96,12 +96,14 @@ static const char *TAG = "transport";
 #define CAPTURE_N 20
 #define CAPTURE_TIMEOUT_MS 2000
 
-/* Remote-command state. Only touched from the transport task, so no lock. */
+/* Remote-command state. Written by transport/upload tasks; fields are simple
+ * and readers use the ready/rid snapshot protocol (see build_body). */
 typedef struct {
     /* command being executed right now */
     char       id[TRANSPORT_CMD_ID_LEN];
     bool       running;
     uint8_t    state;          /* transport_cmd_state_t，给 UI 看（不随 ready 复位） */
+    uint8_t    kind;           /* cmd_kind_t：超时的判据要知道在跑的是不是采集类 */
     TickType_t started;
     int        n;
     float      sum[3];         /* Σx, Σy, Σz (screen frame) */
@@ -419,7 +421,9 @@ static bool json_bool(const cJSON *obj, const char *key, bool dflt)
  * （led_blink / led_set 这类没有测量值）。 */
 static void finish_command(bool ok, bool with_measurement, const char *err)
 {
-    s_cmd.ready = true;
+    /* ready 必须**最后**置位：采样循环在另一个任务里拿它当"结果字段已全部写好"
+     * 的信号（快照进 job → build_body）。原来它写在第一行，于是 ready=true 与
+     * xyz/std/err 就位之间有几微秒的窗口，那一帧上报可能带走半截结果。 */
     s_cmd.ok = ok;
     strlcpy(s_cmd.rid, s_cmd.id, sizeof(s_cmd.rid));
     s_cmd.rn = s_cmd.n;
@@ -441,8 +445,9 @@ static void finish_command(bool ok, bool with_measurement, const char *err)
         strlcpy(s_cmd.err, ok ? "" : (err ? err : "command failed"), sizeof(s_cmd.err));
     }
 
-    s_cmd.running = false;
     s_cmd.state = ok ? TRANSPORT_CMD_DONE : TRANSPORT_CMD_FAILED;
+    s_cmd.ready = true;          /* 见函数开头的注释：结果字段就位之后才许被看见 */
+    s_cmd.running = false;
     if (!ok) {
         led_feedback_play(LED_FB_ERROR);      /* 失败给一个能看见的物理信号 */
     }
@@ -644,6 +649,10 @@ static void run_command(cmd_kind_t kind, const char *id,
         ESP_LOGW(TAG, "cmd %s ignored: %s still running", id, s_cmd.id);
         return;
     }
+    /* 先记类型再置 running：check_capture_timeout（在另一个任务里跑）要靠它
+     * 区分"采集类 2 秒没凑够样本"与"慢指令本来就要几秒"（sd_format / 带换
+     * WiFi 的 set_config 都会超过 2 秒，不该被当成采集超时强判失败）。 */
+    s_cmd.kind = (uint8_t)kind;
 
     switch (kind) {
     case CMD_CAPTURE:
@@ -847,10 +856,13 @@ static void feed_capture(const float xyz[3])
     }
 }
 
-/* Give up on a capture that is not getting its samples (e.g. IMU went quiet). */
+/* Give up on a capture that is not getting its samples (e.g. IMU went quiet).
+ * **只对采集类指令生效**：sd_format / 带换 WiFi 的 set_config 正常就要跑几秒，
+ * 不区分类型的话它们会被这条超时抢先强判 "not enough samples" 失败，
+ * 而真正的结果随后才到 —— 服务端会先收到一个假失败（2026-11-03 通读发现）。 */
 static void check_capture_timeout(void)
 {
-    if (s_cmd.running &&
+    if (s_cmd.running && s_cmd.kind == CMD_CAPTURE &&
         pdTICKS_TO_MS(xTaskGetTickCount() - s_cmd.started) > CAPTURE_TIMEOUT_MS) {
         finish_command(false, true, "not enough samples");
     }
@@ -908,7 +920,8 @@ static bool sanitize3(float x, float y, float z, float out[3])
  * with 15 significant digits, so a float 0.012f comes out as
  * "0.0120000001634057" and a 50-sample batch balloons to ~2.7 kB. "%.3f" gives
  * exactly the precision the analysis needs (1 mg) in a third of the bytes. */
-static char *build_body(const tx_job_t *job, const char *source, const char *device)
+static char *build_body(const tx_job_t *job, const char *source, const char *device,
+                        const char *ask_text)
 {
     const int n = (int)job->n;
     if (n <= 0) {
@@ -917,7 +930,7 @@ static char *build_body(const tx_job_t *job, const char *source, const char *dev
     if (device == NULL) {
         device = "";
     }
-    size_t cap = 256 + (size_t)n * 28 + strlen(s_ask_text) * 2 + 64
+    size_t cap = 256 + (size_t)n * 28 + strlen(ask_text) * 2 + 64
                  + (job->had_result ? (320 + CMD_NOTE_LEN + 24) : 0) + 32
                  + strlen(device) * 6 + 24;   /* "dev" 字段：设备名是用户输入，转义后可能翻倍 */
     char *buf = malloc(cap);
@@ -973,7 +986,7 @@ static char *build_body(const tx_job_t *job, const char *source, const char *dev
             return NULL;
         }
         off += snprintf(buf + off, cap - (size_t)off, ",\"q\":\"");
-        if (!json_escape_append(buf, cap, &off, s_ask_text)) {
+        if (!json_escape_append(buf, cap, &off, ask_text)) {
             free(buf);
             return NULL;
         }
@@ -1222,22 +1235,25 @@ static esp_err_t http_event_handler(esp_http_client_event_t *evt)
 
 static bool post_batch(const tx_job_t *job)
 {
-    /* 三个字段一次锁内拷完：url / 原始设备名 / source 都可能被别的任务改
+    /* 四个字段一次锁内拷完：url / 原始设备名 / source / 问句都可能被别的任务改
      * （见 copy_url 上面那段注释）。拷出来的副本在本函数里不再变化，
      * 之后的 build_body 也就没有"读到半截"的可能了。 */
     char base[NET_URL_MAX];
     char device[NET_DEV_MAX];
     char source[16];
+    char ask[sizeof(s_ask_text)];   /* 问句也走"锁内拷一份"：按钮任务在锁内写它，
+                                       这边不拷的话可能读到半新半旧的问句 */
     status_lock();
     strlcpy(base, s_url, sizeof(base));
     strlcpy(device, s_device, sizeof(device));
     strlcpy(source, s_st.source, sizeof(source));
+    strlcpy(ask, s_ask_text, sizeof(ask));
     status_unlock();
 
     char url[NET_URL_MAX + 16];
     snprintf(url, sizeof(url), "%s%s", base, TX_PATH);
 
-    char *body = build_body(job, source, device);
+    char *body = build_body(job, source, device, ask);
     if (body == NULL) {
         ESP_LOGE(TAG, "out of memory building telemetry body");
         return false;

@@ -37,6 +37,9 @@ const logs = [];
 function start(args, tag, extraEnv) {
   const env = Object.assign({}, process.env, {
     no_proxy: '127.0.0.1,localhost', NO_PROXY: '127.0.0.1,localhost',
+    // 门禁必须是封闭环境：仓库根目录 .env 里的真实 LLM key 被子进程静默加载的话，
+    // 「提问」断言会去打真实模型（慢、不稳定）。显式置空 = 本实例走本地规则 AI。
+    RW1_LLM_API_KEY: '',
   }, extraEnv || {});
   /* 把子进程输出落盘：失败时能一眼看出是"服务端没起来"还是"产品 bug"，
      而不是对着一个空日志猜。 */
@@ -302,6 +305,27 @@ async function step(name, fn) {
     if (found.params.o !== 3) {
       throw new Error('服务端把 o 丢了：' + JSON.stringify(found.params));
     }
+  });
+
+  await step('事件筛选：切到「指令」只剩 cmd 类且确有内容，切回全部恢复', async () => {
+    /* 到这一步页面已经下发过 led_blink / set_orient —— 「指令」类必然非空，
+       所以这条不会退化成"空态也算过"的摆设断言。 */
+    await page.waitForSelector('#feed .item', { timeout: 20000 });
+    await page.selectOption('#evfilter', 'cmd');
+    await sleep(600);                      // 等一次 SSE 重绘（500ms 一帧）
+    const r = await page.evaluate(() => {
+      const dots = Array.from(document.querySelectorAll('#feed .item .k'));
+      return {
+        n: dots.length,
+        bad: dots.filter(el => el.className.indexOf('k-cmd') < 0).length,
+      };
+    });
+    if (r.n < 1) throw new Error('筛选「指令」后一条都没有（前面明明下发过）');
+    if (r.bad) throw new Error('筛选「指令」后仍混着 ' + r.bad + ' 条其它类型');
+    await page.selectOption('#evfilter', 'all');
+    await sleep(600);
+    const all = await page.locator('#feed .item').count();
+    if (all < r.n) throw new Error('切回全部后反而变少: ' + r.n + ' -> ' + all);
   });
 
   await step('设置面板存在，且空着不发', async () => {

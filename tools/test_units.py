@@ -25,6 +25,8 @@ import math
 import os
 import sys
 import unittest
+import unittest.mock
+import urllib.error
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _SERVER_PY = os.path.join(os.path.dirname(_HERE), "server", "server.py")
@@ -39,6 +41,9 @@ def _load_server():
 
 
 srv = _load_server()
+# 单测默认与真实 .env 隔离：仓库根目录可能真的有开发者配的 LLM key，
+# 不许它渗进断言（TestDotenvAndRetry 会自己显式切换这个开关）。
+srv._DOTENV_LOADED = True
 # 分类函数住在 `server/analysis.py`（2026-11-01 从 server.py 拆出）。
 # 这里**直接拿那个模块对象**，而不是 `import analysis` 再加载一遍 ——
 # server.py 在 import 时已经把它装进 sys.modules 了，所以
@@ -713,6 +718,204 @@ class TestRuleAiReplyEventKind(unittest.TestCase):
         self.assertNotIn("warn", kinds, "规则 AI 的正常回复不该记成 warn: %s" % kinds)
         text = next(e["text"] for e in dev.events if e["kind"] == "info")
         self.assertIn("规则AI回复", text, "实际: %s" % text)
+
+
+class TestLlmExtractText(unittest.TestCase):
+    """OpenAI 兼容响应的取正文：标准结构之外的变体要能容忍。
+
+    实测（2026-11-03，qwen3.8-27b @ new-api 网关）：标准 choices[0].message.content，
+    另带 reasoning_content（思考草稿，**不许**冒充正文）。
+    """
+
+    def test_standard_message_content(self):
+        data = {"choices": [{"message": {"role": "assistant", "content": "\n\n2"},
+                               "finish_reason": "stop"}]}
+        self.assertEqual(srv._llm_extract_text(data), "2")
+
+    def test_reasoning_content_is_not_used_as_answer(self):
+        """content 为空时宁缺毋滥：reasoning_content 是草稿，不是给用户看的。"""
+        data = {"choices": [{"message": {"role": "assistant", "content": "",
+                                         "reasoning_content": "想了一堆"}}]}
+        self.assertIsNone(srv._llm_extract_text(data))
+
+    def test_legacy_text_variant(self):
+        data = {"choices": [{"text": " 答案 "}]}
+        self.assertEqual(srv._llm_extract_text(data), "答案")
+
+    def test_top_level_variants(self):
+        for key in ("content", "reply", "text", "output", "answer"):
+            self.assertEqual(srv._llm_extract_text({key: " hi "}), "hi", key)
+
+    def test_garbage_returns_none(self):
+        for bad in ({}, {"choices": []}, {"choices": [{}]}, "not a dict",
+                    {"choices": [{"message": {}}]}, None):
+            self.assertIsNone(srv._llm_extract_text(bad), repr(bad))
+
+
+class TestLlmErrorText(unittest.TestCase):
+    """失败原因必须翻成可读的一句中文（且不泄露密钥）。"""
+
+    def _http_error(self, code):
+        import io
+        return urllib.error.HTTPError("http://x", code, "x", {}, io.BytesIO(b""))
+
+    def test_http_categories(self):
+        self.assertIn("401", srv._llm_error_text(self._http_error(401)))
+        self.assertIn("403", srv._llm_error_text(self._http_error(403)))
+        self.assertIn("404", srv._llm_error_text(self._http_error(404)))
+        self.assertIn("429", srv._llm_error_text(self._http_error(429)))
+        self.assertIn("503", srv._llm_error_text(self._http_error(503)))
+
+    def test_timeout_and_dns(self):
+        self.assertEqual(srv._llm_error_text(TimeoutError()), "请求超时")
+        e = OSError("[Errno 11001] getaddrinfo failed")
+        self.assertEqual(srv._llm_error_text(e), "DNS 解析失败")
+
+    def test_connection_falls_back(self):
+        self.assertEqual(srv._llm_error_text(ConnectionResetError()), "连接失败")
+
+
+class TestDotenvAndRetry(unittest.TestCase):
+    """.env 加载纪律 + ask_llm 的重试与降级。"""
+
+    def test_dotenv_only_fills_missing_rw1(self):
+        import tempfile
+        d = tempfile.mkdtemp()
+        env_path = os.path.join(d, ".env")
+        with open(env_path, "w", encoding="utf-8") as fh:
+            fh.write("RW1_TEST_ABC=from_env\nOTHER_X=no\nRW1_TEST_ABC2= \"q\" \n# 注释\n")
+        old_loaded = srv._DOTENV_LOADED
+        srv._DOTENV_LOADED = False
+        try:
+            os.environ.pop("RW1_TEST_ABC", None)
+            os.environ.pop("RW1_TEST_ABC2", None)
+            with unittest.mock.patch.object(srv.os.path, "join",
+                                            return_value=env_path):
+                srv._load_dotenv()
+            self.assertEqual(os.environ.get("RW1_TEST_ABC"), "from_env")
+            self.assertEqual(os.environ.get("RW1_TEST_ABC2"), "q")
+            self.assertNotIn("OTHER_X", os.environ)
+            # 已存在的值不被覆盖
+            os.environ["RW1_TEST_ABC"] = "keep"
+            srv._DOTENV_LOADED = False
+            with unittest.mock.patch.object(srv.os.path, "join",
+                                            return_value=env_path):
+                srv._load_dotenv()
+            self.assertEqual(os.environ["RW1_TEST_ABC"], "keep")
+        finally:
+            srv._DOTENV_LOADED = old_loaded
+            os.environ.pop("RW1_TEST_ABC", None)
+            os.environ.pop("RW1_TEST_ABC2", None)
+
+    def test_retry_then_success(self):
+        """前两次失败（连接层瞬时故障）、第三次成功 → 必须返回正文。"""
+        calls = {"n": 0}
+
+        class FakeResp:
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+            def read(self):
+                return b'{"choices":[{"message":{"content":" ok "}}]}'
+
+        def fake_urlopen(req, timeout=None):
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise ConnectionResetError("flaky")
+            return FakeResp()
+
+        envs = {"RW1_LLM_API_KEY": "k", "RW1_LLM_BASE_URL": "http://x",
+                "RW1_LLM_MODEL": "m", "RW1_LLM_RETRIES": "2"}
+        with unittest.mock.patch.dict(os.environ, envs), \
+             unittest.mock.patch.object(srv.urllib.request, "urlopen", fake_urlopen), \
+             unittest.mock.patch.object(srv.time, "sleep", lambda s: None):
+            srv._DOTENV_LOADED = True          # 别让真 .env 干扰这条用例
+            dev = srv.Device("unit-retry")
+            out = srv.ask_llm(dev, "问")
+        self.assertEqual(out, "ok")
+        self.assertEqual(calls["n"], 3)
+
+    def test_http401_no_retry_and_readable_warn(self):
+        """401 是配置错误：不许重试，事件流要给可读原因。"""
+        import io
+        calls = {"n": 0}
+
+        def fake_urlopen(req, timeout=None):
+            calls["n"] += 1
+            raise urllib.error.HTTPError("http://x", 401, "x", {}, io.BytesIO(b""))
+
+        envs = {"RW1_LLM_API_KEY": "bad", "RW1_LLM_BASE_URL": "http://x",
+                "RW1_LLM_MODEL": "m", "RW1_LLM_RETRIES": "2"}
+        with unittest.mock.patch.dict(os.environ, envs), \
+             unittest.mock.patch.object(srv.urllib.request, "urlopen", fake_urlopen), \
+             unittest.mock.patch.object(srv.time, "sleep", lambda s: None):
+            srv._DOTENV_LOADED = True
+            dev = srv.Device("unit-401")
+            out = srv.ask_llm(dev, "问")
+        self.assertIsNone(out)
+        self.assertEqual(calls["n"], 1, "401 重试了 %d 次" % (calls["n"] - 1))
+        warns = [e["text"] for e in dev.events if e["kind"] == "warn"]
+        self.assertTrue(any("401" in w and "本地AI" in w for w in warns),
+                        "实际事件: %s" % warns)
+
+    def test_http429_is_retried(self):
+        import io
+        calls = {"n": 0}
+
+        def fake_urlopen(req, timeout=None):
+            calls["n"] += 1
+            raise urllib.error.HTTPError("http://x", 429, "x", {}, io.BytesIO(b""))
+
+        envs = {"RW1_LLM_API_KEY": "k", "RW1_LLM_BASE_URL": "http://x",
+                "RW1_LLM_MODEL": "m", "RW1_LLM_RETRIES": "2"}
+        with unittest.mock.patch.dict(os.environ, envs), \
+             unittest.mock.patch.object(srv.urllib.request, "urlopen", fake_urlopen), \
+             unittest.mock.patch.object(srv.time, "sleep", lambda s: None):
+            srv._DOTENV_LOADED = True
+            dev = srv.Device("unit-429")
+            srv.ask_llm(dev, "问")
+        self.assertEqual(calls["n"], 3)
+
+    def test_board_timeout_param_reaches_urlopen(self):
+        """板端提问的收紧上限（LLM_BOARD_TIMEOUT）必须真的传到 urlopen，
+        超时时回退 None 并给出「请求超时」的可读原因。"""
+        seen = {"timeout": None}
+
+        def fake_urlopen(req, timeout=None):
+            seen["timeout"] = timeout
+            raise TimeoutError("timed out")
+
+        envs = {"RW1_LLM_API_KEY": "k", "RW1_LLM_BASE_URL": "http://x",
+                "RW1_LLM_MODEL": "m", "RW1_LLM_RETRIES": "0"}
+        with unittest.mock.patch.dict(os.environ, envs), \
+             unittest.mock.patch.object(srv.urllib.request, "urlopen", fake_urlopen):
+            srv._DOTENV_LOADED = True
+            dev = srv.Device("unit-bto")
+            out = srv.ask_llm(dev, "问", timeout=srv.LLM_BOARD_TIMEOUT)
+        self.assertIsNone(out)
+        self.assertEqual(seen["timeout"], srv.LLM_BOARD_TIMEOUT,
+                         "板端上限没传到 urlopen: %s" % seen["timeout"])
+        warns = [e["text"] for e in dev.events if e["kind"] == "warn"]
+        self.assertTrue(any("请求超时" in w for w in warns), "实际事件: %s" % warns)
+
+    def test_default_timeout_unchanged_without_param(self):
+        """不传 timeout 时仍用全局 LLM_TIMEOUT（网页提问路径）。"""
+        seen = {"timeout": None}
+
+        def fake_urlopen(req, timeout=None):
+            seen["timeout"] = timeout
+            raise TimeoutError("timed out")
+
+        envs = {"RW1_LLM_API_KEY": "k", "RW1_LLM_BASE_URL": "http://x",
+                "RW1_LLM_MODEL": "m", "RW1_LLM_RETRIES": "0"}
+        with unittest.mock.patch.dict(os.environ, envs), \
+             unittest.mock.patch.object(srv.urllib.request, "urlopen", fake_urlopen):
+            srv._DOTENV_LOADED = True
+            dev = srv.Device("unit-defto")
+            srv.ask_llm(dev, "问")
+        self.assertEqual(seen["timeout"], float(envs.get("RW1_LLM_TIMEOUT",
+                                                          srv.LLM_TIMEOUT)))
 
 
 if __name__ == "__main__":

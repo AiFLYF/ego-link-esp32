@@ -45,6 +45,8 @@ const logs = [];
 function start(args, tag) {
   const env = Object.assign({}, process.env, {
     no_proxy: '127.0.0.1,localhost', NO_PROXY: '127.0.0.1,localhost',
+    // 与 e2e_dashboard 同一道门禁隔离：.env 里的真实 LLM key 不许进测试子进程。
+    RW1_LLM_API_KEY: '',
   });
   const fs = require('fs');
   const logPath = path.join(SHOT_DIR, 'design-' + tag + '.log');
