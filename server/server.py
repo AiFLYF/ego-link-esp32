@@ -86,6 +86,10 @@ MAX_WINDOW = int(WINDOW_S / 0.008) + 64      # = 1064
 
 DEVICE_TIMEOUT = 5.0      # 超过该秒数没有新遥测则视为离线
 LLM_TIMEOUT = 25.0        # 大模型请求超时（后台线程里等，不影响板端）
+# 板端提问（BOOT 单击/语音）单独收紧的等待上限：实测带 reasoning 的模型
+# 正文要等 10s+，板端孩子等不了那么久 —— 超时回退本地规则 AI 并在事件流
+# 注明「请求超时」，网页提问仍走 LLM_TIMEOUT（人坐在屏幕前，等得起）。
+LLM_BOARD_TIMEOUT = float(os.environ.get("RW1_LLM_BOARD_TIMEOUT", "10"))
 # 出站请求的 User-Agent。**不能留 urllib 默认值**（Python-urllib/x.y）：
 # 实测（2026-11-03）上游的 Cloudflare 按浏览器签名封禁，默认 UA 直接吃
 # HTTP 403 "error code: 1010"，换成任何显式 UA 立刻 200。服务端自己的
@@ -975,18 +979,23 @@ def transcribe(audio_bytes):
         return None, "本地识别失败(%s)" % exc.__class__.__name__
 
 
-def ask_llm(dev, question):
+def ask_llm(dev, question, timeout=None):
     """可选：调用 OpenAI 兼容大模型。未配置/失败返回 None → 回退本地模板。
 
     第 4 周「澄清」：带上该设备最近的对话历史，这样"再详细点""那刚才呢"
     这类追问能被理解。历史**按设备隔离**（课堂 20 块板共用一台服务器），
     而且只放问答文本 —— 每轮都重塞一遍遥测摘要既费 token 又会把
     上下文淹没在重复内容里。
+
+    `timeout`：本次请求的等待上限（秒）；不传用全局 LLM_TIMEOUT。
+    板端入口传 LLM_BOARD_TIMEOUT —— 理由见该常量的注释。
     """
     _load_dotenv()
     cfg = _llm_cfg()
     if cfg is None:
         return None
+    if timeout is not None:
+        cfg["timeout"] = timeout
     with LOCK:
         history = list(dev.chat)
     # ai_summary() 内部要取 LOCK，必须在 with LOCK 之外调用（否则自锁）
@@ -1141,7 +1150,7 @@ def _load_dotenv():
         pass
 
 
-def _llm_worker(dev, question, token):
+def _llm_worker(dev, question, token, timeout=None):
     """后台线程：调大模型，完成后把结果写回该设备的状态。
 
     注意 ai_summary() 内部会取 LOCK，必须在进入 with LOCK 之前调用，否则自锁。
@@ -1155,7 +1164,7 @@ def _llm_worker(dev, question, token):
     reply = None
     if _LLM_SEM.acquire(timeout=LLM_QUEUE_TIMEOUT):
         try:
-            reply = ask_llm(dev, question)
+            reply = ask_llm(dev, question, timeout=timeout)
         finally:
             _LLM_SEM.release()
     else:
@@ -1371,7 +1380,7 @@ def run_intent(dev, question, intent):
     return spoken
 
 
-def request_ai(dev, question):
+def request_ai(dev, question, llm_timeout=None):
     """处理一次板端提问，**立即**返回文本；大模型在后台生成，稍后自动生效。
 
     板端每个遥测周期都会带回最新的 ai_reply，所以后台结果下一帧就会显示，
@@ -1403,7 +1412,8 @@ def request_ai(dev, question):
             dev.st["ai_t0"] = time.time()    # 计时：生成从这一刻算起
             dev.st["ai_ms"] = 0
         push_event(dev, "ask", "板端提问「%s」→ 已转交大模型" % question)
-        threading.Thread(target=_llm_worker, args=(dev, question, token), daemon=True,
+        threading.Thread(target=_llm_worker, args=(dev, question, token, llm_timeout),
+                         daemon=True,
                          name="llm").start()
         return "正在思考…"
 
@@ -1496,7 +1506,8 @@ def _voice_worker(dev, data, saved, turn=None):
         dev.st["voice_err"] = ""
         dev.st["voice_state"] = "thinking"
     push_event(dev, "ask", "识别到「%s」%s" % (text, ("（%s）" % saved) if saved else ""))
-    request_ai(dev, text)
+    # 板端语音提问：孩子等不了 reasoning 模型的 10s+，用收紧的上限（见该常量注释）
+    request_ai(dev, text, llm_timeout=LLM_BOARD_TIMEOUT)
     # 规则 AI 是同步返回的，这会儿已经出结果了；大模型还要等后台线程，
     # 那种情况下 voice_state 留在 "thinking"，等 _llm_worker 收尾时自然回落。
     with LOCK:
@@ -2346,7 +2357,8 @@ class Handler(BaseHTTPRequestHandler):
         reply = ""
         if msg.get("ask"):                  # 板子 BOOT 键 → 请求一次 AI 交互
             question = str(msg.get("q", "我现在的状态怎么样？"))[:200]
-            reply = request_ai(dev, question)   # 立刻返回；大模型走后台线程
+            # 板端按键提问：收紧等待上限（见 LLM_BOARD_TIMEOUT 的注释）
+            reply = request_ai(dev, question, llm_timeout=LLM_BOARD_TIMEOUT)
 
         with LOCK:
             final_reply = reply or dev.st["ai_reply"]

@@ -896,9 +896,21 @@ set RW1_LLM_MODEL=qwen-turbo
 python server\server.py
 ```
 
+也可以复制 `.env.example` 为 `.env` 填好（`.env` 已在 `.gitignore`，密钥不入库；
+提问路径用到时自动读取，已存在的环境变量优先）。全部可配键见 `.env.example` 注释：
+`RW1_LLM_API_KEY` / `RW1_LLM_BASE_URL` / `RW1_LLM_MODEL` / `RW1_LLM_TIMEOUT`（默认 25s）/
+`RW1_LLM_BOARD_TIMEOUT`（板端提问收紧上限，默认 10s）/ `RW1_LLM_RETRIES`（默认 2）。
+
 大模型调用跑在后台线程里，HTTP 响应立刻返回，所以模型再慢也不会让板端超时。
 多个请求并发时有上限（默认 4 个在飞，`RW1_LLM_MAX_CONCURRENT` 可调），
-排太久会明说并回退本地 AI，不会全班一起干等。
+排太久会明说并回退本地 AI，不会全班一起干等。失败自动重试并给出可读中文原因
+（密钥被拒 / 限流 / 超时 / 上游服务错误 / DNS 解析失败…），任何失败都回退本地规则 AI。
+
+> **已踩过的坑（勿删 UA 请求头）**：部分上游网关（Cloudflare 前置的 new-api 等）
+> 按 User-Agent 签名封禁 Python urllib 的默认 UA，直接回 HTTP 403 `error code: 1010`，
+> 而同 key 用 curl 却正常。服务端所有出站请求（大模型 / 云端 ASR）统一携带显式
+> UA `RW1/1.1`（常量 `LLM_USER_AGENT`），把这个头删掉会立刻复现 403。
+> 排查入口：事件流里的 warn 会写明原因类别。
 
 ### 可选：访问密钥（课堂防误触）
 

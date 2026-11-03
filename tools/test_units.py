@@ -877,6 +877,46 @@ class TestDotenvAndRetry(unittest.TestCase):
             srv.ask_llm(dev, "问")
         self.assertEqual(calls["n"], 3)
 
+    def test_board_timeout_param_reaches_urlopen(self):
+        """板端提问的收紧上限（LLM_BOARD_TIMEOUT）必须真的传到 urlopen，
+        超时时回退 None 并给出「请求超时」的可读原因。"""
+        seen = {"timeout": None}
+
+        def fake_urlopen(req, timeout=None):
+            seen["timeout"] = timeout
+            raise TimeoutError("timed out")
+
+        envs = {"RW1_LLM_API_KEY": "k", "RW1_LLM_BASE_URL": "http://x",
+                "RW1_LLM_MODEL": "m", "RW1_LLM_RETRIES": "0"}
+        with unittest.mock.patch.dict(os.environ, envs), \
+             unittest.mock.patch.object(srv.urllib.request, "urlopen", fake_urlopen):
+            srv._DOTENV_LOADED = True
+            dev = srv.Device("unit-bto")
+            out = srv.ask_llm(dev, "问", timeout=srv.LLM_BOARD_TIMEOUT)
+        self.assertIsNone(out)
+        self.assertEqual(seen["timeout"], srv.LLM_BOARD_TIMEOUT,
+                         "板端上限没传到 urlopen: %s" % seen["timeout"])
+        warns = [e["text"] for e in dev.events if e["kind"] == "warn"]
+        self.assertTrue(any("请求超时" in w for w in warns), "实际事件: %s" % warns)
+
+    def test_default_timeout_unchanged_without_param(self):
+        """不传 timeout 时仍用全局 LLM_TIMEOUT（网页提问路径）。"""
+        seen = {"timeout": None}
+
+        def fake_urlopen(req, timeout=None):
+            seen["timeout"] = timeout
+            raise TimeoutError("timed out")
+
+        envs = {"RW1_LLM_API_KEY": "k", "RW1_LLM_BASE_URL": "http://x",
+                "RW1_LLM_MODEL": "m", "RW1_LLM_RETRIES": "0"}
+        with unittest.mock.patch.dict(os.environ, envs), \
+             unittest.mock.patch.object(srv.urllib.request, "urlopen", fake_urlopen):
+            srv._DOTENV_LOADED = True
+            dev = srv.Device("unit-defto")
+            srv.ask_llm(dev, "问")
+        self.assertEqual(seen["timeout"], float(envs.get("RW1_LLM_TIMEOUT",
+                                                          srv.LLM_TIMEOUT)))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
