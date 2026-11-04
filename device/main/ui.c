@@ -263,6 +263,8 @@ static char     s_last_reply[TRANSPORT_REPLY_LEN];
 static char     s_last_activity[TRANSPORT_ACTIVITY_LEN];
 static char     s_last_detail[32];          /* 细节行上次的文本（含本地算的倾斜方向） */
 static bool     s_last_pending;
+static uint8_t  s_last_ai_state;
+static char     s_last_ai_note[TRANSPORT_AI_NOTE_LEN];
 static int      s_last_abs = -1;
 static int      s_last_axis[3] = {UI_NONE, UI_NONE, UI_NONE};
 static int      s_last_badge = -1;
@@ -1052,32 +1054,52 @@ static void ui_timer_cb(lv_timer_t *timer)
         }
     }
 
-    /* ---------- AI 回复：新内容就重排分页，否则每 4 秒翻一页 ---------- */
-    if (strcmp(st.reply, s_last_reply) != 0 || st.ai_pending != s_last_pending) {
+    /* ---------- AI 回复：新内容就重排分页，否则每 4 秒翻一页 ----------
+     * 显示优先级：FAILED（显示原因，红色）> 正文（琥珀）> 引导语（灰）。
+     * `ai_state` 是**成败**的权威来源；`ai_pending` 只表示服务端还在生成。
+     * 失败时绝不保留上一句旧回答 —— 那条要求来自"屏幕停在旧话上"的真实投诉。 */
+    if (strcmp(st.reply, s_last_reply) != 0 || st.ai_pending != s_last_pending ||
+        st.ai_state != s_last_ai_state || strcmp(st.ai_note, s_last_ai_note) != 0) {
         strlcpy(s_last_reply, st.reply, sizeof(s_last_reply));
         s_last_pending = st.ai_pending;
+        s_last_ai_state = st.ai_state;
+        strlcpy(s_last_ai_note, st.ai_note, sizeof(s_last_ai_note));
         s_page = 0;
         s_page_tick = 0;
 
-        bool has_reply = st.reply[0] != '\0';
-        const char *text = has_reply ? st.reply : "单击 BOOT 提问 · 三击说话";
+        bool failed = (st.ai_state == TRANSPORT_AI_FAILED && st.ai_note[0] != '\0');
+        bool has_reply = (st.ai_state == TRANSPORT_AI_OK && st.reply[0] != '\0');
+        const char *text;
+        uint32_t reply_c;
+        if (failed) {
+            text = st.ai_note;
+            reply_c = UI_C_RED;
+        } else if (has_reply) {
+            text = st.reply;
+            reply_c = UI_C_AMBER;
+        } else if (st.ai_state == TRANSPORT_AI_PENDING) {
+            text = st.ai_note[0] != '\0' ? st.ai_note : "正在思考…";
+            reply_c = UI_C_DIM;
+        } else {
+            text = "单击 BOOT 提问 · 三击说话";
+            reply_c = UI_C_FAINT;
+        }
         char pagebuf[128];
         s_page_total = reply_page(text, 0, pagebuf, sizeof(pagebuf));
         lv_label_set_text(s_lbl_reply, pagebuf);
-        /* 生成中压暗；空引导语用弱化灰，只有真正的 AI 回复才用琥珀色 */
-        uint32_t reply_c = st.ai_pending ? UI_C_DIM : has_reply ? UI_C_AMBER : UI_C_FAINT;
         lv_obj_set_style_text_color(s_lbl_reply, lv_color_hex(reply_c), 0);
 
-        uint32_t accent = st.ai_pending ? UI_C_AMBER : (has_reply ? UI_C_AMBER : UI_C_BLUE);
+        bool spinning = (st.ai_state == TRANSPORT_AI_PENDING);
+        uint32_t accent = failed ? UI_C_RED : (has_reply || spinning) ? UI_C_AMBER : UI_C_BLUE;
         if (s_ai_stripe != NULL) {
             lv_obj_set_style_bg_color(s_ai_stripe, lv_color_hex(accent), 0);
             lv_obj_set_style_bg_color(s_ai_tag, lv_color_hex(accent), 0);
             lv_obj_set_style_text_color(s_ai_tag_lbl, lv_color_hex(accent), 0);
         }
 
-        lv_obj_set_hidden(s_spinner, !st.ai_pending);
-        refresh_pager(0, s_page_total, st.ai_pending);
-    } else if (!st.ai_pending && s_page_total > 1) {
+        lv_obj_set_hidden(s_spinner, !spinning);
+        refresh_pager(0, s_page_total, spinning);
+    } else if (!s_last_pending && s_last_ai_state == TRANSPORT_AI_OK && s_page_total > 1) {
         if (++s_page_tick >= UI_PAGE_TICKS) {
             s_page_tick = 0;
             s_page = (s_page + 1) % s_page_total;

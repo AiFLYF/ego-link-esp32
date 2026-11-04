@@ -867,6 +867,44 @@ dialog.modal[open]::backdrop{animation:modal-veil var(--dur-2) var(--ease-out)}
 .modal-body p{font-size:var(--fs-body);color:var(--color-text-muted)}
 .modal-foot{display:flex;justify-content:flex-end;gap:var(--sp-3);padding:0 var(--sp-8) var(--sp-8)}
 
+/* ---- 文件管理（2026-11-04） ---------------------------------------------
+   行内允许任意断行：中文/长英文文件名在 320px 下都不许把页面撑宽。
+   字号/圆角/颜色全部沿用既有令牌，没有新的散值。 */
+#filelist .frow{
+  display:flex;align-items:center;gap:var(--sp-2);flex-wrap:wrap;
+  padding:var(--sp-3) 0;border-bottom:1px solid var(--color-line);
+}
+#filelist .frow:last-child{border-bottom:0}
+#filelist .fname{
+  flex:1 1 160px;min-width:0;
+  font:400 var(--fs-meta)/1.5 var(--font-mono);color:var(--color-text);
+  overflow-wrap:anywhere;
+}
+#filelist .fmeta{
+  font:400 var(--fs-micro)/1.4 var(--font-mono);
+  color:var(--color-text-faint);white-space:nowrap;
+}
+/* 批量操作（2026-11-04）：勾选框沿用设备列表那一套（15px + accent-color），
+   「全选」标签做成整块可点，移动端不用去戳 15px 的小方块。 */
+#filelist .fchk{
+  accent-color:var(--color-action-primary);width:15px;height:15px;
+  flex:0 0 auto;cursor:pointer;
+}
+#fileacts label{
+  display:inline-flex;align-items:center;gap:var(--sp-2);
+  font:400 var(--fs-meta)/1 var(--font-mono);color:var(--color-text-muted);
+  cursor:pointer;user-select:none;
+}
+/* 预览弹窗比确认框宽：日志一行可能有一两百个字符，448px 里读不动 */
+dialog.modal#fprevd{width:min(720px,calc(100vw - 32px))}
+#fprevtext{
+  margin:0;max-height:min(56vh,420px);overflow:auto;
+  padding:var(--sp-3);border:1px solid var(--color-line);
+  border-radius:var(--radius-control);background:var(--color-surface-2);
+  font:400 var(--fs-meta)/1.6 var(--font-mono);color:var(--color-text);
+  white-space:pre-wrap;overflow-wrap:anywhere;
+}
+
 /* ==========================================================================
    响应式：窄屏优先保证"读得到、点得到"，不追求信息量
    ========================================================================== */
@@ -1224,6 +1262,37 @@ dialog.modal[open]::backdrop{animation:modal-veil var(--dur-2) var(--ease-out)}
         <div id="sdring" class="ringwrap"></div>
         <div class="list" id="sdfiles"></div>
       </div>
+
+      <div class="card" id="cardfiles">
+        <div class="card-head">
+          <h3><svg class="ico" viewBox="0 0 24 24" stroke-width="1.8" aria-hidden="true"><path d="M3 7.5V5.2a1 1 0 0 1 1-1h4.3l1.8 2H20a1 1 0 0 1 1 1v12.6a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1z"/><path d="M3 9h18"/></svg> 文件管理</h3>
+          <span class="src" id="fileswho">—</span>
+        </div>
+        <div class="formrow">
+          <div class="field">
+            <label for="filecat">分类</label>
+            <select id="filecat" title="照片/录音按设备分目录；日志是服务端数据目录里的 jsonl">
+              <option value="shots">照片</option>
+              <option value="audio">录音</option>
+              <option value="logs">日志</option>
+            </select>
+          </div>
+          <div class="field">
+            <label>上传到当前分类</label>
+            <div class="actions">
+              <button id="fileupbtn" class="sm" type="button">选择文件…</button>
+              <input id="fileup" type="file" hidden>
+            </div>
+          </div>
+        </div>
+        <div class="actions" id="fileacts">
+          <button id="filesrefresh" class="sm" type="button">刷新列表</button>
+          <label id="fileselwrap" hidden><input type="checkbox" id="fileselall"> 全选</label>
+          <button id="filedelsel" class="sm danger" type="button" hidden>删除所选</button>
+          <span id="fileshint" class="hint">预览只读前 256 KB（超出会标注已截断）· 删除不可恢复</span>
+        </div>
+        <div class="list" id="filelist"></div>
+      </div>
     </div>
   </section>
 </main>
@@ -1250,6 +1319,19 @@ dialog.modal[open]::backdrop{animation:modal-veil var(--dur-2) var(--ease-out)}
   <div class="modal-foot">
     <button id="cfm-cancel" type="button">取消</button>
     <button id="cfm-ok" type="button" class="danger">确定</button>
+  </div>
+</dialog>
+
+<dialog class="modal" id="fprevd">
+  <div class="modal-body">
+    <h3 id="fprevname">预览</h3>
+    <p class="hint" id="fprevinfo"></p>
+    <pre id="fprevtext"></pre>
+  </div>
+  <div class="modal-foot">
+    <button id="fprevcopy" type="button">复制全文</button>
+    <button id="fprevdl" type="button">下载</button>
+    <button id="fprevclose" type="button">关闭</button>
   </div>
 </dialog>
 
@@ -2046,6 +2128,254 @@ function renderShots(){
     .catch(function(){ finish(); });
 }
 
+/* ---- 文件管理（照片 / 录音 / 日志）------------------------------------
+   服务端只暴露这三个自有目录，文件名/设备名/分类都在服务端做白名单校验；
+   页面这边只负责拼 URL 和展示 —— 把"能不能删"的判断留在服务端，
+   免得改一行前端就绕过了。 */
+var fileCat = "shots";
+var filePreviewName = "";
+var fileSel = Object.create(null);   /* 批量删除的选中集：name -> true */
+var fileScope = "";                  /* 选中集所属的「分类|设备」；换了就清空，别跨设备误删 */
+var FILE_ACCEPT = {shots: ".jpg,.jpeg,.png", audio: ".wav", logs: ".jsonl,.log,.txt"};
+
+/* 批量删除条的显示状态：没选中就藏起来，「全选」按部分选中显示半选。 */
+function syncFileSel(){
+  var all = $("fileselall"), wrap = $("fileselwrap"), btn = $("filedelsel");
+  var boxes = document.querySelectorAll("#filelist [data-fsel]");
+  var total = boxes.length, n = 0;
+  for (var k in fileSel) if (fileSel[k]) n++;
+  if (wrap){ wrap.hidden = total === 0; }
+  if (all){
+    all.disabled = total === 0;
+    all.checked = total > 0 && n === total;
+    all.indeterminate = n > 0 && n < total;
+  }
+  if (btn){
+    btn.hidden = n === 0;
+    btn.textContent = "删除所选（" + n + "）";
+  }
+}
+
+function fileUrl(kind, name){
+  return "/api/files/" + kind
+    + "?cat=" + encodeURIComponent(fileCat)
+    + "&device=" + encodeURIComponent(selDevice || "")
+    + "&name=" + encodeURIComponent(name);
+}
+function loadFiles(){
+  var host = $("filelist");
+  if (!host) return;
+  var scope = fileCat + "|" + (selDevice || "");
+  if (scope !== fileScope){ fileSel = Object.create(null); fileScope = scope; }
+  var who = $("fileswho");
+  if (who) who.textContent = (fileCat === "logs" ? "日志目录" : (selDevice || "—"));
+  /* 快切分类/设备时会有在途的旧请求：响应回来时按发出时的口径对一遍，
+     不是当前口径就丢掉 —— 不然慢的旧响应会把新列表盖掉（实测复现过）。 */
+  var reqCat = fileCat, reqDev = selDevice || "";
+  fetch("/api/files?cat=" + encodeURIComponent(reqCat)
+        + "&device=" + encodeURIComponent(reqDev))
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+      if (reqCat !== fileCat || reqDev !== (selDevice || "")) return;
+      if (!d || !d.ok) throw new Error((d && d.error) || "列目录失败");
+      var c = (d.categories || [])[0] || {files: [], note: ""};
+      if (who && d.device) who.textContent = (fileCat === "logs" ? "日志目录" : d.device);
+      var files = c.files || [];
+      /* 换分类/换设备后把不在列表里的选中项丢掉 —— 免得删掉同名但别的设备的文件 */
+      var keep = Object.create(null);
+      files.forEach(function(f){ if (fileSel[f.name]) keep[f.name] = true; });
+      fileSel = keep;
+      if (!files.length){
+        host.innerHTML = '<div class="empty">' + esc(c.note || ("该分类暂无文件")) + '</div>';
+        syncFileSel();
+        return;
+      }
+      host.innerHTML = files.map(function(f){
+        var when = new Date(f.mtime * 1000).toLocaleString();
+        return '<div class="frow">'
+          + '<input type="checkbox" class="fchk" data-fsel="' + esc(f.name) + '"'
+          + (fileSel[f.name] ? ' checked' : '') + ' title="选中后可批量删除">'
+          + '<span class="fname" title="' + esc(f.name) + '">' + esc(f.name) + '</span>'
+          + '<span class="fmeta" title="' + esc(when) + '">' + fmtBytes(f.bytes) + '</span>'
+          + (f.text ? '<button class="sm" type="button" data-fpv="' + esc(f.name) + '">预览</button>' : '')
+          + '<button class="sm" type="button" data-fdl="' + esc(f.name) + '">下载</button>'
+          + '<button class="sm" type="button" data-fdel="' + esc(f.name) + '">删除</button>'
+          + '</div>';
+      }).join("");
+      Array.prototype.forEach.call(host.querySelectorAll("[data-fsel]"), function(cb){
+        cb.onchange = function(){
+          if (cb.checked) fileSel[cb.getAttribute("data-fsel")] = true;
+          else delete fileSel[cb.getAttribute("data-fsel")];
+          syncFileSel();
+        };
+      });
+      Array.prototype.forEach.call(host.querySelectorAll("[data-fpv]"), function(btn){
+        btn.onclick = function(){ previewFile(btn.getAttribute("data-fpv")); };
+      });
+      Array.prototype.forEach.call(host.querySelectorAll("[data-fdl]"), function(btn){
+        btn.onclick = function(){ window.location.href = fileUrl("download", btn.getAttribute("data-fdl")); };
+      });
+      Array.prototype.forEach.call(host.querySelectorAll("[data-fdel]"), function(btn){
+        btn.onclick = function(){ deleteFile(btn.getAttribute("data-fdel")); };
+      });
+      syncFileSel();
+    })
+    .catch(function(e){
+      if (reqCat !== fileCat || reqDev !== (selDevice || "")) return;
+      host.innerHTML = '<div class="empty">读取失败：' + esc(e.message) + '</div>';
+    });
+}
+
+function previewFile(name){
+  var dlg = $("fprevd");
+  fetch(fileUrl("preview", name) + "&limit=262144")
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+      if (!d || !d.ok) throw new Error((d && d.error) || "预览失败");
+      filePreviewName = name;
+      $("fprevname").textContent = d.name;
+      var txt = d.text || "";
+      var lines = txt ? txt.split("\n").length : 0;
+      $("fprevinfo").textContent = fmtBytes(d.bytes) + " · " + lines + " 行 · " +
+        (d.truncated ? "⚠ 只显示前 " + fmtBytes(d.limit) + "，其余请下载原文件" : "完整内容");
+      $("fprevtext").textContent = txt;
+      if (dlg && typeof dlg.showModal === "function") dlg.showModal();
+      else window.open(fileUrl("download", name), "_blank");
+    })
+    .catch(function(e){ $("fileshint").textContent = "预览失败：" + e.message; });
+}
+
+function deleteFile(name){
+  confirmDialog("删除文件", "将永久删除 " + name + "，无法恢复。", "删除").then(function(ok){
+    if (!ok) return;
+    apiFetch("/api/files/delete", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({cat: fileCat, device: selDevice || "", name: name})
+    }).then(function(r){ return r.json(); }).then(function(d){
+      if (!d || !d.ok) throw new Error((d && d.error) || "删除失败");
+      $("fileshint").textContent = "已删除 " + d.deleted;
+      loadFiles();
+    }).catch(function(e){ $("fileshint").textContent = "删除失败：" + e.message; });
+  });
+}
+
+/* 批量删除：逐条复用单文件删除接口（服务端路径夹紧/校验只有一份，前端不另开写口），
+   串行执行并在提示行报进度；失败的不中断，最后一起汇总。 */
+function deleteSelected(){
+  var names = [];
+  for (var k in fileSel) if (fileSel[k]) names.push(k);
+  if (!names.length) return;
+  confirmDialog("批量删除文件",
+    "将永久删除选中的 " + names.length + " 个文件，无法恢复。", "删除").then(function(ok){
+    if (!ok) return;
+    var btn = $("filedelsel");
+    if (btn) btn.disabled = true;
+    var i = 0, okN = 0, failed = 0;
+    (function next(){
+      if (i >= names.length){
+        if (btn) btn.disabled = false;
+        $("fileshint").textContent = failed
+          ? "已删除 " + okN + " 个，" + failed + " 个失败（刷新后可重试）"
+          : "已删除 " + okN + " 个文件";
+        fileSel = Object.create(null);
+        loadFiles();
+        return;
+      }
+      var nm = names[i++];
+      $("fileshint").textContent = "删除中 " + i + "/" + names.length + " · " + nm;
+      apiFetch("/api/files/delete", {
+        method: "POST", headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({cat: fileCat, device: selDevice || "", name: nm})
+      }).then(function(r){ return r.json(); }).then(function(d){
+        if (!d || !d.ok) throw new Error((d && d.error) || "删除失败");
+        okN++;
+      }).catch(function(){ failed++; }).then(next);
+    })();
+  });
+}
+
+/* 预览弹窗的「复制全文」：日志要贴进工单/聊天时不用再手动框选；
+   先试异步剪贴板（页面在 https/localhost 下可用），失败退回选区 + execCommand。 */
+function copyPreview(){
+  var btn = $("fprevcopy"), txt = ($("fprevtext") && $("fprevtext").textContent) || "";
+  if (!txt) return;
+  var restore = function(ok){
+    if (!btn) return;
+    btn.textContent = ok ? "已复制" : "复制失败";
+    setTimeout(function(){ btn.textContent = "复制全文"; }, 1800);
+  };
+  if (navigator.clipboard && navigator.clipboard.writeText){
+    navigator.clipboard.writeText(txt).then(function(){ restore(true); },
+                                           function(){ restore(false); });
+    return;
+  }
+  try{
+    var range = document.createRange();
+    range.selectNodeContents($("fprevtext"));
+    var sel = window.getSelection();
+    sel.removeAllRanges(); sel.addRange(range);
+    restore(document.execCommand("copy"));
+    sel.removeAllRanges();
+  }catch(e){ restore(false); }
+}
+
+function uploadFile(){
+  var up = $("fileup");
+  var f = up && up.files && up.files[0];
+  if (!f) return;
+  var url = "/api/files/upload?cat=" + encodeURIComponent(fileCat)
+    + "&device=" + encodeURIComponent(selDevice || "")
+    + "&name=" + encodeURIComponent(f.name);
+  $("fileshint").textContent = "上传中 " + f.name + " …";
+  apiFetch(url, {method: "POST",
+                 headers: {"Content-Type": f.type || "application/octet-stream"},
+                 body: f})
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+      if (!d || !d.ok) throw new Error((d && d.error) || "上传失败");
+      $("fileshint").textContent = "已上传 " + d.name + " · " + fmtBytes(d.bytes)
+        + (d.replaced ? "（已覆盖原文件）" : "");
+      up.value = "";
+      loadFiles();
+    })
+    .catch(function(e){ $("fileshint").textContent = "上传失败：" + e.message; });
+}
+
+(function bindFiles(){
+  var cat = $("filecat");
+  if (!cat) return;
+  var up = $("fileup");
+  if (up) up.accept = FILE_ACCEPT[fileCat] || "";
+  cat.onchange = function(){
+    fileCat = this.value;
+    fileSel = Object.create(null);
+    if (up) up.accept = FILE_ACCEPT[fileCat] || "";
+    $("fileshint").textContent = "预览只读前 256 KB（超出会标注已截断）· 删除不可恢复";
+    loadFiles();
+  };
+  if ($("filesrefresh")) $("filesrefresh").onclick = loadFiles;
+  if ($("fileupbtn") && up) $("fileupbtn").onclick = function(){ up.click(); };
+  if (up) up.onchange = uploadFile;
+  if ($("fileselall")) $("fileselall").onchange = function(){
+    var on = this.checked;
+    Array.prototype.forEach.call(document.querySelectorAll("#filelist [data-fsel]"), function(cb){
+      cb.checked = on;
+      if (on) fileSel[cb.getAttribute("data-fsel")] = true;
+      else delete fileSel[cb.getAttribute("data-fsel")];
+    });
+    syncFileSel();
+  };
+  if ($("filedelsel")) $("filedelsel").onclick = deleteSelected;
+  if ($("fprevcopy")) $("fprevcopy").onclick = copyPreview;
+  var dlg = $("fprevd");
+  if (dlg){
+    if ($("fprevclose")) $("fprevclose").onclick = function(){ dlg.close(); };
+    if ($("fprevdl")) $("fprevdl").onclick = function(){
+      if (filePreviewName) window.location.href = fileUrl("download", filePreviewName);
+    };
+  }
+})();
+
 /* ---- 本机存档：IndexedDB（用户要求"存浏览器里、保持持久性"）----
  * 用 IndexedDB 而不是 localStorage：照片是二进制，localStorage 只能存字符串且只有 5MB。 */
 var IDB_NAME = "rw1-photos", IDB_STORE = "shots";
@@ -2603,6 +2933,9 @@ function selectDevice(id){
      留着上一台的容量/文件列表会显示成新设备的数据（而且看起来完全正常，
      比空着更误导）。 */
   lastSd = null;
+  /* 文件管理也是"这台板"的目录：卡片上写着上一台的名字和文件，
+     实际却会去读新设备的目录 —— 必须立刻按新设备重列。 */
+  if (typeof loadFiles === "function") loadFiles();
   /* 展开态的长列表是**上一台板**的事件，换设备必须收起 —— 和 lastSd 同理，
      留着别人的历史比空着更误导。这里只复位标记与按钮文案，不额外取数：
      下面那行 pull() 会让 renderEvents 用新设备的数据重画。 */
@@ -2989,6 +3322,11 @@ fetch("/api/commands" + devQuery()).then(function(r){ return r.json(); }).then(f
     renderShots();
   } catch (e) {
     if (window.console) console.warn("摄像头初始化失败（不影响其它功能）: " + e);
+  }
+  /* 文件管理卡片：设备还没上报时服务端会退回最近的那台；
+     页面先按当前选择画一次，选设备时 selectDevice 会再刷。 */
+  try { loadFiles(); } catch (e) {
+    if (window.console) console.warn("文件管理初始化失败（不影响其它功能）: " + e);
   }
   init3d();
   /* 板子设置：只把**填了**的项发过去（空着 = 不改那一项）。 */
