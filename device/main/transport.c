@@ -62,6 +62,11 @@ static const char *TAG = "transport";
  * telemetry periods) instead of retrying forever. */
 #define TX_ASK_MAX_ATTEMPTS 3
 
+/* 板端等 AI 回复的上限（毫秒）。服务端自己的大模型超时是 10 s（LLM_BOARD_TIMEOUT），
+ * 再加排队与一帧上报的余量给到 20 s。超过它就在屏幕上明确说"超时"——
+ * 不许让界面停在上一条回复上，也不许一直转圈。 */
+#define AI_WAIT_TIMEOUT_MS 20000
+
 /* 上报周期的合法范围（毫秒）。**两个调用点共用这一份**：
  *   1. run_set_config() —— 接受 set_config 参数时；
  *   2. transport_reload_config() —— 从 NVS 读出来时的兜底夹取。
@@ -126,6 +131,14 @@ static SemaphoreHandle_t s_lock;
 static volatile bool s_ask_pending;
 static int s_ask_attempts;
 static char s_ask_text[64] = "我现在的运动状态怎么样？";
+/* 一次提问/语音从"发起到拿到结果"期间为 true；停表判超时用。
+ * 读写都在 s_lock 里（见 ai_state_set / transport_get_status）。 */
+static bool       s_ai_active;
+static TickType_t s_ai_started;
+/* 提问那一刻屏幕上的旧回复。服务端还没处理 ask 时，仍会把**上一句**当
+ * ai_reply 回给我们；不比对这一份，UI 会先闪一下旧答案再跳新答案。 */
+static char       s_ai_base_reply[TRANSPORT_REPLY_LEN];
+static bool       s_ai_saw_pending;
 static uint32_t s_post_count;
 static int s_btn_pending;      /* 自上次成功上报以来 BOOT 被按了几次（第 3 周） */
 static uint32_t s_bad_samples; /* 累计丢弃的不可用样本数（P1-4，只统计不上报） */
@@ -175,6 +188,18 @@ static void status_lock(void)
 static void status_unlock(void)
 {
     xSemaphoreGive(s_lock);
+}
+
+/* 设置 AI 显示状态。**调用方必须已持有 s_lock**（该状态由多个任务读写：
+ * 按钮任务置 PENDING、上报任务置 OK/FAILED、UI 任务读）。 */
+static void ai_state_set(uint8_t state, const char *note)
+{
+    s_st.ai_state = state;
+    if (note != NULL && note[0] != '\0') {
+        utf8_strlcpy(s_st.ai_note, note, sizeof(s_st.ai_note));
+    } else {
+        s_st.ai_note[0] = '\0';
+    }
 }
 
 /* ---------------- 跨任务读配置：一律"锁内拷一份" ---------------------------
@@ -1167,7 +1192,33 @@ static void apply_response(const char *body, size_t len)
         strlcpy(s_st.activity, activity, sizeof(s_st.activity));
     }
     if (reply[0] != '\0') {
-        strlcpy(s_st.reply, reply, sizeof(s_st.reply));
+        utf8_strlcpy(s_st.reply, reply, sizeof(s_st.reply));
+    }
+    /* 回复的显示状态：只有 OK 才显示正文；失败/超时必须给出明确原因。
+     * 注意 apply_response(NULL,0)（HTTP 失败）也会走到这里，所以下面要按
+     * fail_streak 判断"是不是真连不上"，偶发一次断网不立刻判死。 */
+    if (ok) {
+        if (pending) {
+            ai_state_set(TRANSPORT_AI_PENDING, NULL);
+            s_ai_saw_pending = true;
+        } else if (reply[0] != '\0' &&
+                   (!s_ai_active || s_ai_saw_pending ||
+                    strcmp(reply, s_ai_base_reply) != 0)) {
+            /* 有正文、且不是"提问前的那一句"（或已经见过 pending）才算本次结果 */
+            ai_state_set(TRANSPORT_AI_OK, NULL);
+            s_ai_active = false;
+            s_ai_saw_pending = false;
+        } else if (s_ai_active) {
+            /* 服务端说"不在生成了"却没有新正文：这轮就是空回复，
+             * 不能把上一句旧回答当成本次结果留在屏幕上。 */
+            ai_state_set(TRANSPORT_AI_FAILED, "服务器没有回复");
+            s_ai_active = false;
+            s_ask_pending = false;
+        }
+    } else if (s_ai_active && s_st.fail_streak >= TX_ASK_MAX_ATTEMPTS) {
+        ai_state_set(TRANSPORT_AI_FAILED, "连不上服务器");
+        s_ai_active = false;
+        s_ask_pending = false;
     }
     /* 活动词在锁内取一份，给下面的"活动变化"事件用（采样循环那边的留档另有取值） */
     char log_act[sizeof(s_st.activity)];
@@ -1353,15 +1404,24 @@ static void voice_task(void *arg)
         }
         if (!wifi_link_is_up()) {
             ESP_LOGW(TAG, "语音：WiFi 没连上，这次跳过");
+            status_lock();
+            ai_state_set(TRANSPORT_AI_FAILED, "Wi-Fi 没连上");
+            s_ai_active = false;
+            status_unlock();
             continue;
         }
         if (!audio_ready()) {
             ESP_LOGW(TAG, "语音：麦克风不可用（看上面的 audio 日志）");
+            status_lock();
+            ai_state_set(TRANSPORT_AI_FAILED, "麦克风不可用");
+            s_ai_active = false;
+            status_unlock();
             continue;
         }
 
         status_lock();
         s_st.voice_state = TRANSPORT_VOICE_RECORDING;
+        ai_state_set(TRANSPORT_AI_PENDING, "正在录音…");
         status_unlock();
         led_feedback_play(LED_FB_ACK);
 
@@ -1371,13 +1431,25 @@ static void voice_task(void *arg)
         status_lock();
         s_st.voice_state = (pcm != NULL && n > 0) ? TRANSPORT_VOICE_UPLOADING
                                                   : TRANSPORT_VOICE_IDLE;
+        if (pcm != NULL && n > 0) {
+            ai_state_set(TRANSPORT_AI_PENDING, "正在识别…");
+        }
         status_unlock();
 
         if (pcm == NULL || n == 0) {
             ESP_LOGW(TAG, "语音：没录到数据");
+            status_lock();
+            ai_state_set(TRANSPORT_AI_FAILED, "没录到声音");
+            s_ai_active = false;
+            status_unlock();
             continue;
         }
-        post_audio(pcm, n);
+        if (!post_audio(pcm, n)) {
+            status_lock();
+            ai_state_set(TRANSPORT_AI_FAILED, "语音上传失败");
+            s_ai_active = false;
+            status_unlock();
+        }
         /* 往后就交给服务端了：识别 → 大模型 → 回复随遥测帧回来。
          * 板端把状态交还给服务端，UI 后续按 ai_pending / reply 显示。 */
     }
@@ -1651,6 +1723,11 @@ static void upload_task(void *arg)
                 ESP_LOGW(TAG, "ask dropped after %d failed uploads", s_ask_attempts);
                 s_ask_pending = false;
                 s_ask_attempts = 0;
+                /* 屏幕要给明确结论：发了三次都没发出去，不能停在上一句话上 */
+                status_lock();
+                ai_state_set(TRANSPORT_AI_FAILED, "问答没发出去");
+                s_ai_active = false;
+                status_unlock();
             } else {
                 ESP_LOGW(TAG, "ask upload failed, retry %d/%d",
                          s_ask_attempts, TX_ASK_MAX_ATTEMPTS);
@@ -1761,6 +1838,11 @@ void transport_request_ask(const char *question)
     s_ask_attempts = 0;
     s_ask_pending = true;
     s_btn_pending++;          /* 让服务端/网页能看见"物理按键发生了" */
+    s_ai_active = true;
+    s_ai_started = xTaskGetTickCount();
+    s_ai_saw_pending = false;
+    strlcpy(s_ai_base_reply, s_st.reply, sizeof(s_ai_base_reply));
+    ai_state_set(TRANSPORT_AI_PENDING, NULL);
     status_unlock();
 
     ESP_LOGI(TAG, "ask queued: %s", s_ask_text);
@@ -1771,6 +1853,13 @@ void transport_request_voice(void)
     /* 只置信号量，**绝不在按钮任务里录音** —— 录音要阻塞 3 秒，
      * 会把 iot_button 的任务按住，长按/双击在那 3 秒里全部失灵。 */
     if (s_voice_wake != NULL) {
+        status_lock();
+        s_ai_active = true;
+        s_ai_started = xTaskGetTickCount();
+        s_ai_saw_pending = false;
+        strlcpy(s_ai_base_reply, s_st.reply, sizeof(s_ai_base_reply));
+        ai_state_set(TRANSPORT_AI_PENDING, "正在录音…");
+        status_unlock();
         xSemaphoreGive(s_voice_wake);
         ESP_LOGI(TAG, "语音录制已排队");
     }
@@ -1784,5 +1873,12 @@ void transport_get_status(transport_status_t *out)
     }
     status_lock();
     memcpy(out, &s_st, sizeof(*out));
+    /* 等回复超时：**在读取侧判定**，不改状态机 —— 迟到的回复照样能把它覆盖成 OK。
+     * 没有这一条，服务端一直不回（断网/大模型卡住）时屏幕会永远停在"正在思考…"。 */
+    if (out->ai_state == TRANSPORT_AI_PENDING && s_ai_active &&
+        (xTaskGetTickCount() - s_ai_started) > pdMS_TO_TICKS(AI_WAIT_TIMEOUT_MS)) {
+        out->ai_state = TRANSPORT_AI_FAILED;
+        strlcpy(out->ai_note, "等回复超时，再试一次", sizeof(out->ai_note));
+    }
     status_unlock();
 }

@@ -45,7 +45,7 @@ import time
 import urllib.request
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import unquote, urlsplit
+from urllib.parse import quote, unquote, urlsplit
 
 # --------------------------------------------------------------------------
 # 同目录的两个模块（2026-11-01 从本文件拆出：analysis / jsonl_log）
@@ -103,7 +103,8 @@ _LLM_SEM = threading.BoundedSemaphore(max(1, LLM_MAX_CONCURRENT))
 # 不配 RW1_API_TOKEN = 完全关闭，行为与以前逐字节相同。
 # 配了则下面这些接口要求 `X-RW1-Token` 请求头（或 `?token=` 查询参数）。
 API_TOKEN = os.environ.get("RW1_API_TOKEN", "").strip()
-WEB_WRITE_PATHS = ("/api/command", "/api/ask", "/api/ask/cancel", "/api/shots/delete")
+WEB_WRITE_PATHS = ("/api/command", "/api/ask", "/api/ask/cancel", "/api/shots/delete",
+                   "/api/files/delete", "/api/files/upload")
 # 写入口的同源校验（CSRF）总开关。默认开启；只有在反向代理会改写 Host
 # 导致误判时才需要设 RW1_ALLOW_CROSS_ORIGIN=1 关掉。详见 Handler._origin_ok。
 ALLOW_CROSS_ORIGIN = os.environ.get("RW1_ALLOW_CROSS_ORIGIN", "").strip() == "1"
@@ -152,7 +153,11 @@ CHAT_HISTORY = 6               # 多轮上下文保留的问答轮数（澄清�
 MAX_BATCH = 400           # 单次 POST 最多接受的样本数（防止畸形/恶意负载）
 VALID_G_MAX = 16.0        # 单轴可信上限（g）。固件 sanitize3 是 ±8g，这里留一倍余量；
                           # 超出的一律当坏帧丢弃，见 Handler._parse_points
-BOARD_REPLY_MAX = 512     # 回传板端的回复字节上限（UTF-8 安全截断）
+# 回传板端的回复字节上限（UTF-8 安全截断）。
+# **必须小于固件 TRANSPORT_REPLY_LEN（512）**：clip_utf8 截断后还会追加一个「…」，
+# 若这里写 512，板端 512 字节的 utf8_strlcpy 会把省略号连同最后一两个字一起切掉 ——
+# 超长回复就失去了"被截断过"的标注。留 32 字节余量（480 + 3 < 512）。
+BOARD_REPLY_MAX = 480
 
 # 仪表盘自托管字体白名单（详见 Handler._send_vendor_font）。字体名来自 URL，
 # 所以不放正则、只放**逐字写死**的文件名 —— 这是最难被绕过的白名单。
@@ -340,6 +345,113 @@ def clean_device_id(raw):
     s = "".join(ch for ch in s if ch.isprintable())
     s = " ".join(s.split())[:DEVICE_ID_MAX]
     return s or DEFAULT_DEVICE
+
+
+# ==========================================================================
+# 仪表盘「文件管理」（2026-11-04）
+# --------------------------------------------------------------------------
+# 只暴露三类**由本项目自己写出来的**目录，绝不接受任意路径：
+#   shots → SHOTS_DIR/<设备>/    （板端拍照留档）
+#   audio → AUDIO_DIR/<设备>/    （语音链路的录音留档）
+#   logs  → 数据目录根（JsonlLogger 的 telemetry-*.jsonl / events-*.jsonl）
+# 文件名走**白名单 + 拒绝**（不改写成别的名字），设备名复用 safe_name，
+# 最后再做一次"解析后的绝对路径必须落在 base 里"的夹紧 —— 三道都过才算合法。
+# ==========================================================================
+FILE_CATS = {"shots": "照片", "audio": "录音", "logs": "日志"}
+FILE_MAX_BYTES = 8 * 1024 * 1024          # 上传上限（照片/录音都远小于它）
+FILE_PREVIEW_DEFAULT = 64 * 1024          # 预览默认读多少字节
+FILE_PREVIEW_MAX = 256 * 1024             # 预览最多允许多少字节（客户端也夹）
+FILE_LIST_MAX = 500                       # 单个分类最多列多少条
+FILE_NAME_MAX = 96
+FILE_EXTS = {
+    "shots": (".jpg", ".jpeg", ".png"),
+    "audio": (".wav",),
+    "logs": (".jsonl", ".log", ".txt"),
+}
+TEXT_EXTS = (".jsonl", ".log", ".txt", ".json", ".csv", ".md")
+FILE_CTYPES = {
+    ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
+    ".wav": "audio/wav",
+    ".jsonl": "application/x-ndjson", ".json": "application/json",
+    ".log": "text/plain; charset=utf-8", ".txt": "text/plain; charset=utf-8",
+    ".csv": "text/csv; charset=utf-8", ".md": "text/plain; charset=utf-8",
+}
+# Windows 上这些名字会被当成设备/保留名（NUL/CON/COM1…），写进去行为不可预期。
+_WIN_RESERVED = {"con", "prn", "aux", "nul"}
+_WIN_RESERVED |= {"com%d" % i for i in range(1, 10)}
+_WIN_RESERVED |= {"lpt%d" % i for i in range(1, 10)}
+
+
+def file_cat_dir(cat):
+    """分类 → 根目录；未知分类/未初始化返回 None。"""
+    if cat == "shots":
+        return SHOTS_DIR
+    if cat == "audio":
+        return AUDIO_DIR
+    if cat == "logs":
+        return LOGGER.root if LOGGER is not None else None
+    return None
+
+
+def file_device_dir(device):
+    """设备名 → 安全的目录名。空设备名**拒绝**（否则 clean_device_id 会兜成默认设备，
+    删别人的文件时这是最不该出现的"好心"）。"""
+    raw = device.strip() if isinstance(device, str) else ""
+    if not raw:
+        return None
+    sd = safe_name(clean_device_id(raw))
+    if sd in (".", "..") or not sd.strip("."):
+        return None
+    return sd
+
+
+def file_safe_name(name):
+    """文件名白名单。不安全一律返回 None（**不替用户改名**，免得"以为是删除/上传成功了"）。"""
+    if not isinstance(name, str):
+        return None
+    s = name.strip()
+    if not s or len(s) > FILE_NAME_MAX:
+        return None
+    if s in (".", "..") or not s.strip("."):
+        return None
+    if any(ch in s for ch in ("/", "\\", ":", "\x00", "\r", "\n")):
+        return None
+    if any(ord(c) < 32 for c in s):
+        return None
+    if s.split(".")[0].lower() in _WIN_RESERVED:
+        return None
+    return s
+
+
+def file_ext_ok(cat, name):
+    exts = FILE_EXTS.get(cat) or ()
+    return name.lower().endswith(exts)
+
+
+def file_path(cat, device, name):
+    """分类+设备+文件名 → 绝对路径。三道校验全过才返回，否则 None。"""
+    base = file_cat_dir(cat)
+    if not base:
+        return None
+    fname = file_safe_name(name)
+    if not fname:
+        return None
+    if cat == "logs":
+        folder = base
+    else:
+        sd = file_device_dir(device)
+        if not sd:
+            return None
+        folder = os.path.join(base, sd)
+    full = os.path.abspath(os.path.join(folder, fname))
+    root = os.path.abspath(base)
+    # normcase：Windows 路径大小写不敏感，必须按同一口径比较，否则
+    # `SHOTS%2F..%2Fsecrets.txt` 这种大小写变形会绕过前缀判断。
+    nfull, nroot = os.path.normcase(full), os.path.normcase(root)
+    if nfull != nroot and not nfull.startswith(nroot + os.sep):
+        return None
+    return full
+
 
 
 def get_device(did):
@@ -1677,6 +1789,12 @@ class Handler(BaseHTTPRequestHandler):
                                        ensure_ascii=False))
         elif path.startswith("/api/shots/"):
             self._send_shot(path[len("/api/shots/"):])
+        elif path == "/api/files":
+            self._files_index(query)
+        elif path == "/api/files/download":
+            self._file_send(query, preview=False)
+        elif path == "/api/files/preview":
+            self._file_send(query, preview=True)
         elif path == "/api/stream":
             self._sse(query)
         else:
@@ -1719,6 +1837,10 @@ class Handler(BaseHTTPRequestHandler):
             self._ask_cancel(query)
         elif path == "/api/shots/delete":
             self._shot_delete()
+        elif path == "/api/files/delete":
+            self._file_delete()
+        elif path == "/api/files/upload":
+            self._file_upload(query)
         else:
             self._send(404, json.dumps({"ok": False, "error": "not found"}))
 
@@ -1858,6 +1980,234 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, json.dumps({"ok": True}, ensure_ascii=False))
         except OSError as e:
             self._send(404, json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False))
+
+    # ---- 文件管理（2026-11-04）--------------------------------------------
+    def _files_index(self, query):
+        """列某台设备（或日志目录）下的文件。`?cat=shots|audio|logs` 可选。"""
+        cat = (query_param(query, "cat") or "").strip()
+        if cat and cat not in FILE_CATS:
+            self._send(400, json.dumps({"ok": False, "error": "unknown category"},
+                                       ensure_ascii=False))
+            return
+        device = (query_param(query, "device") or "").strip()
+        keys = [cat] if cat else list(FILE_CATS)
+        # 明确点名了设备就**必须合法**：这种情况下要是也"好心兜底"，
+        # 一次 `?device=..` 的拼错就会变成"列/删了最近那台板子的目录"。
+        if device and any(k != "logs" for k in keys) and not file_device_dir(device):
+            self._send(400, json.dumps({"ok": False, "error": "bad device name"},
+                                       ensure_ascii=False))
+            return
+        # 只读列表允许"没给设备"：和 /api/shots 一样退回最近上报的那台
+        # （单板场景页面永远不带 ?device=）。**删除/上传不享受这个兜底** ——
+        # 写操作必须点名设备，免得手一滑删掉别人的文件。
+        if not device and any(k != "logs" for k in keys):
+            with LOCK:
+                device = pick_device(None).id
+        cats = []
+        for key in keys:
+            base = file_cat_dir(key)
+            files = []
+            note = ""
+            folder = None
+            if base is None:
+                note = "目录未初始化"
+            elif key == "logs":
+                folder = base
+            else:
+                sd = file_device_dir(device)
+                if sd:
+                    folder = os.path.join(base, sd)
+                else:
+                    note = "需要先选择设备"
+            if folder and os.path.isdir(folder):
+                try:
+                    with os.scandir(folder) as it:
+                        for ent in it:
+                            if len(files) >= FILE_LIST_MAX:
+                                break
+                            try:
+                                if not ent.is_file():
+                                    continue
+                                stt = ent.stat()
+                            except OSError:
+                                continue     # 列目录时被删掉/无权限：跳过这一条
+                            lname = ent.name.lower()
+                            files.append({"name": ent.name, "bytes": stt.st_size,
+                                          "mtime": round(stt.st_mtime, 1),
+                                          "text": lname.endswith(TEXT_EXTS)})
+                except OSError as e:
+                    note = "读取目录失败: %s" % e
+            files.sort(key=lambda f: (-f["mtime"], f["name"]))
+            cats.append({"key": key, "label": FILE_CATS[key], "files": files,
+                         "note": note,
+                         "device": device if key != "logs" else ""})
+        self._send(200, json.dumps({"ok": True, "device": device, "categories": cats,
+                                    "max_bytes": FILE_MAX_BYTES,
+                                    "preview_max": FILE_PREVIEW_MAX},
+                                   ensure_ascii=False))
+
+    def _file_send(self, query, preview):
+        """下载 / 预览。预览只读前 limit 字节并明确标注 truncated。"""
+        cat = (query_param(query, "cat") or "").strip()
+        name = query_param(query, "name") or ""
+        path = file_path(cat, query_param(query, "device") or "", name)
+        if path is None:
+            # 路径/设备/分类不合法 → 400（404 会让人以为"文件只是没了"，
+            # 掩盖掉真正的坏输入）
+            self._send(400, json.dumps({"ok": False, "error": "bad path or device"},
+                                       ensure_ascii=False))
+            return
+        if not os.path.isfile(path):
+            self._send(404, json.dumps({"ok": False, "error": "no such file"},
+                                       ensure_ascii=False))
+            return
+        if preview and not name.lower().endswith(TEXT_EXTS):
+            self._send(415, json.dumps({"ok": False, "error": "not a text file"},
+                                       ensure_ascii=False))
+            return
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            self._send(404, json.dumps({"ok": False, "error": "stat failed"},
+                                       ensure_ascii=False))
+            return
+        if preview:
+            limit = clamp_int(query_param(query, "limit"), 1, FILE_PREVIEW_MAX,
+                              FILE_PREVIEW_DEFAULT)
+            try:
+                with open(path, "rb") as f:
+                    blob = f.read(limit)
+            except OSError as e:
+                self._send(400, json.dumps({"ok": False, "error": str(e)},
+                                           ensure_ascii=False))
+                return
+            self._send(200, json.dumps({
+                "ok": True,
+                "name": os.path.basename(path),
+                "bytes": size,
+                "limit": limit,
+                "truncated": size > len(blob),
+                "text": blob.decode("utf-8", errors="replace"),
+            }, ensure_ascii=False))
+            return
+        fname = os.path.basename(path)
+        ctype = FILE_CTYPES.get(os.path.splitext(fname)[1].lower(),
+                                "application/octet-stream")
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(size))
+        # RFC 5987：中文文件名必须用 filename*，否则浏览器会拿到乱码/被截断的名字
+        self.send_header("Content-Disposition",
+                         "attachment; filename*=UTF-8''" + quote(fname))
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        # 大文件分块写，不把整个文件读进内存（照片/录音可能到几十 MB）
+        try:
+            with open(path, "rb") as f:
+                while True:
+                    chunk = f.read(256 * 1024)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass    # 浏览器取消下载：连接断了，没什么可补救的
+
+    def _file_delete(self):
+        msg = self._read_json()
+        if msg is None:
+            self._send(400, json.dumps({"ok": False, "error": "bad json body"},
+                                       ensure_ascii=False))
+            return
+        path = file_path(str(msg.get("cat") or ""), str(msg.get("device") or ""),
+                         str(msg.get("name") or ""))
+        if path is None:
+            self._send(400, json.dumps({"ok": False, "error": "bad path or device"},
+                                       ensure_ascii=False))
+            return
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            self._send(404, json.dumps({"ok": False, "error": "no such file"},
+                                       ensure_ascii=False))
+            return
+        except OSError as e:
+            self._send(400, json.dumps({"ok": False, "error": str(e)},
+                                       ensure_ascii=False))
+            return
+        self._send(200, json.dumps({"ok": True, "deleted": os.path.basename(path)},
+                                   ensure_ascii=False))
+
+    def _file_upload(self, query):
+        """`?cat=&device=&name=` + 裸 body。先校验路径与扩展名，再读 body。"""
+        cat = (query_param(query, "cat") or "").strip()
+        name = query_param(query, "name") or ""
+        path = file_path(cat, query_param(query, "device") or "", name)
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            n = -1
+        if path is None:
+            # T58：拒绝时也要把 body 读掉，否则客户端收到的是 RST 而不是 400
+            self._drain(min(n, FILE_MAX_BYTES + 1) if n > 0 else 0)
+            self._send(400, json.dumps({"ok": False, "error": "bad path or device"},
+                                       ensure_ascii=False))
+            return
+        fname = file_safe_name(name)
+        if not fname or not file_ext_ok(cat, fname):
+            self._drain(min(n, FILE_MAX_BYTES + 1) if n > 0 else 0)
+            self._send(415, json.dumps({"ok": False, "error": "extension not allowed",
+                                        "allowed": list(FILE_EXTS.get(cat) or ())},
+                                       ensure_ascii=False))
+            return
+        if n <= 0:
+            self._send(400, json.dumps({"ok": False, "error": "empty body"},
+                                       ensure_ascii=False))
+            return
+        if n > FILE_MAX_BYTES:
+            # 413 之前尽量把 body 读掉：`_drain` 的上限（4×音频上限）不够覆盖
+            # 8MB 上传档，没读干净就关闭连接会让客户端收到 RST 而不是 413（T58）。
+            left = min(n, FILE_MAX_BYTES + 4 * 1024 * 1024)
+            try:
+                while left > 0:
+                    chunk = self.rfile.read(min(left, 256 * 1024))
+                    if not chunk:
+                        break
+                    left -= len(chunk)
+            except OSError:
+                pass
+            self._send(413, json.dumps({"ok": False, "error": "too large",
+                                        "max_bytes": FILE_MAX_BYTES},
+                                       ensure_ascii=False))
+            return
+        data = self.rfile.read(n)
+        if len(data) != n:
+            self._send(400, json.dumps({"ok": False, "error": "short body"},
+                                       ensure_ascii=False))
+            return
+        existed = os.path.exists(path)
+        folder = os.path.dirname(path)
+        tmp = None
+        try:
+            os.makedirs(folder, exist_ok=True)
+            # 先写临时文件再原子替换：上传中断时不会留下半截文件冒充完整文件
+            tmp = "%s.%d.part" % (path, threading.get_ident())
+            with open(tmp, "wb") as f:
+                f.write(data)
+            os.replace(tmp, path)
+        except OSError as e:
+            if tmp:
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+            self._send(500, json.dumps({"ok": False, "error": str(e)},
+                                       ensure_ascii=False))
+            return
+        self._send(200, json.dumps({"ok": True, "cat": cat, "name": fname,
+                                    "bytes": len(data), "replaced": existed},
+                                   ensure_ascii=False))
 
     # ---- voice (板 → 服务器 → 识别 → 大模型 → 板/网页) ----------------------
     def _audio(self, query):

@@ -1730,6 +1730,108 @@ def main():
               'id="feed"' in page and "仪表盘文件缺失" not in page,
               "长度 %d 字节" % len(page))
 
+        # ---- 31. 文件管理：列/预览/下载/删除/上传 + 三种坏输入 ----------------
+        # 用户明确要求这三类坏输入必须有测试钉住：路径穿越、超大文件、非法设备名。
+        print("\n[31] 文件管理")
+        fbase = "http://127.0.0.1:%d" % port
+        fdev = "文件测试-01"
+
+        def f_call(path, data=None, method=None, headers=None):
+            req = urllib.request.Request(fbase + path, data=data, method=method)
+            for k, v in (headers or {}).items():
+                req.add_header(k, v)
+            try:
+                with OPENER.open(req, timeout=15) as r:
+                    return r.status, r.read()
+            except urllib.error.HTTPError as e:
+                return e.code, e.read()
+
+        def f_upload(cat, dev, name, blob, ctype="application/octet-stream"):
+            q = ("?cat=" + urllib.parse.quote(cat)
+                 + "&device=" + urllib.parse.quote(dev)
+                 + "&name=" + urllib.parse.quote(name))
+            return f_call("/api/files/upload" + q, blob, method="POST",
+                          headers={"Content-Type": ctype})
+
+        jpg = b"\xff\xd8\xff" + b"fake-jpeg" * 200
+        st, _ = f_upload("shots", fdev, "a.jpg", jpg, "image/jpeg")
+        check("上传假 JPEG → 200", st == 200, "HTTP %d" % st)
+
+        st, body = f_call("/api/files?cat=shots&device=" + urllib.parse.quote(fdev))
+        d = json.loads(body.decode("utf-8"))
+        names = [f["name"] for f in (d.get("categories") or [{}])[0].get("files", [])]
+        check("列表能列出刚上传的文件", st == 200 and "a.jpg" in names,
+              "HTTP %d / %s" % (st, names[:5]))
+
+        # 预览：请求 limit 超过上限时必须被夹到 256KB，并明确标注截断
+        big = ("日志行1\n" + "x" * 300000).encode("utf-8")
+        st, _ = f_upload("logs", "", "big-test.txt", big, "text/plain")
+        check("上传日志文本 → 200", st == 200, "HTTP %d" % st)
+        st, body = f_call("/api/files/preview?cat=logs&name=big-test.txt&limit=999999")
+        d = json.loads(body.decode("utf-8"))
+        check("预览 limit 被夹到 256KB",
+              d.get("limit") == 256 * 1024 and len(d.get("text", "")) <= 256 * 1024,
+              "limit=%s len=%s" % (d.get("limit"), len(d.get("text", ""))))
+        check("超大文件预览标注 truncated", d.get("truncated") is True,
+              "bytes=%s" % d.get("bytes"))
+
+        st, got = f_call("/api/files/download?cat=logs&name=big-test.txt")
+        check("下载与原文件逐字节一致", st == 200 and got == big,
+              "HTTP %d / %d vs %d" % (st, len(got), len(big)))
+
+        # 路径穿越：文件名、反斜杠、设备名三处各来一条
+        bad_cases = [
+            ("文件名 ../", "/api/files/preview?cat=logs&name="
+             + urllib.parse.quote("../outside.txt")),
+            ("文件名反斜杠", "/api/files/download?cat=logs&name="
+             + urllib.parse.quote("..\\outside.txt")),
+            ("设备名 ..", "/api/files?cat=shots&device=" + urllib.parse.quote("..")),
+            ("未知分类", "/api/files?cat=secrets"),
+        ]
+        for label, path in bad_cases:
+            st, _ = f_call(path)
+            check("路径穿越被拒: %s" % label, st == 400, "HTTP %d" % st)
+
+        st, _ = f_upload("shots", "..", "evil.jpg", jpg, "image/jpeg")
+        check("非法设备名上传被拒", st == 400, "HTTP %d" % st)
+        st, _ = f_upload("shots", fdev, "evil.exe", b"MZ", "application/octet-stream")
+        check("扩展名不在白名单被拒", st == 415, "HTTP %d" % st)
+
+        # 超大文件：Content-Length 刚过 8MB 上限。必须能被服务端读完再回 413，
+        # 不能直接 RST —— 那条是 T58 的教训。
+        huge = b"z" * (8 * 1024 * 1024 + 1)
+        st, body = f_upload("logs", "", "too-big.txt", huge, "text/plain")
+        d = json.loads(body.decode("utf-8"))
+        check("超大上传 → 413 且带 max_bytes",
+              st == 413 and d.get("max_bytes") == 8 * 1024 * 1024,
+              "HTTP %d / %s" % (st, d.get("error")))
+
+        # 删除：穿越必须拒，正常删除要真的少一条
+        try:
+            out = post_json(fbase + "/api/files/delete",
+                            {"cat": "logs", "device": "", "name": "../outside.txt"})
+            ok_del_bad, detail_del_bad = False, "竟然接受了: %s" % out
+        except urllib.error.HTTPError as e:
+            ok_del_bad, detail_del_bad = e.code == 400, "HTTP %d" % e.code
+        except Exception as e:  # noqa: BLE001
+            ok_del_bad, detail_del_bad = False, "%s: %s" % (type(e).__name__, e)
+        check("删除时路径穿越被拒", ok_del_bad, detail_del_bad)
+
+        out = post_json(fbase + "/api/files/delete",
+                        {"cat": "shots", "device": fdev, "name": "a.jpg"})
+        check("正常删除返回 ok", out.get("ok") is True, "实际: %s" % out)
+        st, body = f_call("/api/files?cat=shots&device=" + urllib.parse.quote(fdev))
+        d = json.loads(body.decode("utf-8"))
+        names = [f["name"] for f in (d.get("categories") or [{}])[0].get("files", [])]
+        check("删除后列表里确实没有了", "a.jpg" not in names, "实际: %s" % names[:5])
+
+        # 收尾：把测试写进日志目录的文本删掉，别污染后续运行
+        try:
+            post_json(fbase + "/api/files/delete",
+                      {"cat": "logs", "device": "", "name": "big-test.txt"})
+        except Exception:  # noqa: BLE001
+            pass
+
     finally:
         for p in (srv, srv2, nlboard):
             if p is None:
