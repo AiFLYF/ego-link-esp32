@@ -547,6 +547,45 @@ async function step(name, fn) {
     console.log('     401 → 提示+摊开密钥框+归还文字 → 填密钥 → 带头发送 200');
   });
 
+  await step('文件列表竞态回归：快切分类时晚到的旧响应不覆盖新列表', async () => {
+    /* 2026-11-05 修的真 bug：loadFiles 旧实现在响应回来时无条件渲染，
+       快切分类/设备时慢的旧口径响应会把新列表盖掉（多视口截图核对时实测复现）。
+       这里用路由拦截把旧口径（shots）的响应**挂起**，让新口径（logs）先渲染完，
+       再放出旧响应 —— 修好的页面应当把它丢掉，列表仍是日志。 */
+    const held = [];
+    let armed = true;
+    const isFilesIndex = u => u.pathname === '/api/files';
+    const holdShots = route => {
+      if (armed && route.request().url().indexOf('cat=shots') >= 0) {
+        held.push(route); return;                       // 挂起旧口径，先不回
+      }
+      route.continue().catch(() => {});
+    };
+    await page.route(isFilesIndex, holdShots);
+    try {
+      await page.selectOption('#filecat', 'audio');    // 先离开默认的 shots（否则 change 不触发）
+      await page.selectOption('#filecat', 'shots');    // 旧请求（被挂起）
+      await sleep(300);                                 // 确保旧请求已在途
+      await page.selectOption('#filecat', 'logs');      // 新请求（放行）
+      await page.waitForSelector('#filelist .frow, #filelist .empty', { timeout: 15000 });
+      await sleep(300);
+      for (const r of held) { try { await r.continue(); } catch (e) {} }  // 旧响应晚到
+      await sleep(800);
+      const cat = await page.inputValue('#filecat');
+      const rows = await page.locator('#filelist .frow').count();
+      const names = await page.locator('#filelist .fname').allTextContents();
+      if (cat !== 'logs') throw new Error('分类没停在 logs: ' + cat);
+      if (!rows) throw new Error('旧响应把 logs 列表盖没了（rows=0）');
+      if (!/\.(jsonl|log|txt)/.test(names.join(' '))) {
+        throw new Error('列表内容不是日志文件: ' + names.join(','));
+      }
+      console.log('     旧口径响应被挂起 → 新口径先渲染 → 放出旧响应 → 列表未被覆盖');
+    } finally {
+      armed = false;
+      await page.unroute(isFilesIndex, holdShots).catch(() => {});
+    }
+  });
+
   await step('没有横向溢出', async () => {
     const over = await page.evaluate(() =>
       document.documentElement.scrollWidth - document.documentElement.clientWidth);

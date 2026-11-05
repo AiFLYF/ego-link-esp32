@@ -878,8 +878,12 @@ dialog.modal[open]::backdrop{animation:modal-veil var(--dur-2) var(--ease-out)}
 #filelist .fname{
   flex:1 1 160px;min-width:0;
   font:400 var(--fs-meta)/1.5 var(--font-mono);color:var(--color-text);
-  overflow-wrap:anywhere;
+  /* 长名单截断 + title 悬浮给全名（2026-11-05 起）：anywhere 断行会把
+     500 条列表拉成"文件名墙"，真正的内容全名用 tooltip 看 */
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
 }
+/* 文件很多时列表自己滚，别把整页拉成几千像素高（上限 500 条/分类） */
+#filelist{max-height:min(46vh,360px);overflow-y:auto}
 #filelist .fmeta{
   font:400 var(--fs-micro)/1.4 var(--font-mono);
   color:var(--color-text-faint);white-space:nowrap;
@@ -2181,6 +2185,15 @@ function loadFiles(){
       var c = (d.categories || [])[0] || {files: [], note: ""};
       if (who && d.device) who.textContent = (fileCat === "logs" ? "日志目录" : d.device);
       var files = c.files || [];
+      /* 服务端只回最近 500 条（capped）时要说出来 —— 不然用户以为"文件丢了"。
+         只在 capped 或残留 capped 文案时才动提示行：删除进度/结果消息也走这行，
+         无条件的覆盖会把"已删除 N 个"抹掉。 */
+      var fhint = $("fileshint");
+      if (fhint && c.capped){
+        fhint.textContent = "仅显示最近 500 条，更早的请到数据目录直接删 · 删除不可恢复";
+      } else if (fhint && fhint.textContent.indexOf("仅显示最近") === 0){
+        fhint.textContent = "预览只读前 256 KB（超出会标注已截断）· 删除不可恢复";
+      }
       /* 换分类/换设备后把不在列表里的选中项丢掉 —— 免得删掉同名但别的设备的文件 */
       var keep = Object.create(null);
       files.forEach(function(f){ if (fileSel[f.name]) keep[f.name] = true; });

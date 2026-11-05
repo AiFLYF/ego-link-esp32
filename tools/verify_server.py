@@ -1825,6 +1825,108 @@ def main():
         names = [f["name"] for f in (d.get("categories") or [{}])[0].get("files", [])]
         check("删除后列表里确实没有了", "a.jpg" not in names, "实际: %s" % names[:5])
 
+        # ---- 边界用例（2026-11-05 补） ----
+        # 空目录：全新设备的 shots 目录还没建，必须 ok + 空列表，而不是报错
+        st, body = f_call("/api/files?cat=shots&device=" + urllib.parse.quote("空目录-01"))
+        d = json.loads(body.decode("utf-8"))
+        c0 = (d.get("categories") or [{}])[0]
+        check("空目录 → 200 且空列表", st == 200 and c0.get("files") == [],
+              "HTTP %d / %s" % (st, c0.get("note")))
+
+        # Unicode 文件名：中文名必须能上传→列出→删除整条走通
+        uname = "遥测-测试日志.jsonl"
+        st, _ = f_upload("logs", "", uname, "中文内容\n".encode("utf-8"), "text/plain")
+        check("Unicode 文件名上传 → 200", st == 200, "HTTP %d" % st)
+        st, body = f_call("/api/files?cat=logs")
+        d = json.loads(body.decode("utf-8"))
+        names = [f["name"] for f in (d.get("categories") or [{}])[0].get("files", [])]
+        check("Unicode 文件名能列出", uname in names, "实际: %s" % names[:5])
+        out = post_json(fbase + "/api/files/delete",
+                        {"cat": "logs", "device": "", "name": uname})
+        check("Unicode 文件名能删除", out.get("ok") is True, "实际: %s" % out)
+
+        # 超长文件名：白名单上限 96 字符，超了必须 400 而不是落盘
+        long_name = "a" * 100 + ".txt"
+        st, _ = f_upload("logs", "", long_name, b"x", "text/plain")
+        check("超长文件名上传被拒", st == 400, "HTTP %d" % st)
+
+        # 删除不存在的文件 → 404（不是 200 也不是 500）
+        try:
+            post_json(fbase + "/api/files/delete",
+                      {"cat": "logs", "device": "", "name": "no-such-file.txt"})
+            check("删除不存在文件 → 404", False, "竟然删成功了")
+        except urllib.error.HTTPError as e:
+            check("删除不存在文件 → 404", e.code == 404, "HTTP %d" % e.code)
+
+        # 并发删除同一文件：一个 200、一个 404，不允许两个都"成功"
+        f_upload("logs", "", "race-del.txt", b"r", "text/plain")
+        race_codes = []
+
+        def _del_race():
+            try:
+                post_json(fbase + "/api/files/delete",
+                          {"cat": "logs", "device": "", "name": "race-del.txt"})
+                race_codes.append(200)
+            except urllib.error.HTTPError as e:
+                race_codes.append(e.code)
+            except Exception:  # noqa: BLE001
+                race_codes.append(-1)
+
+        t1 = threading.Thread(target=_del_race)
+        t2 = threading.Thread(target=_del_race)
+        t1.start(); t2.start(); t1.join(); t2.join()
+        check("并发删除同一文件 → 恰好一个 200 一个 404",
+              sorted(race_codes) == [200, 404], "实际: %s" % race_codes)
+
+        # 文件被占用时删除走 OSError 分支 → 400 + ok:false（Windows 限定；
+        # Linux 允许删打开中的文件，CI 上跳过这条）
+        if os.name == "nt":
+            f_upload("logs", "", "locked.txt", b"L", "text/plain")
+            locked_path = os.path.join(data_dir, "locked.txt")
+            fh = open(locked_path, "rb")  # noqa: SIM115 - 就是要占着它
+            try:
+                try:
+                    post_json(fbase + "/api/files/delete",
+                              {"cat": "logs", "device": "", "name": "locked.txt"})
+                    check("文件被占用时删除 → 400", False, "竟然删成功了")
+                except urllib.error.HTTPError as e:
+                    check("文件被占用时删除 → 400", e.code == 400, "HTTP %d" % e.code)
+            finally:
+                fh.close()
+            post_json(fbase + "/api/files/delete",
+                      {"cat": "logs", "device": "", "name": "locked.txt"})
+        else:
+            print("  [SKIP] 文件占用删除（仅 Windows 可复现，Linux 允许删打开中的文件）")
+
+        # 大列表上限：目录里放 505 个文件，列表必须截到 500 且 capped=True，
+        # 且留下的是**最近的** 500 条（编号最大的那条必须在）
+        for i in range(505):
+            with open(os.path.join(data_dir, "bulk-%03d.log" % i), "wb") as f:
+                f.write(b"b")
+            # 让 mtime 单调：编号越大越新
+            ts = 1700000000 + i
+            os.utime(os.path.join(data_dir, "bulk-%03d.log" % i), (ts, ts))
+        st, body = f_call("/api/files?cat=logs")
+        d = json.loads(body.decode("utf-8"))
+        c0 = (d.get("categories") or [{}])[0]
+        bulk_names = [f["name"] for f in c0.get("files", []) if f["name"].startswith("bulk-")]
+        check("大列表截到 500 条且有 capped 标志",
+              len(c0.get("files", [])) <= 500 and c0.get("capped") is True,
+              "len=%s capped=%s" % (len(c0.get("files", [])), c0.get("capped")))
+        check("截断留下的是最近的文件", "bulk-504.log" in bulk_names,
+              "最近一条在不在: %s" % ("bulk-504.log" in bulk_names))
+        for n in bulk_names:
+            try:
+                post_json(fbase + "/api/files/delete",
+                          {"cat": "logs", "device": "", "name": n})
+            except Exception:  # noqa: BLE001
+                pass
+        # capped 列表只给了 500 条，剩下的直接从磁盘清，别留到下个用例
+        for i in range(505):
+            p = os.path.join(data_dir, "bulk-%03d.log" % i)
+            if os.path.exists(p):
+                os.remove(p)
+
         # 收尾：把测试写进日志目录的文本删掉，别污染后续运行
         try:
             post_json(fbase + "/api/files/delete",

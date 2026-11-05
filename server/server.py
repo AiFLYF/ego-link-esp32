@@ -2023,8 +2023,6 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     with os.scandir(folder) as it:
                         for ent in it:
-                            if len(files) >= FILE_LIST_MAX:
-                                break
                             try:
                                 if not ent.is_file():
                                     continue
@@ -2037,9 +2035,13 @@ class Handler(BaseHTTPRequestHandler):
                                           "text": lname.endswith(TEXT_EXTS)})
                 except OSError as e:
                     note = "读取目录失败: %s" % e
+            # 先按时间排再截断：截断必须留下**最近的** 500 条，而不是 scandir
+            # 碰上什么算什么（旧实现是先截后排，超限时留下的是任意 500 条）。
             files.sort(key=lambda f: (-f["mtime"], f["name"]))
+            capped = len(files) > FILE_LIST_MAX
+            files = files[:FILE_LIST_MAX]
             cats.append({"key": key, "label": FILE_CATS[key], "files": files,
-                         "note": note,
+                         "note": note, "capped": capped,
                          "device": device if key != "logs" else ""})
         self._send(200, json.dumps({"ok": True, "device": device, "categories": cats,
                                     "max_bytes": FILE_MAX_BYTES,
