@@ -262,20 +262,36 @@ async function shot(page, name) {
     eq(await txt(page, '#ttsbtn'), '播报 开');
     eq(await page.getAttribute('#ttsbtn', 'aria-pressed'), 'true');
   });
-  await step('F01', '曲线空态提示不与 y 轴刻度重叠', async () => {
+  await step('F01', '曲线空态提示不贴着 y 轴刻度、不顶在最上沿', async () => {
+    /* 不看源码里的常量（那是自证），直接看**画布像素**：
+       全不透明的像素只可能来自文字（网格线 alpha .22、参考线 .40/.55），
+       左边 x<padL 的是刻度数字，右边的是空态提示。要求：
+         ① 提示的墨迹离 y 轴刻度至少 40px（不能读成 "2.0 等待…"）；
+         ② 提示的纵向中心落在画布中间一半（不能顶在最上沿冒充刻度）。 */
     const g = await page.evaluate(() => {
       const cv = document.getElementById('cv');
-      const dpr = window.devicePixelRatio || 1;
-      const H = cv.clientHeight, W = cv.clientWidth;
-      const padT = 12, padB = 16, plotH = H - padT - padB;
-      // "2.0" 刻度的基线（textBaseline=middle）
-      const yTick = padT + plotH - (2 / 2.4) * plotH;
-      // 空态提示的基线：padT + 14
-      const yHint = padT + 14;
-      return { yTick: yTick, yHint: yHint, gap: Math.abs(yTick - yHint), H: H };
+      const c2 = cv.getContext('2d');
+      const W = cv.width, H = cv.height, dpr = window.devicePixelRatio || 1;
+      const padL = 34 * dpr;
+      const d = c2.getImageData(0, 0, W, H).data;
+      let minX = W, minY = H, maxY = -1, n = 0;
+      for (let y = 0; y < H; y++) {
+        for (let x = Math.floor(padL + 2 * dpr); x < W; x++) {
+          if (d[(y * W + x) * 4 + 3] > 200) {
+            n++;
+            if (x < minX) minX = x;
+            if (y < minY) minY = y;
+            if (y > maxY) maxY = y;
+          }
+        }
+      }
+      return { minX, minY, maxY, n, padL, H, W, dpr };
     });
-    // 10px 字号、middle 基线 → 两行文字中心至少要有 12px 才不"读成一行"
-    ok(g.gap >= 12, '空态提示与 2.0 刻度只差 ' + g.gap.toFixed(1) + 'px（同字号 10px），视觉上并成一行');
+    ok(g.n > 20, '画布上没找到空态提示文字（不透明像素 ' + g.n + ' 个）');
+    const dx = (g.minX - g.padL) / g.dpr;
+    ok(dx >= 40, '空态提示离 y 轴刻度只有 ' + dx.toFixed(1) + 'px，会被读成刻度的一部分');
+    const cy = (g.minY + g.maxY) / 2;
+    ok(cy > g.H * 0.3 && cy < g.H * 0.7, '空态提示的纵向中心在 ' + (cy / g.H * 100).toFixed(0) + '%，顶在最上沿');
   });
   await step('A03', '零外部请求（教室没外网也能用）', async () => {
     eq(external.length, 0, '请求了外部资源：' + external.slice(0, 3).join(', '));

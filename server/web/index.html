@@ -1504,8 +1504,11 @@ function drawChart(){
 
   var n = samples.length;
   if (n < 2){
-    ctx.fillStyle = cFaint; ctx.textAlign = "left";
-    ctx.fillText("等待开发板上报…", padL+6*dpr, padT+14*dpr);
+    /* 空态提示画在**绘图区正中**，不要贴着 y 轴刻度。
+       原来画在 (padL+6, padT+14)，和顶部的 "2.0" 刻度纵向只差 5px、同 10px 字号，
+       读出来是 "2.0 等待开发板上报…"（2026-11-10 QA 抓到）。 */
+    ctx.fillStyle = cFaint; ctx.textAlign = "center";
+    ctx.fillText("等待开发板上报…", padL + plotW/2, padT + plotH/2);
     return;
   }
 
