@@ -224,6 +224,11 @@ nav .gh:hover{box-shadow:0 6px 26px -8px rgba(46,230,197,.6);border-color:rgba(4
 .fstep .arrow{position:absolute;right:-11px;top:50%;transform:translateY(-50%);color:var(--faint);font-size:13px;z-index:3}
 .fstep:last-child .arrow{display:none}
 .payloads{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+/* 代码块里的 <pre> 是 white-space:pre —— 它会把 grid 轨道的**自动最小尺寸**
+   撑到"最长一行"那么宽（实测 375px 屏上轨道变成 465.5px），于是整页横向溢出，
+   body 的 overflow-x:hidden 又把右边（含「复制」按钮）直接裁掉。
+   给轨道子项 min-width:0 之后，1fr 才能真的收缩，pre 自己的 overflow-x:auto 才生效。 */
+.payloads>*{min-width:0}
 
 /* ===================== code ===================== */
 .code{position:relative;border:1px solid var(--line);border-radius:12px;background:var(--code-bg);overflow:hidden}
