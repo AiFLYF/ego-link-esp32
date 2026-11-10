@@ -509,7 +509,6 @@ async function shot(page, name) {
     await page.fill('#asktext', '');
   });
   await step('D12', '注入字符串不执行、页面不被破坏', async () => {
-    const before = await txt(page, '#reply');
     await page.fill('#asktext', '<img src=x onerror=window.__xss=1><script>window.__xss2=1</script>');
     await page.keyboard.press('Enter');
     await sleep(2000);
@@ -518,7 +517,8 @@ async function shot(page, name) {
     ok((await page.$$('#reply img, #reply script')).length === 0, '回复里生成了标签');
     const after = await txt(page, '#reply');
     ok(after && after.length > 0, '回复被清空');
-    ok(after !== before, '注入字符串没有产生任何回复（可能被服务端拒绝）');
+    /* 不比较"回复是否变化"：规则 AI 的回答只依赖传感器读数，
+       两次提问拿到同一句是完全正常的（第一版这么断言，跑第二次就假红）。 */
   });
   await step('D13', '4 个快捷 chip 都能发出对应文本', async () => {
     const chips = await page.$$eval('.ask-chip', bs => bs.map(b => b.dataset.ask));
