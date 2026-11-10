@@ -7,6 +7,8 @@
  *
  * 用法：
  *   NODE_PATH=<node workspace>/node_modules node tests/e2e/qa_dashboard.js
+ *   端口默认 8098，可用 QA_PORT=xxxx 换（这台机器 8080–8090 有别的服务，
+ *   换端口前先用 curl --noproxy '*' 确认目标端口是空的）。
  *
  * 结果写 _qa_shots/run/results.json，截图写 _qa_shots/run/*.png
  */
