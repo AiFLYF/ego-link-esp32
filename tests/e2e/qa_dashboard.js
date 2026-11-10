@@ -405,6 +405,15 @@ async function shot(page, name) {
     ok(/\d{2}:\d{2}:\d{2}/.test(first), '时间格式：' + first);
   });
 
+  await step('H01b', '有事件时，5Hz 轮询不会把事件流抹成空态', async () => {
+    /* /api/latest 不带 events 字段 —— 如果"字段缺失"被当成"0 条"，
+       200ms 一次的轮询就会把 SSE 画好的列表换成空态（T47 那个抖动的翻版）。 */
+    await sleep(2500);
+    const n = (await page.$$('#feed .item')).length;
+    eq((await page.$$('#feed .empty')).length, 0, '事件流里混进了空态');
+    ok(n > 0, '事件列表被轮询清空了');
+  });
+
   /* ============ 第三段：多设备 ============ */
   console.log('\n== 多设备 ==');
   const b2 = startBoard({ dev: '第一组-01', scenario: 'tilt', orient: 3 });

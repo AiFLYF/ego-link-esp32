@@ -2332,7 +2332,12 @@ function renderEvents(evts, total){
      没有这个字段时退回 `evts.length`（老服务端 / 单独调用）。 */
   if (evts && evts.length){ lastEvts = evts; lastEvTotal = total; }
   if (evExpanded) return;          /* 展开态由 toggleEvents 自己管，别盖 */
-  if (!evts || !evts.length){
+  /* ⚠️ "字段缺失"和"真的没有事件"必须分开：
+     /api/latest 是 5Hz 轮询、**不带 events**，如果在这里画空态，
+     就会每 200ms 把 SSE 刚画好的列表抹掉（T47 的抖动换个方向再现）。
+     只有拿到**空数组**（SSE 说"现在确实 0 条"）才画空态。 */
+  if (!evts) return;
+  if (!evts.length){
     /* 空态：卡片不能一片空白（「指令记录」「照片」「存储」都有空态文案，这里漏了）。
        SSE 每帧都会调到这儿，靠 setHTML 的 __html 去重，不会重复写 DOM。 */
     setHTML($("feed"), '<div class="empty">还没有事件。板子上报或下发指令后会出现在这里。</div>');
