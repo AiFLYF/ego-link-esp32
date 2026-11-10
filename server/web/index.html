@@ -2329,7 +2329,12 @@ function renderEvents(evts, total){
      没有这个字段时退回 `evts.length`（老服务端 / 单独调用）。 */
   if (evts && evts.length){ lastEvts = evts; lastEvTotal = total; }
   if (evExpanded) return;          /* 展开态由 toggleEvents 自己管，别盖 */
-  if (!evts || !evts.length) return;
+  if (!evts || !evts.length){
+    /* 空态：卡片不能一片空白（「指令记录」「照片」「存储」都有空态文案，这里漏了）。
+       SSE 每帧都会调到这儿，靠 setHTML 的 __html 去重，不会重复写 DOM。 */
+    setHTML($("feed"), '<div class="empty">还没有事件。板子上报或下发指令后会出现在这里。</div>');
+    return;
+  }
   var h = evts.slice(0,40).map(evItem).join("");
   var n = (total !== undefined && total !== null) ? total : evts.length;
   var label = (n > evts.length) ? ("最近 " + evts.length + " 条 / 共 " + n + " 条")
