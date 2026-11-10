@@ -33,6 +33,8 @@ function startStatic() {
     });
   });
   srv.listen(PORT, '127.0.0.1');
+  /* 端口被占时立刻炸，别去测别人的页面 */
+  srv.on('error', e => { console.error('静态服务端口 ' + PORT + ' 不可用：' + e.message); process.exit(4); });
   return srv;
 }
 

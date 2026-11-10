@@ -43,10 +43,19 @@ function startServer() {
 }
 
 async function waitHttp(url, maxSec) {
+  /* ⚠️ 不能只看 HTTP 200 就认为"服务端起来了"：
+     这台机器上 8080–8090 有一堆别的服务（实测 8081 是 opencode2api 控制台，
+     任意路径都回 200）。那样会把"端口被占、我们的服务端根本没起来"伪装成就绪，
+     后面所有断言都在测别人的页面。所以必须确认**返回的是本项目的快照**。 */
   const t0 = Date.now();
   while (Date.now() - t0 < (maxSec || 60) * 1000) {
-    try { const r = await fetch(url, { signal: AbortSignal.timeout(1500) }); if (r.ok) return true; }
-    catch (e) {}
+    try {
+      const r = await fetch(url, { signal: AbortSignal.timeout(1500) });
+      if (r.ok) {
+        const j = await r.json();
+        if (j && typeof j.device === 'string' && 'device_online' in j) return true;
+      }
+    } catch (e) {}
     await sleep(400);
   }
   return false;

@@ -80,8 +80,18 @@ function startLLM() {
 }
 
 async function waitHttp(u, s) {
+  /* 同上：只认"本项目服务端"的快照，别被占用同一端口的其他服务骗过去 */
   const t0 = Date.now();
-  while (Date.now() - t0 < s * 1000) { try { if ((await fetch(u)).ok) return true; } catch (e) {} await sleep(300); }
+  while (Date.now() - t0 < s * 1000) {
+    try {
+      const r = await fetch(u);
+      if (r.ok) {
+        const j = await r.json();
+        if (j && typeof j.device === 'string' && 'device_online' in j) return true;
+      }
+    } catch (e) {}
+    await sleep(300);
+  }
   return false;
 }
 

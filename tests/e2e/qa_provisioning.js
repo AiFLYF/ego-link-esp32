@@ -88,6 +88,9 @@ function startMock(html) {
     json({ ok: false, error: 'not found' }, 404);
   });
   srv.listen(PORT, '127.0.0.1');
+  /* 端口被别的服务占着时要**立刻炸**，不能继续跑 ——
+     否则测的是别人的页面（这台机器 8080–8090 确实有一堆别的服务）。 */
+  srv.on('error', e => { console.error('mock 端口 ' + PORT + ' 不可用：' + e.message); process.exit(4); });
   return srv;
 }
 
