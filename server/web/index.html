@@ -2225,7 +2225,12 @@ function renderSd(){
     b.onclick = function(){
       var fn = b.getAttribute("data-rm");
       confirmDialog("删除板子上的文件", "将永久删除 SD 卡里的 " + fn + "，无法恢复。", "删除")
-        .then(function(ok){ if (ok) sendCmd("sd_rm", null, {name: fn}); });
+        /* 这里必须走 doSendCmd（跳过 sendCmd 里的"危险操作再确认一次"）：
+           sd_rm 在 CMD_UI 里标了 danger，是为了不让它出现在指令栏，
+           但确认框已经在上面弹过了。走 sendCmd 会**再弹一次**，而且那次的文案
+           是写死的「格式化 SD 卡 / 整张清空」—— 删一个文件被说成清空整张卡
+           （2026-11-10 QA 抓到，用户点一次没反应、看到"格式化"又不敢点）。 */
+        .then(function(ok){ if (ok) doSendCmd("sd_rm", null, {name: fn}); });
     };
   });
 }
