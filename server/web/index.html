@@ -2268,6 +2268,10 @@ function renderCmds(cmds){
   var el = $("cmds");
   if (!cmds.length){
     setHTML(el, '<div class="empty">还没有下发过指令。</div>');
+    /* 存储面板的"还没读过 —— 点上面的「读取存储信息」"也在这里画。
+       以前这里直接 return，而 renderSd() 在函数末尾 —— 于是**一条指令都没下发过时**
+       存储面板永远是一片空白（文案写了，但代码永远走不到）。 */
+    renderSd();
     return;
   }
   setHTML(el, cmds.slice(0,8).map(function(c){
