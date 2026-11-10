@@ -2458,6 +2458,20 @@ function renderDevices(list, current){
      现在服务端两个通道都带 devices 了，这条只是**防御性兜底**：
      以后再加新通道、忘了带 devices 时，页面不会再闪。 */
   if (!Array.isArray(list)) return;
+  /* 档位显示**和"要不要画设备列表"无关**。
+     单板时下面那块卡片是隐藏的，但「指令记录」里的"当前 oN"仍然要显示 ——
+     所以 devOrient 必须先更新，再决定画不画列表。
+     （2026-11-10 QA 抓到：单板场景永远显示"还没收到板端上报的档位"，
+     因为原来更新 devOrient 的循环在 list.length<=1 的提前 return 之后。） */
+  var orientDirty = false;
+  list.forEach(function(d){
+    if (d.orient !== null && d.orient !== undefined){
+      if (devOrient[d.id] !== d.orient) orientDirty = true;
+      devOrient[d.id] = d.orient;
+    }
+  });
+  if (orientDirty) syncOrient();
+
   /* 只有一台板时不显示这块 —— 单板课堂不该凭空多出一张卡片 */
   if (list.length <= 1){
     card.hidden = true;
@@ -2524,15 +2538,11 @@ function renderDevices(list, current){
      复选框的 checked 只在不一致时赋值 —— 无条件赋值会让用户正在点的
      那颗框被"改回旧值"，表现为点了没反应（旧实现每帧整体重建，
      20 台时这问题必现）。 */
-  var online = 0, orientDirty = false;
+  var online = 0;
   list.forEach(function(d){
     var row = devRows[d.id];
     if (!row) return;
     if (d.online) online++;
-    if (d.orient !== null && d.orient !== undefined){
-      if (devOrient[d.id] !== d.orient) orientDirty = true;
-      devOrient[d.id] = d.orient;
-    }
     var sel = d.id === current;
     if (row.__sel !== sel){
       row.__sel = sel;
@@ -2563,9 +2573,7 @@ function renderDevices(list, current){
     $("devcount").textContent = cntTxt;
   }
   syncDevAllText();
-  /* 档位显示跟着 devOrient 走。它只在**档位真的变了**时才刷 ——
-     原来每次都刷，textContent 每秒被写十遍同样的内容。 */
-  if (orientDirty) syncOrient();
+  /* 档位显示（syncOrient）已经在函数开头刷过了 —— 那里单板/多板都会走到。 */
 }
 
 /* 「全选」按钮：全都勾上 / 全都取消。文案随状态变，避免用户看不出当前是哪种。
