@@ -731,6 +731,20 @@ async function shot(page, name) {
     ok(n1 < n0, '删除后数量没减少：' + n0 + ' → ' + n1);
   });
 
+  await step('D08-T03', '窄屏摄像头空态文案不指错方向', async () => {
+    await page.setViewportSize({ width: 375, height: 812 });
+    await sleep(700);
+    const cols = await page.$eval('.camwrap', e =>
+      getComputedStyle(e).gridTemplateColumns.trim().split(/\s+/).length);
+    const t = await txt(page, '#camnosig');
+    if (cols === 1) {
+      ok(t.indexOf('右侧') < 0, '窄屏下按钮在图片**下方**，文案却说「点右侧」：' + t);
+    }
+    await page.screenshot({ path: path.join(OUT, 'cam-narrow.png'), fullPage: false });
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await sleep(400);
+  });
+
   /* ============ 第六段：响应式 / 主题 / 可访问性 ============ */
   console.log('\n== 响应式 / 主题 / 可访问性 ==');
   for (const vp of [{ n: '1440', w: 1440, h: 900 }, { n: '768', w: 768, h: 1024 }, { n: '375', w: 375, h: 812 }]) {

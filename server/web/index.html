@@ -1117,7 +1117,9 @@ dialog.modal[open]::backdrop{animation:modal-veil var(--dur-2) var(--ease-out)}
             <!-- 一开始就 hidden：没有 src 时浏览器会画一个"图片裂了"的破图标，
                  比什么都不显示还难看。收到第一帧再让它出现。 -->
             <img id="camimg" alt="" hidden>
-            <div class="nosig" id="camnosig">点右侧「开启实时画面」<br>
+            <!-- 不写"点右侧"：900px 以下 .camwrap 变成上下堆叠，按钮跑到图片**下面**，
+                 文案指错方向比不指更糟（2026-11-10 QA 抓到）。 -->
+            <div class="nosig" id="camnosig">点「开启实时画面」<br>
               （板子离线 / 摄像头自检没过时不会有画面）</div>
           </div>
           <div class="camside">
