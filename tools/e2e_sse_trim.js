@@ -149,6 +149,45 @@ function frame(over) {
     check('收起后回到最近 40 条', n === 40 && /共\s*140\s*条/.test(label),
           `${n} 条 / 「${label}」`);
 
+    /* ---- 7. 滚动锚定：往下读旧事件时，新事件不该把阅读位置推移 ---- */
+    /* 事件是**头部插入**的：不做锚定的话，每来一条新事件，用户正在读的那行
+       就往下滑一格（读得多快滑得多快）。锚定 = 把正在读的那行送回原视口位置。
+       停在**列表中部**测：贴底时尾行被挤出窗口、scrollTop 已被夹住，锚定无从谈起。 */
+    await page.$eval('#feed', el => { el.scrollTop = 400; });
+    await page.waitForTimeout(100);
+    const scBefore = await page.$eval('#feed', el => el.scrollTop);
+    /* 顶行必须用 getBoundingClientRect 量：offsetTop 是相对 offsetParent 的，
+       #feed 不是定位元素，offsetTop 里带着 feed 自己在页面里的偏移，
+       拿它跟 scrollTop 比永远命中第 0 行（第一版就是这么误判的）。 */
+    const topRow = () => page.evaluate(() => {
+      const el = document.getElementById('feed');
+      const top = el.getBoundingClientRect().top;
+      const k = Array.prototype.find.call(el.children, c => c.getBoundingClientRect().bottom > top + 1);
+      return k ? k.textContent.replace(/\s+/g, ' ').slice(0, 24) : '';
+    });
+    const pinnedBefore = await topRow();
+    const fresh = { ts: Date.now() / 1000, kind: 'info', text: '新来的事件' };
+    await page.evaluate(f => window.__push(f), frame({ events: [fresh, ...events], ev_total: 141 }));
+    await page.waitForTimeout(200);
+    const scAfter = await page.$eval('#feed', el => el.scrollTop);
+    const pinnedAfter = await topRow();
+    check('新事件头部插入时阅读位置不滑走（滚动锚定）',
+          scAfter > scBefore && pinnedBefore === pinnedAfter,
+          `scrollTop ${scBefore} → ${scAfter}；视口顶行「${pinnedBefore}」→「${pinnedAfter}」`);
+
+    /* ---- 8. 空态与正常态共用一份缓存：SSE 说 0 条就必须画空态 ---- */
+    /* 旧实现空态走 setHTML（缓存在 el.__html）、正常态直接写 innerHTML，
+       两套缓存各说各话：再回到 0 条时 setHTML 看见 __html 没变就跳过写入，
+       屏幕上留着上一批事件。这里验「有 → 无 → 有」来回切都跟得上。 */
+    await page.evaluate(f => window.__push(f), frame({ events: [], ev_total: 0 }));
+    await page.waitForTimeout(200);
+    const emptyShown = await page.$eval('#feed', el => !!el.querySelector('.empty'));
+    check('SSE 报 0 条时画空态（不被旧缓存挡住）', emptyShown);
+    await page.evaluate(f => window.__push(f), frame({ events, ev_total: 141 }));
+    await page.waitForTimeout(200);
+    n = await page.$$eval('#feed .item', els => els.length);
+    check('空态之后再来事件能画回来', n === 40, `实际 ${n} 条`);
+
     check('页面无 JS 异常', errors.length === 0, errors.join(' | '));
   } finally {
     if (browser) await browser.close().catch(() => {});

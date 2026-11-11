@@ -180,6 +180,29 @@ async function shot(page, name) {
   try { await page.screenshot({ path: path.join(OUT, name + '.png'), fullPage: false }); } catch (e) {}
 }
 
+/* 必须是**浏览器能解码**的真 JPEG：服务端只校验 FF D8 魔数，但 <img> 解不出来
+   就会走 onerror → 图片保持 hidden，断言会误判成"画面没显示"（踩过一次）。 */
+const JPEG_1PX = Buffer.from(
+  '/9j/4AAQSkZJRgABAQEAYABgAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0a' +
+  'HBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPDs0NDT/wAALCAABAAEBAREA/8QAFAABAAAAAAAA' +
+  'AAAAAAAAAAAACf/EABQQAQAAAAAAAAAAAAAAAAAAAAD/2gAIAQEAAD8AKp//2Q==', 'base64');
+
+/* 服务器侧照片行（本机存档那行带 data-local="1"，删除走 IndexedDB，拦不到 HTTP） */
+const SRV_ROW = '#shotlist .shot:has(button[data-shot]:not([data-local="1"]))';
+
+/* 自己造一张服务器侧照片，不依赖前面步骤的残留 —— 照片列表只在
+   init / 拍照 / 删除 / 切设备时重画，前面 I06/I08 会把唯一一行删掉。
+   推完帧点一下「拍照」把 renderShots 带起来（它 fetch 失败也会 renderShots）。 */
+async function pushServerShot(page) {
+  const dev = await page.$eval('#devs .dev.sel', r => r.dataset.dev).catch(() => '');
+  ok(dev, '没有选中的设备：/api/shots 不带 device 就返回空列表，照片永远不会出现');
+  const r = await fetch(BASE + '/api/frame?device=' + encodeURIComponent(dev) + '&save=1',
+    { method: 'POST', headers: { 'Content-Type': 'image/jpeg' }, body: JPEG_1PX });
+  ok(r.ok, '推帧失败 ' + r.status);
+  await page.click('#camshot');
+  await waitFor(page, async () => (await page.$$(SRV_ROW)).length > 0, 15, '服务器侧照片出现在列表');
+}
+
 (async () => {
   startServer();
   if (!await waitHttp(BASE + '/api/latest', 90)) {
@@ -192,7 +215,7 @@ async function shot(page, name) {
     args: ['--no-sandbox', '--disable-dev-shm-usage', '--no-proxy-server',
            '--enable-unsafe-swiftshader'],
   });
-  const ctx = await browser.newContext({ viewport: { width: 1440, height: 900 } });
+  const ctx = await browser.newContext({ viewport: { width: 1440, height: 900 }, acceptDownloads: true });
   const page = await ctx.newPage();
   const external = [];
   page.on('request', r => {
@@ -725,14 +748,8 @@ async function shot(page, name) {
         await page.click('#cfm-ok'); await sleep(400);
       } else break;
     }
-    // 必须是**浏览器能解码**的真 JPEG：服务端只校验 FF D8 魔数，但 <img> 解不出来
-    // 就会走 onerror → 图片保持 hidden，测试会误判成"画面没显示"（踩过一次）。
-    const jpeg = Buffer.from(
-      '/9j/4AAQSkZJRgABAQEAYABgAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0a' +
-      'HBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPDs0NDT/wAALCAABAAEBAREA/8QAFAABAAAAAAAA' +
-      'AAAAAAAAAAAACf/EABQQAQAAAAAAAAAAAAAAAAAAAAD/2gAIAQEAAD8AKp//2Q==', 'base64');
     const r = await fetch(BASE + '/api/frame?device=' + encodeURIComponent('第三组-07') + '&save=1',
-      { method: 'POST', headers: { 'Content-Type': 'image/jpeg' }, body: jpeg });
+      { method: 'POST', headers: { 'Content-Type': 'image/jpeg' }, body: JPEG_1PX });
     ok(r.ok, '推帧失败 ' + r.status);
     await page.click('#camlive');       // 开启实时画面
     await waitFor(page, async () => page.isVisible('#camimg'), 15, '画面显示');
@@ -765,6 +782,71 @@ async function shot(page, name) {
     await sleep(800);
     const n1 = (await page.$$('#shotlist .shot')).length;
     ok(n1 < n0, '删除后数量没减少：' + n0 + ' → ' + n1);
+  });
+  await step('I11', '大图预览：点行开弹窗、关闭/Esc 退出、键盘可达', async () => {
+    await pushServerShot(page);
+    await page.click(SRV_ROW + ' img');
+    await waitFor(page, async () => page.evaluate(() => document.getElementById('shotview').open), 5, '预览弹窗打开');
+    await sleep(400);   /* 等 modal-in 动效落定，量出来的才是最终位置 */
+    const box = await page.evaluate(() => {
+      const r = document.getElementById('shotview').getBoundingClientRect();
+      return { l: Math.round(r.left), t: Math.round(r.top), w: Math.round(r.width),
+               h: Math.round(r.height), vw: innerWidth, vh: innerHeight };
+    });
+    /* 全局 reset（*{margin:0}）会吃掉 UA 给 <dialog> 的 margin:auto ——
+       漏写回来时所有弹窗都贴左上角，这条就是盯着它的。 */
+    ok(Math.abs((box.l + box.w / 2) - box.vw / 2) < 4 && Math.abs((box.t + box.h / 2) - box.vh / 2) < 4,
+       '弹窗没在视口里居中：' + JSON.stringify(box));
+    const cap = await txt(page, '#shotcap');
+    ok(cap && cap.indexOf('.jpg') >= 0, '弹窗说明里没有文件名：' + cap);
+    ok(!!(await page.getAttribute('#shotimg', 'src')), '大图没有 src');
+    await page.click('#shotclose');
+    await sleep(300);
+    ok(!(await page.evaluate(() => document.getElementById('shotview').open)), '「关闭」没关掉弹窗');
+    await page.focus(SRV_ROW);
+    await page.keyboard.press('Enter');
+    await sleep(300);
+    ok(await page.evaluate(() => document.getElementById('shotview').open), 'Enter 没打开预览（键盘不可达）');
+    await page.keyboard.press('Escape');
+    await sleep(300);
+    ok(!(await page.evaluate(() => document.getElementById('shotview').open)), 'Esc 没关掉预览');
+  });
+  await step('I12', '大图预览里能下载原图', async () => {
+    await page.click(SRV_ROW + ' img');
+    await waitFor(page, async () => page.evaluate(() => document.getElementById('shotview').open), 5, '预览弹窗打开');
+    const [dl] = await Promise.all([
+      page.waitForEvent('download', { timeout: 8000 }),
+      page.click('#shotdl'),
+    ]);
+    ok(/\.jpe?g$/i.test(dl.suggestedFilename()), '下载文件名不对：' + dl.suggestedFilename());
+    await page.click('#shotclose');
+    await sleep(300);
+  });
+  await step('I13', '删除失败时给出原因（不再静默刷新列表）', async () => {
+    await page.route('**/api/shots/delete', r => r.fulfill({
+      status: 200, contentType: 'application/json',
+      body: '{"ok":false,"error":"模拟删除失败"}',
+    }));
+    const n0 = (await page.$$(SRV_ROW)).length;
+    await page.click(SRV_ROW + ' button[data-shot]');
+    await sleep(400);
+    await page.click('#cfm-ok');
+    await waitFor(page, async () => (await txt(page, '#shothint')).indexOf('删除失败') >= 0, 6, '删除失败提示');
+    has(await txt(page, '#shothint'), '模拟删除失败');
+    eq((await page.$$(SRV_ROW)).length, n0, '失败时列表不该变');
+    await page.unroute('**/api/shots/delete');
+  });
+  await step('I14', '预览里删除：确认后弹窗关闭、行消失', async () => {
+    const n0 = (await page.$$(SRV_ROW)).length;
+    ok(n0 > 0, '没有照片可删');
+    await page.click(SRV_ROW + ' img');
+    await waitFor(page, async () => page.evaluate(() => document.getElementById('shotview').open), 5, '预览弹窗打开');
+    await page.click('#shotdel');
+    await sleep(400);
+    ok(await page.evaluate(() => document.getElementById('cfm').open), '删除确认框没打开');
+    await page.click('#cfm-ok');
+    await waitFor(page, async () => (await page.$$(SRV_ROW)).length < n0, 10, '行消失');
+    ok(!(await page.evaluate(() => document.getElementById('shotview').open)), '删除后预览弹窗没关');
   });
 
   await step('D08-T03', '窄屏摄像头空态文案不指错方向', async () => {
