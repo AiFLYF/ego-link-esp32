@@ -1806,9 +1806,26 @@ class Handler(BaseHTTPRequestHandler):
             return 0
 
     def _shots_list(self, query):
-        dev = clean_device_id(query_param(query, "device") or "")
+        """列某台设备的留档照片。
+
+        `?device=` **缺省**时回退到"最近上报的那台"，和 /api/latest、/api/frame
+        一个口径 —— 网页单板场景下 selDevice 是空的，三个取数接口都靠这条回退。
+        原来这里 `clean_device_id("")` 会得到兜底名 `"-"`，于是去翻 SHOTS_DIR/-/
+        （永远不存在），**单板课堂存下来的照片一张也列不出来**（2026-11-12 抓到：
+        文件在盘上、save=1 也返回 ok，网页列表恒为空）。
+
+        ⚠️ **给了名字就不要走 pick_device**：留档目录只认设备名，而"只推帧、
+        从不上报遥测"的设备（相机板 / 已被 LRU 淘汰的板）不在 DEVICES 册子里，
+        pick_device 会把它悄悄换成别台 —— 指名查照片却拿到别人的列表。
+        """
+        want = query_param(query, "device") or ""
+        if want:
+            dev = clean_device_id(want)
+        else:
+            with LOCK:
+                dev = pick_device(None).id
         out = []
-        if SHOTS_DIR and dev:
+        if SHOTS_DIR:
             d = os.path.join(SHOTS_DIR, safe_name(dev))
             if os.path.isdir(d):
                 for f in sorted(os.listdir(d), reverse=True):

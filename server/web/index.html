@@ -804,9 +804,22 @@ select{padding-right:var(--sp-2);font-family:var(--font-mono);font-size:var(--fs
   display:flex;align-items:center;gap:var(--sp-3);
   padding:var(--sp-2);border-radius:var(--radius-control);
   border:1px solid var(--color-line);background:var(--color-surface);
+  cursor:pointer;transition:border-color var(--dur-1) var(--ease-out);
 }
+.shot:hover{border-color:var(--color-line-strong)}
+.shot:focus-visible{outline:2px solid var(--color-action-primary);outline-offset:2px}
 .shot img{width:56px;height:42px;object-fit:cover;border-radius:var(--radius-control);background:var(--video-bg);flex:none}
 .shot .nm{font:400 var(--fs-meta)/1.5 var(--font-mono);flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+/* 大图预览：复用 .modal 的全部令牌与动效，只放宽宽度这一档。
+   图高按视口封顶 —— 否则竖拍的照片能把操作按钮顶出屏幕外。 */
+dialog.modal-wide{width:min(860px,calc(100vw - 32px))}
+#shotimg{
+  display:block;margin:0 auto;max-width:100%;max-height:min(62vh,560px);
+  object-fit:contain;background:var(--video-bg);border-radius:var(--radius-control);
+}
+#shotcap{font:400 var(--fs-meta)/1.6 var(--font-mono);color:var(--color-text-muted);word-break:break-all}
+/* 删除靠左、下载/关闭靠右：破坏性动作不和安全动作挤在一堆 */
+#shotdel{margin-right:auto}
 
 /* ---- 存储占用圆环 ---- */
 .ringwrap{display:flex;align-items:center;gap:var(--sp-6);flex-wrap:wrap}
@@ -853,6 +866,10 @@ dialog.modal{
   border-radius:var(--radius-modal);
   background:var(--color-surface);color:var(--color-text);
   box-shadow:var(--shadow-3), inset 0 1px 0 var(--sheen);
+  /* 居中必须显式写回来：第 263 行的全局 reset（*{margin:0}）把 UA 给
+     <dialog> 的 margin:auto 吃掉了，于是所有弹窗都贴在视口左上角
+     （2026-11-12 截图抓到：确认框、大图预览全在角上）。 */
+  margin:auto;
 }
 dialog.modal::backdrop{background:var(--modal-backdrop);backdrop-filter:blur(3px)}
 /* 进出场动效：用 animation 而不是 transition —— <dialog> 的显示/隐藏
@@ -1018,7 +1035,7 @@ dialog.modal[open]::backdrop{animation:modal-veil var(--dur-2) var(--ease-out)}
       <div class="hero-ai">
         <div class="reply" id="replybox">
           <span class="tag"><svg class="ico" viewBox="0 0 24 24" stroke-width="1.8" aria-hidden="true"><path d="M12 3l1.9 4.9L19 9.8l-4.2 3.2L16.2 19 12 16.2 7.8 19l1.4-6L5 9.8l5.1-1.9z"/></svg> AI 回复</span>
-          <div class="txt" id="reply">还没有提问。</div>
+          <div class="txt" id="reply" aria-live="polite">还没有提问。</div>
           <div class="reply-foot">
             <span>按板子 BOOT 键提问，<b>三击</b>说话</span>
             <span id="voicehint">回复同时显示在板子屏幕上</span>
@@ -1049,7 +1066,7 @@ dialog.modal[open]::backdrop{animation:modal-veil var(--dur-2) var(--ease-out)}
          900px 高的笔记本切在折线以下（规则要求主操作必须跳出来）。 -->
     <div class="stage-actions">
       <span class="cmdbar" id="cmdbts"></span>
-      <span id="cmdhint" class="hint"></span>
+      <span id="cmdhint" class="hint" role="status"></span>
     </div>
 
     <div class="stage-block">
@@ -1117,7 +1134,9 @@ dialog.modal[open]::backdrop{animation:modal-veil var(--dur-2) var(--ease-out)}
             <!-- 一开始就 hidden：没有 src 时浏览器会画一个"图片裂了"的破图标，
                  比什么都不显示还难看。收到第一帧再让它出现。 -->
             <img id="camimg" alt="" hidden>
-            <div class="nosig" id="camnosig">点右侧「开启实时画面」<br>
+            <!-- 不写"点右侧"：900px 以下 .camwrap 变成上下堆叠，按钮跑到图片**下面**，
+                 文案指错方向比不指更糟（2026-11-10 QA 抓到）。 -->
+            <div class="nosig" id="camnosig">点「开启实时画面」<br>
               （板子离线 / 摄像头自检没过时不会有画面）</div>
           </div>
           <div class="camside">
@@ -1146,6 +1165,7 @@ dialog.modal[open]::backdrop{animation:modal-veil var(--dur-2) var(--ease-out)}
           <span class="src" id="shotwho">—</span>
         </div>
         <div class="list" id="shotlist"></div>
+        <span id="shothint" class="hint" role="status"></span>
       </div>
 
       <div class="card" id="card3d" hidden>
@@ -1204,7 +1224,7 @@ dialog.modal[open]::backdrop{animation:modal-veil var(--dur-2) var(--ease-out)}
         </div>
         <div class="actions">
           <button id="cfgapply">下发到板子</button>
-          <span id="cfghint" class="hint"></span>
+          <span id="cfghint" class="hint" role="status"></span>
         </div>
         <div class="hint">
           <b>改 WiFi 会先试连、连上了才保存</b>（最多 8 秒）—— 密码填错不会把板子弄失联。
@@ -1250,6 +1270,20 @@ dialog.modal[open]::backdrop{animation:modal-veil var(--dur-2) var(--ease-out)}
   <div class="modal-foot">
     <button id="cfm-cancel" type="button">取消</button>
     <button id="cfm-ok" type="button" class="danger">确定</button>
+  </div>
+</dialog>
+
+<!-- 照片大图预览：缩略图只有 56×42，拍没拍清楚根本看不出 ——
+     点行开大图，能下载、能删。Esc / 「关闭」退出。 -->
+<dialog class="modal modal-wide" id="shotview">
+  <div class="modal-body">
+    <img id="shotimg" alt="">
+    <p id="shotcap"></p>
+  </div>
+  <div class="modal-foot">
+    <button id="shotdel" type="button" class="danger">删除</button>
+    <button id="shotdl" type="button">下载</button>
+    <button id="shotclose" type="button">关闭</button>
   </div>
 </dialog>
 
@@ -1432,7 +1466,12 @@ var CMD_UI = {
   led_set:     { label:"LED 常亮", params:{on:true}, toggle:true },
   set_orient:  { label:"设置方向档位" },
   set_config:  { label:"下发板子设置" },
-  sd_format:   { label:"格式化 SD 卡", danger:true },
+  sd_format:   { label:"格式化 SD 卡", danger:true,
+    /* 确认文案跟着指令走，不写死在 sendCmd 里 —— 否则下一个 danger 指令
+       会被问"要不要格式化 SD 卡"（2026-11-10 QA 建议 #3）。 */
+    confirm:{ title:"格式化 SD 卡",
+              body:"板子上的 SD 卡会被整张清空，卡里原有内容全部丢失，无法恢复。",
+              ok:"格式化" } },
   sd_ls:       { label:"读取存储信息" },
   /* sd_rm 需要文件名参数，裸点必然失败 —— 它只该从「存储管理」里每个文件的
      删除按钮触发，所以这里标 hidden，不在指令栏出按钮。 */
@@ -1502,8 +1541,11 @@ function drawChart(){
 
   var n = samples.length;
   if (n < 2){
-    ctx.fillStyle = cFaint; ctx.textAlign = "left";
-    ctx.fillText("等待开发板上报…", padL+6*dpr, padT+14*dpr);
+    /* 空态提示画在**绘图区正中**，不要贴着 y 轴刻度。
+       原来画在 (padL+6, padT+14)，和顶部的 "2.0" 刻度纵向只差 5px、同 10px 字号，
+       读出来是 "2.0 等待开发板上报…"（2026-11-10 QA 抓到）。 */
+    ctx.fillStyle = cFaint; ctx.textAlign = "center";
+    ctx.fillText("等待开发板上报…", padL + plotW/2, padT + plotH/2);
     return;
   }
 
@@ -1874,9 +1916,8 @@ function syncButtons(){
 function sendCmd(name, btn, overrideParams){
   var ui0 = CMD_UI[name] || {};
   if (ui0.danger){
-    confirmDialog("格式化 SD 卡",
-                  "板子上的 SD 卡会被整张清空，卡里原有内容全部丢失，无法恢复。",
-                  "格式化").then(function(ok){
+    var cfm = ui0.confirm || { title:(ui0.label || name), body:"此操作无法撤销。", ok:(ui0.label || name) };
+    confirmDialog(cfm.title, cfm.body, cfm.ok).then(function(ok){
       if (ok) doSendCmd(name, btn, overrideParams);
     });
     return;
@@ -1953,7 +1994,7 @@ function camFrame(){
     if (ns) ns.style.display = "none";
     var st = $("camstat");
     if (st) st.textContent = "画面 " + im.naturalWidth + "×" + im.naturalHeight +
-                             "（约 2 帧/秒）";
+                             "（板端推流 " + camFps() + " 帧/秒）";
   };
   im.onerror = function(){
     camBusy = false;
@@ -2005,37 +2046,76 @@ function camSetLive(on){
   sendCmd("cam_stream", null, {on: on, fps: fps});
 }
 function shotRow(dev, name, bytes, local){
-  return '<div class="shot"><img src="' + (local ? local : "/api/shots/" +
-      encodeURIComponent(dev) + "/" + encodeURIComponent(name)) + '" alt="">' +
+  /* 整行是可点的（role=button + tabindex，与设备行 / 存储圆环同一套路），
+     点开大图预览；行内的「删除」按钮自己 stopPropagation 语义靠委托里
+     排除 [data-shot] 实现。 */
+  return '<div class="shot" role="button" tabindex="0" data-open="' + esc(name) +
+      '" data-open-dev="' + esc(dev) + '" data-local="' + (local ? "1" : "") + '">' +
+      '<img src="' + (local ? local : "/api/shots/" +
+      encodeURIComponent(dev) + "/" + encodeURIComponent(name)) + '" alt="' + esc(name) + '">' +
     '<span class="nm">' + esc(name) + '<br><span class="hint">' +
     (bytes ? fmtBytes(bytes) : "") + (local ? " · 本机存档" : " · 板子/服务器") + '</span></span>' +
     '<button class="sm" data-shot="' + esc(name) + '" data-local="' + (local ? "1" : "") + '">删除</button></div>';
+}
+/* 本机存档的 objectURL 登记表：name → url。每次 renderShots 对账 ——
+  名字还在就复用同一个 URL（浏览器不必重新解码），名字没了才 revoke。
+  旧实现每渲染一次新建一批 URL 且从不 revoke，拍几十张照就漏几十份 blob 引用。 */
+var shotUrls = {};
+function shotHint(t){
+  var el = $("shothint");
+  if (el && el.textContent !== t) el.textContent = t;
+}
+function doDeleteShot(nm, dev, local){
+  if (local){
+    idbDel(nm, function(){ shotHint(""); renderShots(); });
+    return;
+  }
+  apiFetch("/api/shots/delete", {method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({device: dev, name: nm})})
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+      /* 旧实现 .then(renderShots) 不看结果：401 / 失败时列表照刷，
+         没删掉的照片"消失一下又回来"，还没有任何解释。 */
+      if (d && d.ok === false){ shotHint("删除失败：" + (d.error || d.hint || "未知错误")); return; }
+      shotHint("");
+      renderShots();
+    })
+    .catch(function(e){ shotHint("删除失败：" + e); });
 }
 function renderShots(){
   var host = $("shotlist");
   if (!host) return;
   var dev = selDevice || "";      /* 空着就交给服务端回退到"最近上报的那台" */
   var who = $("shotwho");
-  if (who) who.textContent = dev || "—";
   var server = [];
   var finish = function(){
+    /* 单板场景 selDevice 是空的、照片归"最近上报的那台"（服务端回退）——
+       标题要跟着回退结果走，否则会写着「—」却列出 Group-07 的照片。 */
+    if (who) who.textContent = dev || (server[0] && server[0].device) || "—";
     /* 服务器上的 + 本机 IndexedDB 里的，合起来展示（本机在前，刷新页面也不丢） */
     idbList(function(local){
+      var alive = {};
+      local.forEach(function(x){
+        alive[x.name] = 1;
+        /* idbList 每次调用都为同一张照片新建一个 URL：顶替旧的要顺手 revoke，
+           否则每渲染一次漏一份（旧 <img> 随 innerHTML 一起被换掉， revoke 安全）。 */
+        if (shotUrls[x.name] && shotUrls[x.name] !== x.url) URL.revokeObjectURL(shotUrls[x.name]);
+        shotUrls[x.name] = x.url;
+      });
+      Object.keys(shotUrls).forEach(function(nm){
+        if (!alive[nm]){ URL.revokeObjectURL(shotUrls[nm]); delete shotUrls[nm]; }
+      });
       var html = local.map(function(x){ return shotRow(dev, x.name, x.bytes, x.url); }).join("") +
                  server.map(function(x){ return shotRow(x.device, x.name, x.bytes, null); }).join("");
       host.innerHTML = html || '<div class="empty">还没有照片。点上面的「拍照」按钮。</div>';
       Array.prototype.forEach.call(host.querySelectorAll("[data-shot]"), function(btn){
         btn.onclick = function(){
           var nm = btn.getAttribute("data-shot");
+          var row = btn.closest ? btn.closest(".shot") : null;
+          var dv = row ? row.getAttribute("data-open-dev") : dev;
           confirmDialog("删除照片", "将永久删除 " + nm + "，无法恢复。", "删除").then(function(ok){
-            if (!ok) return;
-            if (btn.getAttribute("data-local")) {
-              idbDel(nm, renderShots);
-            } else {
-              apiFetch("/api/shots/delete", {method: "POST",
-                headers: {"Content-Type": "application/json"},
-                body: JSON.stringify({device: dev, name: nm})}).then(renderShots);
-            }
+            if (ok) doDeleteShot(nm, dv, !!btn.getAttribute("data-local"));
           });
         };
       });
@@ -2044,6 +2124,44 @@ function renderShots(){
   fetch("/api/shots?device=" + encodeURIComponent(dev)).then(function(r){ return r.json(); })
     .then(function(d){ server = (d && d.shots) || []; finish(); })
     .catch(function(){ finish(); });
+}
+
+/* ---- 大图预览 ---- */
+var shotViewCur = null;   /* 当前打开的 {name, dev, local} */
+function openShotView(row){
+  var dlg = $("shotview");
+  if (!dlg || typeof dlg.showModal !== "function") return;
+  var nm = row.getAttribute("data-open");
+  var dev = row.getAttribute("data-open-dev") || "";
+  var local = row.getAttribute("data-local") === "1";
+  var src = local ? (shotUrls[nm] || "")
+                  : "/api/shots/" + encodeURIComponent(dev) + "/" + encodeURIComponent(nm);
+  if (!src) return;
+  var img = $("shotimg");
+  img.src = src;
+  img.alt = nm;
+  var cap = $("shotcap");
+  if (cap) cap.textContent = nm + (local ? " · 本机存档" : (dev ? " · " + dev : ""));
+  shotViewCur = {name: nm, dev: dev, local: local};
+  dlg.showModal();
+}
+/* 委托挂在容器上一次：行每次 renderShots 都重建，handler 不能跟着重建 */
+function bindShotList(host){
+  if (!host || host.__bound) return;
+  host.__bound = 1;
+  host.addEventListener("click", function(ev){
+    /* 点「删除」是删除，不该顺带开大图 */
+    if (ev.target && ev.target.closest && ev.target.closest("[data-shot]")) return;
+    var row = ev.target && ev.target.closest ? ev.target.closest(".shot") : null;
+    if (row) openShotView(row);
+  });
+  host.addEventListener("keydown", function(ev){
+    if (ev.key !== "Enter" && ev.key !== " " && ev.key !== "Spacebar") return;
+    var row = ev.target && ev.target.closest ? ev.target.closest(".shot") : null;
+    if (!row) return;
+    ev.preventDefault();
+    openShotView(row);
+  });
 }
 
 /* ---- 本机存档：IndexedDB（用户要求"存浏览器里、保持持久性"）----
@@ -2225,7 +2343,12 @@ function renderSd(){
     b.onclick = function(){
       var fn = b.getAttribute("data-rm");
       confirmDialog("删除板子上的文件", "将永久删除 SD 卡里的 " + fn + "，无法恢复。", "删除")
-        .then(function(ok){ if (ok) sendCmd("sd_rm", null, {name: fn}); });
+        /* 这里必须走 doSendCmd（跳过 sendCmd 里的"危险操作再确认一次"）：
+           sd_rm 在 CMD_UI 里标了 danger，是为了不让它出现在指令栏，
+           但确认框已经在上面弹过了。走 sendCmd 会**再弹一次**，而且那次的文案
+           是写死的「格式化 SD 卡 / 整张清空」—— 删一个文件被说成清空整张卡
+           （2026-11-10 QA 抓到，用户点一次没反应、看到"格式化"又不敢点）。 */
+        .then(function(ok){ if (ok) doSendCmd("sd_rm", null, {name: fn}); });
     };
   });
 }
@@ -2261,6 +2384,10 @@ function renderCmds(cmds){
   var el = $("cmds");
   if (!cmds.length){
     setHTML(el, '<div class="empty">还没有下发过指令。</div>');
+    /* 存储面板的"还没读过 —— 点上面的「读取存储信息」"也在这里画。
+       以前这里直接 return，而 renderSd() 在函数末尾 —— 于是**一条指令都没下发过时**
+       存储面板永远是一片空白（文案写了，但代码永远走不到）。 */
+    renderSd();
     return;
   }
   setHTML(el, cmds.slice(0,8).map(function(c){
@@ -2279,8 +2406,13 @@ function renderCmds(cmds){
     /* 第 4 周：标出这条指令是不是"说话触发的" —— 网页上点的和板子前说的
        混在同一个列表里，不标就分不清"刚才那句『拍张照』到底执行了没有"。 */
     var src = (c.source === "nl") ? '<span class="meta">语音</span>' : "";
+    /* 下发时刻：服务端 commands_snapshot 带 created（epoch 秒）。
+       追"刚才那条到底什么时候发的"不用再去翻服务端日志。 */
+    var ts = (typeof c.created === "number" && isFinite(c.created))
+      ? '<span class="meta">' + new Date(c.created*1000).toLocaleTimeString("zh-CN", {hour12:false}) + '</span>'
+      : "";
     return '<div class="item"><span class="st st-' + esc(c.state) + '">' + esc(STNAME[c.state]||c.state) + '</span>'
-         + '<span class="name">' + esc(c.name) + '</span>' + ps + src
+         + ts + '<span class="name">' + esc(c.name) + '</span>' + ps + src
          + '<span class="meta">' + esc(c.id) + '</span>' + lat + extra + '</div>';
   }).join(""));
 
@@ -2311,6 +2443,34 @@ function evItem(ev){
        + '<span>' + esc(ev.text) + '</span></div>';
 }
 
+/* 事件流唯一的 innerHTML 写入口。旧实现有两处错：
+   1) 空态走 setHTML（缓存记在 el.__html）、正常态直接写 innerHTML —— 两套缓存
+      各说各话：切到「0 条事件」的设备时 setHTML 看见 __html 没变就跳过写入，
+      屏幕上留着**上一台设备**的事件（比空着更误导）；
+   2) 重绘不锚定滚动 —— 事件是头部插入的，每来一条，用户正在读的那行就往下
+      滑一格；读得多快滑得多快。
+   锚定做法：重绘前记住"视口顶端正在读的那一行"（按文本认），重绘后把它
+   送回原来的视口位置。注意**不能**用 scrollHeight 差值补偿：列表恒为 40 行
+   （头进一条、尾掉一条），差值永远是 0。 */
+function paintFeed(html){
+  var el = $("feed");
+  if (!el || evHTML === html) return;
+  var sc = el.scrollTop, key = null, dy = 0;
+  if (sc > 0){
+    for (var i = 0; i < el.children.length; i++){
+      var k = el.children[i];
+      if (k.offsetTop + k.offsetHeight > sc){ key = k.textContent; dy = sc - k.offsetTop; break; }
+    }
+  }
+  evHTML = html;
+  el.innerHTML = html;
+  if (key !== null){
+    for (var j = 0; j < el.children.length; j++){
+      if (el.children[j].textContent === key){ el.scrollTop = el.children[j].offsetTop + dy; break; }
+    }
+  }
+}
+
 function renderEvents(evts, total){
   /* 事件流的权威通道也是 SSE。/api/latest 不带 events，所以这里缺字段时
      **什么都不要做**（包括画"暂无事件"空态）—— 画了就是跟 SSE 打架。
@@ -2318,16 +2478,23 @@ function renderEvents(evts, total){
      没有这个字段时退回 `evts.length`（老服务端 / 单独调用）。 */
   if (evts && evts.length){ lastEvts = evts; lastEvTotal = total; }
   if (evExpanded) return;          /* 展开态由 toggleEvents 自己管，别盖 */
-  if (!evts || !evts.length) return;
+  /* ⚠️ "字段缺失"和"真的没有事件"必须分开：
+     /api/latest 是 5Hz 轮询、**不带 events**，如果在这里画空态，
+     就会每 200ms 把 SSE 刚画好的列表抹掉（T47 的抖动换个方向再现）。
+     只有拿到**空数组**（SSE 说"现在确实 0 条"）才画空态。 */
+  if (!evts) return;
+  if (!evts.length){
+    /* 空态：卡片不能一片空白（「指令记录」「照片」「存储」都有空态文案，这里漏了）。
+       SSE 每帧都会调到这儿，靠 paintFeed 的 evHTML 去重，不会重复写 DOM。 */
+    paintFeed('<div class="empty">还没有事件。板子上报或下发指令后会出现在这里。</div>');
+    return;
+  }
   var h = evts.slice(0,40).map(evItem).join("");
   var n = (total !== undefined && total !== null) ? total : evts.length;
   var label = (n > evts.length) ? ("最近 " + evts.length + " 条 / 共 " + n + " 条")
                                 : ("最近 " + n + " 条");
-  if (h !== evHTML){
-    evHTML = h;
-    $("feed").innerHTML = h;
-    $("evcount").textContent = label;
-  } else if ($("evcount").textContent !== label){
+  paintFeed(h);
+  if ($("evcount").textContent !== label){
     /* 条数变了但可见的那 40 条没变（比如又来了第 41 条把最旧的挤出去前）——
        文案也得跟上，否则"共 N 条"会停在旧值。 */
     $("evcount").textContent = label;
@@ -2338,7 +2505,13 @@ function setEvExpanded(on){
   evExpanded = on;
   var b = $("evmore");
   if (b) b.textContent = on ? "只看最近" : "查看全部";
-  if (!on && lastEvts){ evHTML = ""; renderEvents(lastEvts, lastEvTotal); }
+  if (!on && lastEvts){
+    evHTML = "";
+    renderEvents(lastEvts, lastEvTotal);
+    /* 200 条 ↔ 40 条是两份不同的列表，滚动位置没有可延续的意义 */
+    var f = $("feed");
+    if (f) f.scrollTop = 0;
+  }
 }
 
 function toggleEvents(){
@@ -2353,6 +2526,7 @@ function toggleEvents(){
       setEvExpanded(true);
       evHTML = evts.map(evItem).join("");
       $("feed").innerHTML = evHTML;
+      $("feed").scrollTop = 0;
       $("evcount").textContent = "全部 " + evts.length + " 条";
     })
     .catch(function(){ $("evcount").textContent = "取事件失败"; });
@@ -2458,6 +2632,27 @@ function renderDevices(list, current){
      现在服务端两个通道都带 devices 了，这条只是**防御性兜底**：
      以后再加新通道、忘了带 devices 时，页面不会再闪。 */
   if (!Array.isArray(list)) return;
+  /* 档位显示**和"要不要画设备列表"无关**。
+     单板时下面那块卡片是隐藏的，但「指令记录」里的"当前 oN"仍然要显示 ——
+     所以 devOrient 必须先更新，再决定画不画列表。
+     （2026-11-10 QA 抓到：单板场景永远显示"还没收到板端上报的档位"，
+     因为原来更新 devOrient 的循环在 list.length<=1 的提前 return 之后。） */
+  var orientDirty = false;
+  list.forEach(function(d){
+    if (d.orient !== null && d.orient !== undefined){
+      if (devOrient[d.id] !== d.orient) orientDirty = true;
+      devOrient[d.id] = d.orient;
+    }
+  });
+  /* devOrient 以设备名为键、只增不删：一学期换几十个设备名就积几十个死键
+     （syncOrient 在没勾选时会把**所有键**列出来）。按本帧名单修剪 ——
+     服务端册子里已经没有的设备，档位留着也没人看（2026-11-10 QA 建议 #4）。 */
+  Object.keys(devOrient).forEach(function(id){
+    var alive = list.some(function(d){ return d.id === id; });
+    if (!alive){ delete devOrient[id]; orientDirty = true; }
+  });
+  if (orientDirty) syncOrient();
+
   /* 只有一台板时不显示这块 —— 单板课堂不该凭空多出一张卡片 */
   if (list.length <= 1){
     card.hidden = true;
@@ -2524,15 +2719,11 @@ function renderDevices(list, current){
      复选框的 checked 只在不一致时赋值 —— 无条件赋值会让用户正在点的
      那颗框被"改回旧值"，表现为点了没反应（旧实现每帧整体重建，
      20 台时这问题必现）。 */
-  var online = 0, orientDirty = false;
+  var online = 0;
   list.forEach(function(d){
     var row = devRows[d.id];
     if (!row) return;
     if (d.online) online++;
-    if (d.orient !== null && d.orient !== undefined){
-      if (devOrient[d.id] !== d.orient) orientDirty = true;
-      devOrient[d.id] = d.orient;
-    }
     var sel = d.id === current;
     if (row.__sel !== sel){
       row.__sel = sel;
@@ -2563,9 +2754,7 @@ function renderDevices(list, current){
     $("devcount").textContent = cntTxt;
   }
   syncDevAllText();
-  /* 档位显示跟着 devOrient 走。它只在**档位真的变了**时才刷 ——
-     原来每次都刷，textContent 每秒被写十遍同样的内容。 */
-  if (orientDirty) syncOrient();
+  /* 档位显示（syncOrient）已经在函数开头刷过了 —— 那里单板/多板都会走到。 */
 }
 
 /* 「全选」按钮：全都勾上 / 全都取消。文案随状态变，避免用户看不出当前是哪种。
@@ -2609,6 +2798,13 @@ function selectDevice(id){
   evExpanded = false;
   evHTML = "";                 /* 逼下一帧按新设备的数据重画，而不是"看起来没变" */
   if ($("evmore")) $("evmore").textContent = "查看全部";
+  /* 上一台设备读到的滚动位置对新一台没有意义 —— 归零，从最新一条看起 */
+  var feed0 = $("feed");
+  if (feed0) feed0.scrollTop = 0;
+  /* 照片列表同理：它按设备取 /api/shots，不重画就会出现「标题写着 B 板、
+     列表里是 A 板的照片」（和上面 lastSd 那条一模一样，都是"看着正常"的误导）。
+     本机存档（IndexedDB）不分设备，重画后照旧显示。 */
+  renderShots();
   pull();              /* 先拉一次快照，不必等下一帧 SSE */
   stream();            /* SSE 是按设备过滤的，换设备要重连 */
 }
@@ -2986,6 +3182,28 @@ fetch("/api/commands" + devQuery()).then(function(r){ return r.json(); }).then(f
     /* 正在推流时改帧率 → 立刻重发一次命令，不用先关再开。
      * 没在推流就什么都不做：等用户点「开启实时画面」时会带上新帧率。 */
     if ($("camfps")) $("camfps").onchange = function(){ if (camOn) camSetLive(true); };
+    if ($("shotview")){
+      bindShotList($("shotlist"));
+      $("shotclose").onclick = function(){ $("shotview").close(""); };
+      $("shotdl").onclick = function(){
+        if (!shotViewCur) return;
+        var a = document.createElement("a");
+        a.href = $("shotimg").src;
+        a.download = shotViewCur.name;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+      };
+      $("shotdel").onclick = function(){
+        if (!shotViewCur) return;
+        var cur = shotViewCur;
+        confirmDialog("删除照片", "将永久删除 " + cur.name + "，无法恢复。", "删除").then(function(ok){
+          if (!ok) return;
+          $("shotview").close("");
+          doDeleteShot(cur.name, cur.dev, cur.local);
+        });
+      };
+    }
     renderShots();
   } catch (e) {
     if (window.console) console.warn("摄像头初始化失败（不影响其它功能）: " + e);

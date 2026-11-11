@@ -22,7 +22,11 @@
 static const char PROV_PAGE_HTML[] =
 "<!DOCTYPE html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
 "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
-"<title>Ego Link 配网</title><style>"
+"<title>Ego Link 配网</title>"
+/* 空 favicon：不写这行浏览器会去请求 /favicon.ico，板子的 HTTP 服务没有这条路由，
+   每次打开配网页都留一条 404（仪表盘 server/web/index.html 早就修过同一个坑）。 */
+"<link rel=\"icon\" href=\"data:,\">"
+"<style>"
 "*{box-sizing:border-box}"
 "body{margin:0;padding:16px;font:15px/1.5 system-ui,-apple-system,'Segoe UI',sans-serif;"
 "background:#0f1115;color:#e8eaed;max-width:520px;margin:0 auto}"

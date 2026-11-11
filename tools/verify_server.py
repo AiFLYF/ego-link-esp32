@@ -931,6 +931,21 @@ def main():
             check("删完列表里没有了", len(left.get("shots", [])) == len(shots["shots"]) - 1,
                   "实际: %d 张" % len(left.get("shots", [])))
 
+        # 缺省 device 的回退：网页单板场景 selDevice 是空的，/api/shots 不带 device
+        # 就必须回退到"最近上报的那台"（原来落到兜底名 "-"，于是去翻一个永远不存在
+        # 的目录，列表恒为空 —— 照片明明存下来了却一张也不显示）。
+        # 这里用**当前最近上报的那台**留档一张再查，不依赖 cam-01 在不在册
+        # （它只推帧、从不上报遥测，恰恰是"指名查不许被回退"那一面的例子）。
+        who = get_json("http://127.0.0.1:%d/api/latest" % port).get("device") or ""
+        st, body = cam_post("/api/frame?device=" + urllib.parse.quote(who) + "&save=1", frame2)
+        saved2 = json.loads(body.decode()).get("saved") if st == 200 else None
+        fb = get_json("http://127.0.0.1:%d/api/shots" % port).get("shots") or []
+        check("/api/shots 不带 device 会回退到最近上报的那台（照片列得出来）",
+              bool(who) and bool(saved2)
+              and any(s.get("name") == saved2 and s.get("device") == who for s in fb),
+              "最近上报=%s / 留档=%s / 缺省列表=%s"
+              % (who, saved2, [(s.get("device"), s.get("name")) for s in fb][:3]))
+
         # ---- 18. 多设备（PROPOSAL §4.1 / 优先级 ③）---------------------------
         # 这一节必须放在最后：它往服务端注册了新设备，会改变"最近上报过的设备"
         # 是哪一台，而前面所有小节都是靠那个回退语义（不带 ?device=）工作的。
