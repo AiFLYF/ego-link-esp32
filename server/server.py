@@ -42,10 +42,11 @@ import struct
 import sys
 import threading
 import time
+import urllib.error
 import urllib.request
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import unquote, urlsplit
+from urllib.parse import quote, unquote, urlsplit
 
 # --------------------------------------------------------------------------
 # 同目录的两个模块（2026-11-01 从本文件拆出：analysis / jsonl_log）
@@ -86,6 +87,15 @@ MAX_WINDOW = int(WINDOW_S / 0.008) + 64      # = 1064
 
 DEVICE_TIMEOUT = 5.0      # 超过该秒数没有新遥测则视为离线
 LLM_TIMEOUT = 25.0        # 大模型请求超时（后台线程里等，不影响板端）
+# 板端提问（BOOT 单击/语音）单独收紧的等待上限：实测带 reasoning 的模型
+# 正文要等 10s+，板端孩子等不了那么久 —— 超时回退本地规则 AI 并在事件流
+# 注明「请求超时」，网页提问仍走 LLM_TIMEOUT（人坐在屏幕前，等得起）。
+LLM_BOARD_TIMEOUT = float(os.environ.get("RW1_LLM_BOARD_TIMEOUT", "10"))
+# 出站请求的 User-Agent。**不能留 urllib 默认值**（Python-urllib/x.y）：
+# 实测（2026-11-03）上游的 Cloudflare 按浏览器签名封禁，默认 UA 直接吃
+# HTTP 403 "error code: 1010"，换成任何显式 UA 立刻 200。服务端自己的
+# server_version 是 RW1/1.1，出站就用同一个标识，对端日志里也好认。
+LLM_USER_AGENT = "RW1/1.1"
 # 同时打大模型的请求上限。一个班 20 块板可能同时提问，没有上限时 20 个线程
 # 一起砸过去，对方一限流就**全部**超时 —— 课堂里表现为"全班的 AI 同时傻了"，
 # 且每个人都要干等 LLM_TIMEOUT 秒。语义：最多 N 个在飞，其余在信号量上排队；
@@ -103,7 +113,8 @@ _LLM_SEM = threading.BoundedSemaphore(max(1, LLM_MAX_CONCURRENT))
 # 不配 RW1_API_TOKEN = 完全关闭，行为与以前逐字节相同。
 # 配了则下面这些接口要求 `X-RW1-Token` 请求头（或 `?token=` 查询参数）。
 API_TOKEN = os.environ.get("RW1_API_TOKEN", "").strip()
-WEB_WRITE_PATHS = ("/api/command", "/api/ask", "/api/ask/cancel", "/api/shots/delete")
+WEB_WRITE_PATHS = ("/api/command", "/api/ask", "/api/ask/cancel", "/api/shots/delete",
+                   "/api/files/delete", "/api/files/upload")
 # 写入口的同源校验（CSRF）总开关。默认开启；只有在反向代理会改写 Host
 # 导致误判时才需要设 RW1_ALLOW_CROSS_ORIGIN=1 关掉。详见 Handler._origin_ok。
 ALLOW_CROSS_ORIGIN = os.environ.get("RW1_ALLOW_CROSS_ORIGIN", "").strip() == "1"
@@ -152,7 +163,11 @@ CHAT_HISTORY = 6               # 多轮上下文保留的问答轮数（澄清�
 MAX_BATCH = 400           # 单次 POST 最多接受的样本数（防止畸形/恶意负载）
 VALID_G_MAX = 16.0        # 单轴可信上限（g）。固件 sanitize3 是 ±8g，这里留一倍余量；
                           # 超出的一律当坏帧丢弃，见 Handler._parse_points
-BOARD_REPLY_MAX = 512     # 回传板端的回复字节上限（UTF-8 安全截断）
+# 回传板端的回复字节上限（UTF-8 安全截断）。
+# **必须小于固件 TRANSPORT_REPLY_LEN（512）**：clip_utf8 截断后还会追加一个「…」，
+# 若这里写 512，板端 512 字节的 utf8_strlcpy 会把省略号连同最后一两个字一起切掉 ——
+# 超长回复就失去了"被截断过"的标注。留 32 字节余量（480 + 3 < 512）。
+BOARD_REPLY_MAX = 480
 
 # 仪表盘自托管字体白名单（详见 Handler._send_vendor_font）。字体名来自 URL，
 # 所以不放正则、只放**逐字写死**的文件名 —— 这是最难被绕过的白名单。
@@ -340,6 +355,112 @@ def clean_device_id(raw):
     s = "".join(ch for ch in s if ch.isprintable())
     s = " ".join(s.split())[:DEVICE_ID_MAX]
     return s or DEFAULT_DEVICE
+
+
+# ==========================================================================
+# 仪表盘「文件管理」（2026-11-04）
+# --------------------------------------------------------------------------
+# 只暴露三类**由本项目自己写出来的**目录，绝不接受任意路径：
+#   shots → SHOTS_DIR/<设备>/    （板端拍照留档）
+#   audio → AUDIO_DIR/<设备>/    （语音链路的录音留档）
+#   logs  → 数据目录根（JsonlLogger 的 telemetry-*.jsonl / events-*.jsonl）
+# 文件名走**白名单 + 拒绝**（不改写成别的名字），设备名复用 safe_name，
+# 最后再做一次"解析后的绝对路径必须落在 base 里"的夹紧 —— 三道都过才算合法。
+# ==========================================================================
+FILE_CATS = {"shots": "照片", "audio": "录音", "logs": "日志"}
+FILE_MAX_BYTES = 8 * 1024 * 1024          # 上传上限（照片/录音都远小于它）
+FILE_PREVIEW_DEFAULT = 64 * 1024          # 预览默认读多少字节
+FILE_PREVIEW_MAX = 256 * 1024             # 预览最多允许多少字节（客户端也夹）
+FILE_LIST_MAX = 500                       # 单个分类最多列多少条
+FILE_NAME_MAX = 96
+FILE_EXTS = {
+    "shots": (".jpg", ".jpeg", ".png"),
+    "audio": (".wav",),
+    "logs": (".jsonl", ".log", ".txt"),
+}
+TEXT_EXTS = (".jsonl", ".log", ".txt", ".json", ".csv", ".md")
+FILE_CTYPES = {
+    ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
+    ".wav": "audio/wav",
+    ".jsonl": "application/x-ndjson", ".json": "application/json",
+    ".log": "text/plain; charset=utf-8", ".txt": "text/plain; charset=utf-8",
+    ".csv": "text/csv; charset=utf-8", ".md": "text/plain; charset=utf-8",
+}
+# Windows 上这些名字会被当成设备/保留名（NUL/CON/COM1…），写进去行为不可预期。
+_WIN_RESERVED = {"con", "prn", "aux", "nul"}
+_WIN_RESERVED |= {"com%d" % i for i in range(1, 10)}
+_WIN_RESERVED |= {"lpt%d" % i for i in range(1, 10)}
+
+
+def file_cat_dir(cat):
+    """分类 → 根目录；未知分类/未初始化返回 None。"""
+    if cat == "shots":
+        return SHOTS_DIR
+    if cat == "audio":
+        return AUDIO_DIR
+    if cat == "logs":
+        return LOGGER.root if LOGGER is not None else None
+    return None
+
+
+def file_device_dir(device):
+    """设备名 → 安全的目录名。空设备名**拒绝**（否则 clean_device_id 会兜成默认设备，
+    删别人的文件时这是最不该出现的"好心"）。"""
+    raw = device.strip() if isinstance(device, str) else ""
+    if not raw:
+        return None
+    sd = safe_name(clean_device_id(raw))
+    if sd in (".", "..") or not sd.strip("."):
+        return None
+    return sd
+
+
+def file_safe_name(name):
+    """文件名白名单。不安全一律返回 None（**不替用户改名**，免得"以为是删除/上传成功了"）。"""
+    if not isinstance(name, str):
+        return None
+    s = name.strip()
+    if not s or len(s) > FILE_NAME_MAX:
+        return None
+    if s in (".", "..") or not s.strip("."):
+        return None
+    if any(ch in s for ch in ("/", "\\", ":", "\x00", "\r", "\n")):
+        return None
+    if any(ord(c) < 32 for c in s):
+        return None
+    if s.split(".")[0].lower() in _WIN_RESERVED:
+        return None
+    return s
+
+
+def file_ext_ok(cat, name):
+    exts = FILE_EXTS.get(cat) or ()
+    return name.lower().endswith(exts)
+
+
+def file_path(cat, device, name):
+    """分类+设备+文件名 → 绝对路径。三道校验全过才返回，否则 None。"""
+    base = file_cat_dir(cat)
+    if not base:
+        return None
+    fname = file_safe_name(name)
+    if not fname:
+        return None
+    if cat == "logs":
+        folder = base
+    else:
+        sd = file_device_dir(device)
+        if not sd:
+            return None
+        folder = os.path.join(base, sd)
+    full = os.path.abspath(os.path.join(folder, fname))
+    root = os.path.abspath(base)
+    # normcase：Windows 路径大小写不敏感，必须按同一口径比较，否则
+    # `SHOTS%2F..%2Fsecrets.txt` 这种大小写变形会绕过前缀判断。
+    nfull, nroot = os.path.normcase(full), os.path.normcase(root)
+    if nfull != nroot and not nfull.startswith(nroot + os.sep):
+        return None
+    return full
 
 
 def get_device(did):
@@ -926,7 +1047,10 @@ def _transcribe_cloud(cfg, wav):
     req = urllib.request.Request(
         cfg["base"] + "/audio/transcriptions", data=body,
         headers={"Content-Type": "multipart/form-data; boundary=" + boundary,
-                 "Authorization": "Bearer " + cfg["key"]},
+                 "Authorization": "Bearer " + cfg["key"],
+                 # 与大模型同一原因（LLM_USER_AGENT 的注释）：
+                 # urllib 默认 UA 会被部分网关按签名封禁。
+                 "User-Agent": LLM_USER_AGENT},
     )
     try:
         with urllib.request.urlopen(req, timeout=ASR_TIMEOUT) as resp:
@@ -967,19 +1091,23 @@ def transcribe(audio_bytes):
         return None, "本地识别失败(%s)" % exc.__class__.__name__
 
 
-def ask_llm(dev, question):
+def ask_llm(dev, question, timeout=None, for_board=False):
     """可选：调用 OpenAI 兼容大模型。未配置/失败返回 None → 回退本地模板。
 
     第 4 周「澄清」：带上该设备最近的对话历史，这样"再详细点""那刚才呢"
     这类追问能被理解。历史**按设备隔离**（课堂 20 块板共用一台服务器），
     而且只放问答文本 —— 每轮都重塞一遍遥测摘要既费 token 又会把
     上下文淹没在重复内容里。
+
+    `timeout`：显式覆盖本次请求的等待上限（秒）；
+    `for_board`：为 True 时使用收紧后的 RW1_LLM_BOARD_TIMEOUT 上限（默认 10s）。
     """
-    key = os.environ.get("RW1_LLM_API_KEY")
-    if not key:
+    _load_dotenv()
+    cfg = _llm_cfg(for_board=for_board)
+    if cfg is None:
         return None
-    base = os.environ.get("RW1_LLM_BASE_URL", "https://api.openai.com/v1").rstrip("/")
-    model = os.environ.get("RW1_LLM_MODEL", "gpt-4o-mini")
+    if timeout is not None:
+        cfg["timeout"] = timeout
     with LOCK:
         history = list(dev.chat)
     # ai_summary() 内部要取 LOCK，必须在 with LOCK 之外调用（否则自锁）
@@ -989,22 +1117,157 @@ def ask_llm(dev, question):
     messages.extend({"role": r, "content": c} for r, c in history)
     messages.append({"role": "user",
                      "content": "开发板传感器情况：%s\n同学想问：%s" % (ai_summary(dev), question)})
-    payload = {"model": model, "messages": messages, "max_tokens": 300}
-    req = urllib.request.Request(
-        base + "/chat/completions",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json", "Authorization": "Bearer " + key},
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=LLM_TIMEOUT) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-        return data["choices"][0]["message"]["content"].strip()
-    except Exception as exc:  # noqa: BLE001 —— 任何失败都回退本地模板
-        push_event(dev, "warn", "大模型调用失败(%s)，已用本地AI回复" % exc.__class__.__name__)
+    payload = {"model": cfg["model"], "messages": messages, "max_tokens": 300}
+
+    # 实测这个上游（new-api 网关 + Cloudflare）丢包严重：建连成功率约六成。
+    # 所以失败**必须重试**：连接类错误、超时、429、5xx、返回非 JSON 都可能是
+    # 瞬时故障；4xx（除 429）是配置/权限问题，重试没意义，直接报原因。
+    # 任何路径都不许静默卡死 —— 最终一定落一句可读原因进事件流。
+    last_err = "未知错误"
+    attempts = 0
+    for attempt in range(1 + cfg["retries"]):
+        attempts = attempt + 1
+        try:
+            req = urllib.request.Request(
+                cfg["base"] + "/chat/completions",
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json",
+                         "Authorization": "Bearer " + cfg["key"],
+                         # Cloudflare 按 UA 签名封禁 urllib 默认 UA（403/1010），
+                         # 必须显式给 —— 见 LLM_USER_AGENT 的注释。
+                         "User-Agent": LLM_USER_AGENT},
+            )
+            with urllib.request.urlopen(req, timeout=cfg["timeout"]) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            text = _llm_extract_text(data)
+            if text:
+                return text
+            last_err = "响应格式异常（找不到正文）"
+        except json.JSONDecodeError:
+            # 网关抖起来会回 Cloudflare 的 HTML 错误页 —— 按瞬时故障处理（重试）
+            last_err = "响应不是合法 JSON"
+        except urllib.error.HTTPError as exc:
+            last_err = _llm_error_text(exc)
+            if exc.code not in (429,) and not (500 <= exc.code < 600):
+                break                      # 4xx 配置错误，重试无意义
+        except Exception as exc:  # noqa: BLE001 —— 连接/超时/DNS 都按瞬时故障重试
+            last_err = _llm_error_text(exc)
+        if attempt < cfg["retries"]:
+            time.sleep(1.0)              # 退避一拍再来，别把网关刷成真正的限流
+    push_event(dev, "warn", "大模型调用失败（%s，共试 %d 次），已用本地AI回复"
+               % (last_err, attempts))
+    return None
+
+
+def _llm_cfg(for_board=False):
+    """大模型配置；没配 key 返回 None（= 整个功能降级到本地规则 AI）。
+
+    base / model / 超时 / 重试次数全部走环境变量（.env 由 _load_dotenv 补齐），
+    代码里不落地任何密钥。默认值保持 OpenAI 官方端点，换渠道只改配置不改代码。
+    """
+    key = os.environ.get("RW1_LLM_API_KEY")
+    if not key:
         return None
+    timeout = float(os.environ.get("RW1_LLM_TIMEOUT", str(LLM_TIMEOUT)))
+    if for_board:
+        board_timeout = float(os.environ.get("RW1_LLM_BOARD_TIMEOUT",
+                                             str(LLM_BOARD_TIMEOUT)))
+        timeout = min(timeout, board_timeout)
+    return {
+        "key": key,
+        "base": os.environ.get("RW1_LLM_BASE_URL",
+                               "https://api.openai.com/v1").rstrip("/"),
+        "model": os.environ.get("RW1_LLM_MODEL", "gpt-4o-mini"),
+        "timeout": timeout,
+        "retries": max(0, min(5, int(os.environ.get("RW1_LLM_RETRIES", "2")))),
+    }
 
 
-def _llm_worker(dev, question, token):
+def _llm_extract_text(data):
+    """从 OpenAI 兼容响应里取正文，容忍几种结构变体。取不到返回 None。
+
+    实测记录（2026-11-03，qwen3.8-27b @ new-api 网关）：标准结构之外还带着
+    `reasoning_content`（思考过程）—— 那是**模型的草稿，不是给用户看的**，
+    content 为空的退化场合宁可判格式异常、回退本地 AI，也不拿草稿冒充正文。
+    """
+    try:
+        ch = data.get("choices")
+        if isinstance(ch, list) and ch:
+            first = ch[0]
+            if isinstance(first, dict):
+                msg = first.get("message")
+                if isinstance(msg, dict):
+                    t = msg.get("content")
+                    if isinstance(t, str) and t.strip():
+                        return t.strip()
+                t = first.get("text")
+                if isinstance(t, str) and t.strip():
+                    return t.strip()
+        for k in ("content", "reply", "text", "output", "answer"):
+            t = data.get(k)
+            if isinstance(t, str) and t.strip():
+                return t.strip()
+    except (AttributeError, TypeError, IndexError, KeyError):
+        pass
+    return None
+
+
+def _llm_error_text(exc):
+    """把一次失败的异常翻成给用户看的一句中文原因。**绝不带任何密钥**。"""
+    if isinstance(exc, urllib.error.HTTPError):
+        code = exc.code
+        if code == 401:
+            return "密钥被拒（401）"
+        if code == 403:
+            return "没有权限（403）"
+        if code == 404:
+            return "接口或模型不存在（404）"
+        if code == 429:
+            return "上游限流（429）"
+        if 500 <= code < 600:
+            return "上游服务错误（%d）" % code
+        return "上游拒绝（%d）" % code
+    msg = ("%s: %s" % (exc.__class__.__name__, exc)).lower()
+    if "timed out" in msg or "timeout" in msg or isinstance(exc, (TimeoutError,)):
+        return "请求超时"
+    if "getaddrinfo" in msg or "11001" in msg or "name or service" in msg \
+            or "temporary failure" in msg or "解析" in msg:
+        return "DNS 解析失败"
+    return "连接失败"
+
+
+_DOTENV_LOADED = False
+
+
+def _load_dotenv():
+    """把仓库根目录 `.env` 里的 RW1_* 读进环境变量（**只补缺省，不覆盖**）。
+
+    `.env` 在 .gitignore 里（密钥绝不入库、不打印）。只放行 RW1_ 前缀，
+    防止一个配置文件悄悄改掉进程的其它行为。文件不存在就静默跳过 —
+    和「不配大模型也能完整跑通」是同一条原则。
+    """
+    global _DOTENV_LOADED
+    if _DOTENV_LOADED:
+        return
+    _DOTENV_LOADED = True
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                        ".env")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, _, v = line.partition("=")
+                k = k.strip()
+                v = v.strip().strip('"').strip("'")
+                if k.startswith("RW1_") and k and k not in os.environ:
+                    os.environ[k] = v
+    except OSError:
+        pass
+
+
+def _llm_worker(dev, question, token, timeout=None, for_board=False):
     """后台线程：调大模型，完成后把结果写回该设备的状态。
 
     注意 ai_summary() 内部会取 LOCK，必须在进入 with LOCK 之前调用，否则自锁。
@@ -1018,7 +1281,7 @@ def _llm_worker(dev, question, token):
     reply = None
     if _LLM_SEM.acquire(timeout=LLM_QUEUE_TIMEOUT):
         try:
-            reply = ask_llm(dev, question)
+            reply = ask_llm(dev, question, timeout=timeout, for_board=for_board)
         finally:
             _LLM_SEM.release()
     else:
@@ -1234,7 +1497,7 @@ def run_intent(dev, question, intent):
     return spoken
 
 
-def request_ai(dev, question):
+def request_ai(dev, question, llm_timeout=None, for_board=False):
     """处理一次板端提问，**立即**返回文本；大模型在后台生成，稍后自动生效。
 
     板端每个遥测周期都会带回最新的 ai_reply，所以后台结果下一帧就会显示，
@@ -1249,6 +1512,9 @@ def request_ai(dev, question):
     if intent is not None:
         return run_intent(dev, question, intent)
 
+    # .env 只在这里和 ask_llm 里读一次（幂等）：没有这一行的话，
+    # 只在 .env 里配了 key 的用户会永远走不到大模型这条路。
+    _load_dotenv()
     if os.environ.get("RW1_LLM_API_KEY"):
         with LOCK:
             if dev.st["ai_pending"]:
@@ -1263,8 +1529,9 @@ def request_ai(dev, question):
             dev.st["ai_t0"] = time.time()    # 计时：生成从这一刻算起
             dev.st["ai_ms"] = 0
         push_event(dev, "ask", "板端提问「%s」→ 已转交大模型" % question)
-        threading.Thread(target=_llm_worker, args=(dev, question, token), daemon=True,
-                         name="llm").start()
+        threading.Thread(target=_llm_worker,
+                         args=(dev, question, token, llm_timeout, for_board),
+                         daemon=True, name="llm").start()
         return "正在思考…"
 
     reply = ai_summary(dev)
@@ -1356,7 +1623,8 @@ def _voice_worker(dev, data, saved, turn=None):
         dev.st["voice_err"] = ""
         dev.st["voice_state"] = "thinking"
     push_event(dev, "ask", "识别到「%s」%s" % (text, ("（%s）" % saved) if saved else ""))
-    request_ai(dev, text)
+    # 板端语音提问：孩子等不了 reasoning 模型的 10s+，用收紧的上限（见 LLM_BOARD_TIMEOUT 注释）
+    request_ai(dev, text, for_board=True)
     # 规则 AI 是同步返回的，这会儿已经出结果了；大模型还要等后台线程，
     # 那种情况下 voice_state 留在 "thinking"，等 _llm_worker 收尾时自然回落。
     with LOCK:
@@ -1677,6 +1945,12 @@ class Handler(BaseHTTPRequestHandler):
                                        ensure_ascii=False))
         elif path.startswith("/api/shots/"):
             self._send_shot(path[len("/api/shots/"):])
+        elif path == "/api/files":
+            self._files_index(query)
+        elif path == "/api/files/download":
+            self._file_send(query, preview=False)
+        elif path == "/api/files/preview":
+            self._file_send(query, preview=True)
         elif path == "/api/stream":
             self._sse(query)
         else:
@@ -1719,6 +1993,10 @@ class Handler(BaseHTTPRequestHandler):
             self._ask_cancel(query)
         elif path == "/api/shots/delete":
             self._shot_delete()
+        elif path == "/api/files/delete":
+            self._file_delete()
+        elif path == "/api/files/upload":
+            self._file_upload(query)
         else:
             self._send(404, json.dumps({"ok": False, "error": "not found"}))
 
@@ -1862,7 +2140,12 @@ class Handler(BaseHTTPRequestHandler):
             self._send(400, json.dumps({"ok": False, "error": "bad json body"},
                                        ensure_ascii=False))
             return
-        dev = clean_device_id(str(msg.get("device", "")))
+        raw_dev = str(msg.get("device") or "").strip()
+        if raw_dev:
+            dev = clean_device_id(raw_dev)
+        else:
+            with LOCK:
+                dev = pick_device(None).id
         fn = str(msg.get("name", ""))
         if (not dev or not fn or "/" in fn or "\\" in fn or ".." in fn
                 or ":" in fn or not SHOTS_DIR):
@@ -1875,6 +2158,236 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, json.dumps({"ok": True}, ensure_ascii=False))
         except OSError as e:
             self._send(404, json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False))
+
+    # ---- 文件管理（2026-11-04）--------------------------------------------
+    def _files_index(self, query):
+        """列某台设备（或日志目录）下的文件。`?cat=shots|audio|logs` 可选。"""
+        cat = (query_param(query, "cat") or "").strip()
+        if cat and cat not in FILE_CATS:
+            self._send(400, json.dumps({"ok": False, "error": "unknown category"},
+                                       ensure_ascii=False))
+            return
+        device = (query_param(query, "device") or "").strip()
+        keys = [cat] if cat else list(FILE_CATS)
+        # 明确点名了设备就**必须合法**：这种情况下要是也"好心兜底"，
+        # 一次 `?device=..` 的拼错就会变成"列/删了最近那台板子的目录"。
+        if device and any(k != "logs" for k in keys) and not file_device_dir(device):
+            self._send(400, json.dumps({"ok": False, "error": "bad device name"},
+                                       ensure_ascii=False))
+            return
+        # 只读列表允许"没给设备"：和 /api/shots 一样退回最近上报的那台
+        # （单板场景页面永远不带 ?device=）。**删除/上传不享受这个兜底** ——
+        # 写操作必须点名设备，免得手一滑删掉别人的文件。
+        if not device and any(k != "logs" for k in keys):
+            with LOCK:
+                device = pick_device(None).id
+        cats = []
+        for key in keys:
+            base = file_cat_dir(key)
+            files = []
+            note = ""
+            folder = None
+            if base is None:
+                note = "目录未初始化"
+            elif key == "logs":
+                folder = base
+            else:
+                sd = file_device_dir(device)
+                if sd:
+                    folder = os.path.join(base, sd)
+                else:
+                    note = "需要先选择设备"
+            if folder and os.path.isdir(folder):
+                try:
+                    with os.scandir(folder) as it:
+                        for ent in it:
+                            try:
+                                if not ent.is_file():
+                                    continue
+                                stt = ent.stat()
+                            except OSError:
+                                continue     # 列目录时被删掉/无权限：跳过这一条
+                            lname = ent.name.lower()
+                            files.append({"name": ent.name, "bytes": stt.st_size,
+                                          "mtime": round(stt.st_mtime, 1),
+                                          "text": lname.endswith(TEXT_EXTS)})
+                except OSError as e:
+                    note = "读取目录失败: %s" % e
+            # 先按时间排再截断：截断必须留下**最近的** 500 条，而不是 scandir
+            # 碰上什么算什么（旧实现是先截后排，超限时留下的是任意 500 条）。
+            files.sort(key=lambda f: (-f["mtime"], f["name"]))
+            capped = len(files) > FILE_LIST_MAX
+            files = files[:FILE_LIST_MAX]
+            cats.append({"key": key, "label": FILE_CATS[key], "files": files,
+                         "note": note, "capped": capped,
+                         "device": device if key != "logs" else ""})
+        self._send(200, json.dumps({"ok": True, "device": device, "categories": cats,
+                                    "max_bytes": FILE_MAX_BYTES,
+                                    "preview_max": FILE_PREVIEW_MAX},
+                                   ensure_ascii=False))
+
+    def _file_send(self, query, preview):
+        """下载 / 预览。预览只读前 limit 字节并明确标注 truncated。"""
+        cat = (query_param(query, "cat") or "").strip()
+        name = query_param(query, "name") or ""
+        path = file_path(cat, query_param(query, "device") or "", name)
+        if path is None:
+            # 路径/设备/分类不合法 → 400（404 会让人以为"文件只是没了"，
+            # 掩盖掉真正的坏输入）
+            self._send(400, json.dumps({"ok": False, "error": "bad path or device"},
+                                       ensure_ascii=False))
+            return
+        if not os.path.isfile(path):
+            self._send(404, json.dumps({"ok": False, "error": "no such file"},
+                                       ensure_ascii=False))
+            return
+        if preview and not name.lower().endswith(TEXT_EXTS):
+            self._send(415, json.dumps({"ok": False, "error": "not a text file"},
+                                       ensure_ascii=False))
+            return
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            self._send(404, json.dumps({"ok": False, "error": "stat failed"},
+                                       ensure_ascii=False))
+            return
+        if preview:
+            limit = clamp_int(query_param(query, "limit"), 1, FILE_PREVIEW_MAX,
+                              FILE_PREVIEW_DEFAULT)
+            try:
+                with open(path, "rb") as f:
+                    blob = f.read(limit)
+            except OSError as e:
+                self._send(400, json.dumps({"ok": False, "error": str(e)},
+                                           ensure_ascii=False))
+                return
+            self._send(200, json.dumps({
+                "ok": True,
+                "name": os.path.basename(path),
+                "bytes": size,
+                "limit": limit,
+                "truncated": size > len(blob),
+                "text": blob.decode("utf-8", errors="replace"),
+            }, ensure_ascii=False))
+            return
+        fname = os.path.basename(path)
+        ctype = FILE_CTYPES.get(os.path.splitext(fname)[1].lower(),
+                                "application/octet-stream")
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(size))
+        # RFC 5987：中文文件名必须用 filename*，否则浏览器会拿到乱码/被截断的名字
+        self.send_header("Content-Disposition",
+                         "attachment; filename*=UTF-8''" + quote(fname))
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        # 大文件分块写，不把整个文件读进内存（照片/录音可能到几十 MB）
+        try:
+            with open(path, "rb") as f:
+                while True:
+                    chunk = f.read(256 * 1024)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass    # 浏览器取消下载：连接断了，没什么可补救的
+
+    def _file_delete(self):
+        msg = self._read_json()
+        if msg is None:
+            self._send(400, json.dumps({"ok": False, "error": "bad json body"},
+                                       ensure_ascii=False))
+            return
+        path = file_path(str(msg.get("cat") or ""), str(msg.get("device") or ""),
+                         str(msg.get("name") or ""))
+        if path is None:
+            self._send(400, json.dumps({"ok": False, "error": "bad path or device"},
+                                       ensure_ascii=False))
+            return
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            self._send(404, json.dumps({"ok": False, "error": "no such file"},
+                                       ensure_ascii=False))
+            return
+        except OSError as e:
+            self._send(400, json.dumps({"ok": False, "error": str(e)},
+                                       ensure_ascii=False))
+            return
+        self._send(200, json.dumps({"ok": True, "deleted": os.path.basename(path)},
+                                   ensure_ascii=False))
+
+    def _file_upload(self, query):
+        """`?cat=&device=&name=` + 裸 body。先校验路径与扩展名，再读 body。"""
+        cat = (query_param(query, "cat") or "").strip()
+        name = query_param(query, "name") or ""
+        path = file_path(cat, query_param(query, "device") or "", name)
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            n = -1
+        if path is None:
+            # T58：拒绝时也要把 body 读掉，否则客户端收到的是 RST 而不是 400
+            self._drain(min(n, FILE_MAX_BYTES + 1) if n > 0 else 0)
+            self._send(400, json.dumps({"ok": False, "error": "bad path or device"},
+                                       ensure_ascii=False))
+            return
+        fname = file_safe_name(name)
+        if not fname or not file_ext_ok(cat, fname):
+            self._drain(min(n, FILE_MAX_BYTES + 1) if n > 0 else 0)
+            self._send(415, json.dumps({"ok": False, "error": "extension not allowed",
+                                        "allowed": list(FILE_EXTS.get(cat) or ())},
+                                       ensure_ascii=False))
+            return
+        if n <= 0:
+            self._send(400, json.dumps({"ok": False, "error": "empty body"},
+                                       ensure_ascii=False))
+            return
+        if n > FILE_MAX_BYTES:
+            # 413 之前尽量把 body 读掉：`_drain` 的上限（4×音频上限）不够覆盖
+            # 8MB 上传档，没读干净就关闭连接会让客户端收到 RST 而不是 413（T58）。
+            left = min(n, FILE_MAX_BYTES + 4 * 1024 * 1024)
+            try:
+                while left > 0:
+                    chunk = self.rfile.read(min(left, 256 * 1024))
+                    if not chunk:
+                        break
+                    left -= len(chunk)
+            except OSError:
+                pass
+            self._send(413, json.dumps({"ok": False, "error": "too large",
+                                        "max_bytes": FILE_MAX_BYTES},
+                                       ensure_ascii=False))
+            return
+        data = self.rfile.read(n)
+        if len(data) != n:
+            self._send(400, json.dumps({"ok": False, "error": "short body"},
+                                       ensure_ascii=False))
+            return
+        existed = os.path.exists(path)
+        folder = os.path.dirname(path)
+        tmp = None
+        try:
+            os.makedirs(folder, exist_ok=True)
+            # 先写临时文件再原子替换：上传中断时不会留下半截文件冒充完整文件
+            tmp = "%s.%d.part" % (path, threading.get_ident())
+            with open(tmp, "wb") as f:
+                f.write(data)
+            os.replace(tmp, path)
+        except OSError as e:
+            if tmp:
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+            self._send(500, json.dumps({"ok": False, "error": str(e)},
+                                       ensure_ascii=False))
+            return
+        self._send(200, json.dumps({"ok": True, "cat": cat, "name": fname,
+                                    "bytes": len(data), "replaced": existed},
+                                   ensure_ascii=False))
 
     # ---- voice (板 → 服务器 → 识别 → 大模型 → 板/网页) ----------------------
     def _audio(self, query):
@@ -2223,7 +2736,8 @@ class Handler(BaseHTTPRequestHandler):
         reply = ""
         if msg.get("ask"):                  # 板子 BOOT 键 → 请求一次 AI 交互
             question = str(msg.get("q", "我现在的状态怎么样？"))[:200]
-            reply = request_ai(dev, question)   # 立刻返回；大模型走后台线程
+            # 板端按键提问：收紧等待上限（见 LLM_BOARD_TIMEOUT 的注释）
+            reply = request_ai(dev, question, for_board=True)   # 立刻返回；大模型走后台线程
 
         with LOCK:
             final_reply = reply or dev.st["ai_reply"]

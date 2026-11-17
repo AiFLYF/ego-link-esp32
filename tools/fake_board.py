@@ -156,6 +156,14 @@ def main():
     pending_cmd = None          # 已收到、待下一帧执行的指令 id
     cmds_received = 0
     results_sent = 0
+    state = {
+        "orient": (args.orient & 15) if args.orient is not None else None,
+        "period_ms": int(round(args.period * 1000)),
+        "cam_streaming": False,
+        "shot_seq": 0,
+        "sd_total": 2097152,
+        "sd_files": [["TELEM01.CSV", 14208], ["EVENTS01.TXT", 3840]],
+    }
 
     for b in range(batches):
         # 让模拟时间跟上真实时间，服务端靠"到达间隔/样本数"推算采样率
@@ -183,8 +191,8 @@ def main():
         }
         if args.device:
             payload["device"] = args.device
-        if args.orient is not None:
-            payload["o"] = args.orient
+        if state["orient"] is not None:
+            payload["o"] = state["orient"]
         if b in ask_marks:
             payload["q"] = "我现在的运动状态怎么样？"
 
@@ -206,6 +214,62 @@ def main():
                             "x": round(mx, 4), "y": round(my, 4), "z": round(mz, 4),
                             "std": round(std, 4)})
                 note = "x=%+.3f y=%+.3f z=%+.3f (%d 样本, σ=%.4f)" % (mx, my, mz, n, std)
+            elif cname == "set_orient":
+                state["orient"] = int(cparams.get("o", 0)) & 15
+                payload["o"] = state["orient"]
+                note = "o%d" % state["orient"]
+                res.update({"ms": 2.0, "n": 0, "note": note})
+            elif cname == "set_config":
+                if "period_ms" in cparams:
+                    try:
+                        state["period_ms"] = max(100, min(2000, int(cparams["period_ms"])))
+                    except (TypeError, ValueError):
+                        pass
+                note = "period=%dms" % state["period_ms"]
+                res.update({"ms": 15.0, "n": 0, "note": note})
+            elif cname == "sd_ls":
+                used = sum(sz for _, sz in state["sd_files"])
+                free_b = max(0, state["sd_total"] - used)
+                items = ";".join("%s|%d" % (nm, sz) for nm, sz in state["sd_files"])
+                note = "SPACE,%d,%d;%s%s" % (
+                    state["sd_total"], free_b, items, ";" if items else "")
+                res.update({"ms": 8.0, "n": 0, "note": note})
+            elif cname == "sd_rm":
+                target = str(cparams.get("name") or "")
+                idx = next((k for k, (nm, _) in enumerate(state["sd_files"])
+                            if nm == target), None)
+                if idx is not None:
+                    state["sd_files"].pop(idx)
+                    note = "已删除 %s" % target
+                    res.update({"ms": 6.0, "n": 0, "note": note})
+                else:
+                    note = "删除失败（文件不存在）"
+                    res.update({"ok": False, "ms": 4.0, "n": 0, "err": note})
+            elif cname == "sd_format":
+                state["sd_files"].clear()
+                note = "formatted"
+                res.update({"ms": 50.0, "n": 0, "note": note})
+            elif cname == "cam_capture":
+                state["shot_seq"] += 1
+                shot_name = "CAM%04d.JPG" % state["shot_seq"]
+                jpg = (b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01"
+                       b"\x00\x01\x00\x00" + b"\x00" * 64 + b"\xff\xd9")
+                dev_q = urllib.parse.quote(args.device or "-", safe="-_.~")
+                frame_url = args.url.rstrip("/") + "/api/frame?save=1&device=" + dev_q
+                try:
+                    req = urllib.request.Request(
+                        frame_url, data=jpg,
+                        headers={"Content-Type": "image/jpeg"})
+                    with OPENER.open(req, timeout=5.0) as fr_resp:
+                        fr_resp.read()
+                except (urllib.error.URLError, OSError):
+                    pass
+                note = "已存 %s" % shot_name
+                res.update({"ms": 35.0, "n": 0, "note": note})
+            elif cname == "cam_stream":
+                state["cam_streaming"] = bool(cparams.get("on", True))
+                note = "实时画面已开启" if state["cam_streaming"] else "实时画面已关闭"
+                res.update({"ms": 5.0, "n": 0, "note": note})
             else:
                 # led_blink / led_set：板端立刻完成，没有测量值
                 res.update({"ms": 1.0, "n": 0})

@@ -36,7 +36,10 @@ extern "C" {
 #endif
 
 #define TRANSPORT_ACTIVITY_LEN 96
+/* 回复正文的**硬上限**（含结尾 NUL）。服务端 BOARD_REPLY_MAX 比这里小 32 字节，
+ * 留出的余量给服务端截断时追加的「…」—— 两边都截的话板端会把省略号切掉。 */
 #define TRANSPORT_REPLY_LEN    512
+#define TRANSPORT_AI_NOTE_LEN  32
 #define TRANSPORT_CMD_ID_LEN   32
 
 /** What the board is doing with remote commands (for the UI). */
@@ -54,6 +57,15 @@ typedef enum {
     TRANSPORT_VOICE_UPLOADING,  /*!< 录完了，正在上传给服务器 */
 } transport_voice_state_t;
 
+/** AI 回复的显示状态。**失败/超时要有明确状态** —— 不能让屏幕停在上一句话上。
+ *  OK 时才显示 `reply`；FAILED 时显示 `ai_note`（原因）；PENDING 显示进度。 */
+typedef enum {
+    TRANSPORT_AI_IDLE = 0,      /*!< 还没提过问（或开机以来没收到过回复） */
+    TRANSPORT_AI_PENDING,       /*!< 已发出，等回复 */
+    TRANSPORT_AI_OK,            /*!< 拿到了正文 */
+    TRANSPORT_AI_FAILED,        /*!< 发不出去 / 超时 / 空回复 */
+} transport_ai_state_t;
+
 typedef struct {
     bool  server_ok;                                   /*!< last POST succeeded */
     int   fail_streak;                                 /*!< consecutive failures */
@@ -65,6 +77,8 @@ typedef struct {
     uint16_t batch_last;                               /*!< samples in the last batch */
     uint8_t  orient;                                   /*!< active tilt calibration 0..15 */
     bool  ai_pending;                                  /*!< server is still generating the reply */
+    uint8_t  ai_state;                                 /*!< transport_ai_state_t */
+    char  ai_note[TRANSPORT_AI_NOTE_LEN];              /*!< FAILED 时给屏幕看的原因 */
     uint8_t  cmd_state;                                /*!< transport_cmd_state_t */
     uint16_t cmd_count;                                /*!< commands executed since boot */
     char  cmd_id[TRANSPORT_CMD_ID_LEN];                /*!< last command's request_id */

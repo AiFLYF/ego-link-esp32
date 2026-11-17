@@ -21,7 +21,7 @@ const PORT = parseInt(process.env.E2E_PORT || '8123', 10);
 function startServer() {
   const p = spawn(process.env.PYTHON || 'python', ['-u', 'server/server.py',
     '--port', String(PORT), '--data-dir', path.join(ROOT, '_local_tmp', 'e2e_sse')],
-    { cwd: ROOT, stdio: 'ignore', env: { ...process.env, no_proxy: '127.0.0.1,localhost' } });
+    { cwd: ROOT, stdio: 'ignore', env: { ...process.env, no_proxy: '127.0.0.1,localhost', NO_PROXY: '127.0.0.1,localhost', RW1_LLM_API_KEY: '' } });
   return p;
 }
 

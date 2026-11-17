@@ -77,8 +77,8 @@ static const char PROV_PAGE_HTML[] =
 "（和热点名 EGO-LINK-XXXX 后四位一致）</div></fieldset>"
 
 "<fieldset><legend>④ 高级</legend>"
-"<label for=\"period\">上报周期（ms，留空用默认）</label>"
-"<input id=\"period\" inputmode=\"numeric\" placeholder=\"500\" autocomplete=\"off\">"
+"<label for=\"period\">上报周期（ms，范围 100–2000，留空用默认）</label>"
+"<input id=\"period\" type=\"number\" min=\"100\" max=\"2000\" inputmode=\"numeric\" placeholder=\"500\" autocomplete=\"off\">"
 "</fieldset>"
 
 "<button id=\"save\" onclick=\"save()\">保存并连接</button>"

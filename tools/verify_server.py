@@ -57,6 +57,11 @@ OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 # 它们根本不是"偶发"，是"有多少子进程被代理吃掉"的必然结果。
 CHILD_ENV = dict(os.environ)
 CHILD_ENV["no_proxy"] = CHILD_ENV["NO_PROXY"] = "127.0.0.1,localhost"
+# 门禁必须是封闭环境：仓库根目录的 .env（大模型 key）被子进程静默加载的话，
+# 前半段「没配 key → 本地规则AI」的断言会突然去打真实模型（慢、不稳定、花钱）。
+# 显式置空 = 明确"本实例无 LLM"（_load_dotenv 不覆盖已存在的键）。
+# 需要 LLM 的第 [7] 节自己在 env2 里覆盖成 sk-test。
+CHILD_ENV["RW1_LLM_API_KEY"] = ""
 for _k in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY",
            "all_proxy", "ALL_PROXY"):
     CHILD_ENV.pop(_k, None)
@@ -79,6 +84,35 @@ def check(name, ok, detail=""):
         safe_name = name.encode("ascii", errors="backslashreplace").decode("ascii")
         print("  [%s] %s%s" % ("PASS" if ok else "FAIL", safe_name, ("  — " + safe_detail) if detail else ""))
     return ok
+
+
+def skip(name, detail=""):
+    """观测型断言在采样被机器负载饿死时记 SKIP，而不是 FAIL。
+
+    2026-11-03 实测：多进程并行压满 CPU 时，6 秒晃动场景只采到 26 个状态
+    （目标约 60 个），「剧烈晃动」「疑似跌落」的可见窗只有零点几秒，被整段
+    错过 —— 那种 FAIL 度量的是负载，不是产品。SKIP 不占通过数也不算失败，
+    安静环境下这些断言照常以 FAIL 标准执行。
+    """
+    RESULTS.append((name, None, detail))
+    try:
+        print("  [SKIP] %s%s" % (name, ("  — " + detail) if detail else ""))
+    except UnicodeEncodeError:
+        safe_detail = detail.encode("ascii", errors="backslashreplace").decode("ascii")
+        safe_name = name.encode("ascii", errors="backslashreplace").decode("ascii")
+        print("  [SKIP] %s%s" % (safe_name, ("  — " + safe_detail) if detail else ""))
+    return False
+
+
+def sampled_enough(seen, seconds):
+    """采样率至少达到目标（100 ms 一档）的一半，否则观测型断言是在测负载。
+
+    返回 (是否够, 说明)。配合 skip() 使用：不够时观测断言记 SKIP。
+    """
+    got = len(seen)
+    need = int(seconds * 10 * 0.5)
+    return got >= need, "采样被饿死：%d 秒场景只采到 %d 个状态（低于 %d 个不计结论）" % (
+        seconds, got, need)
 
 
 def free_port():
@@ -254,8 +288,13 @@ def feed(port, scenario, seconds, ask_at=None, expect_steps=None):
     return p.returncode, p.stdout + p.stderr
 
 
-def feed_observe(port, scenario, seconds, device=None, with_proc=False, expect_steps=None):
+def feed_observe(port, scenario, seconds, device=None, with_proc=False, expect_steps=None,
+                 snaps=None):
     """跑一段假板子场景，**边跑边采样** `activity`，返回观察到的活动词列表。
+
+    传入 `snaps=[]` 时，每个采样点的完整快照（含 shake_count 等字段）也会
+    追加进去 —— 「计数是窗口值」这类断言要读的是现象发生**期间**的值，
+    不是场景收尾那一帧（收尾幅度已衰减，读出来是 0）。
 
     为什么不能跑完再读一次：`activity` 是"随最后一批数据变化"的瞬时字段。
     场景结束之后再读，读到的是**收尾那一批**的分类结果 —— 晃动场景的尾部
@@ -285,7 +324,10 @@ def feed_observe(port, scenario, seconds, device=None, with_proc=False, expect_s
     seen = []
     while p.poll() is None:
         try:
-            seen.append(latest(port, device)["activity"])
+            s = latest(port, device)
+            seen.append(s["activity"])
+            if snaps is not None:
+                snaps.append(s)
         except (urllib.error.URLError, OSError, ValueError):
             pass
         time.sleep(0.1)
@@ -429,9 +471,13 @@ def main():
         seen_walk, rc2, out = feed_observe(port, "walk", 14, with_proc=True,
                                            expect_steps=8)
         snap = latest(port)
-        check("检测到步行而非晃动", any("步行" in a for a in seen_walk),
-              "采到 %d 个状态，出现过: %s"
-              % (len(seen_walk), sorted({a for a in seen_walk if a})))
+        enough, why = sampled_enough(seen_walk, 14)
+        if enough:
+            check("检测到步行而非晃动", any("步行" in a for a in seen_walk),
+                  "采到 %d 个状态，出现过: %s"
+                  % (len(seen_walk), sorted({a for a in seen_walk if a})))
+        else:
+            skip("检测到步行而非晃动", why)
         check("窗口内步数 >= 8", snap["step_count"] >= 8, "实际: %d" % snap["step_count"])
         _tail = (out or "").strip().splitlines()
         check("fake_board 自检通过", rc2 == 0,
@@ -441,13 +487,23 @@ def main():
         print("\n[4] 晃动 5Hz / 6 秒")
         # 边跑边采（见 feed_observe 的注释）：只看"这 6 秒里出现过剧烈晃动"，
         # 不看"收尾那一瞬间是什么" —— 后者由最后一批数据的相位决定，是抛硬币。
-        seen_shake = feed_observe(port, "shake", 6)
-        snap = latest(port)
-        check("判定为剧烈晃动", "剧烈晃动" in seen_shake,
-              "采到 %d 个状态，出现过: %s"
-              % (len(seen_shake), sorted(set(seen_shake))))
-        check("晃动计数为窗口内计数（非累计）", 0 < snap["shake_count"] <= 20,
-              "实际: %d" % snap["shake_count"])
+        snaps4 = []
+        seen_shake = feed_observe(port, "shake", 6, snaps=snaps4)
+        enough, why = sampled_enough(seen_shake, 6)
+        if enough:
+            check("判定为剧烈晃动", "剧烈晃动" in seen_shake,
+                  "采到 %d 个状态，出现过: %s"
+                  % (len(seen_shake), sorted(set(seen_shake))))
+        else:
+            skip("判定为剧烈晃动", why)
+        # 计数同样要读**现象期间**的值：场景收尾幅度衰减，结束后再读 snapshot
+        # 已经是最后一帧的 0（2026-11-03 高负载下实测复现）。
+        peak_shake = max((s.get("shake_count", 0) for s in snaps4), default=0)
+        if snaps4:
+            check("晃动计数为窗口内计数（非累计）", 0 < peak_shake <= 20,
+                  "采样期峰值: %d" % peak_shake)
+        else:
+            skip("晃动计数为窗口内计数（非累计）", "一个快照都没采到")
 
         # ---- 5. 跌落（250ms 失重）---------------------------------------
         print("\n[5] 跌落（第 6 秒 250ms 失重）")
@@ -468,8 +524,12 @@ def main():
             # 连跑三次挂了一次，而用 50 ms 间隔复测时"跌落"命中 7 次（检测没问题）。
             # 所以这里改 0.1 s：抓住现象，而不是降低断言标准。
             time.sleep(0.1)
-        check("检测到疑似跌落", any("跌落" in a for a in seen),
-              "采到 %d 个状态" % len(seen))
+        enough, why = sampled_enough(seen, 9)
+        if enough:
+            check("检测到疑似跌落", any("跌落" in a for a in seen),
+                  "采到 %d 个状态" % len(seen))
+        else:
+            skip("检测到疑似跌落", why)
 
         # ---- 6. 持久化 ---------------------------------------------------
         print("\n[6] JSONL 落盘")
@@ -610,10 +670,28 @@ def main():
         check("ask 帧方向判定正确", out5.get("activity") == "静置·向右倾斜",
               "实际: %s" % out5.get("activity"))
 
-        raw_neg = firmware_body([(-0.012, 0.998, 0.031)] * 50)
-        out6 = post_raw("http://127.0.0.1:%d/api/telemetry" % port, raw_neg)
+        # 与 ask 帧同一原因：倾斜分类只看**最后 1 秒**的样本（analysis.py 的
+        # tail），单发一批时结论由上一节残留样本决定 —— 机器一忙，残留样本
+        # 超出 1 秒被剔除，「右」就翻成「下」（2026-11-03 高负载实测复现）。
+        # 所以先把最后 1 秒灌满待测向量。向量选 x 为负：负号被解析丢掉的话
+        # 方向从「左」翻成「右」，这条断言才真正咬住「负值解析」；
+        # 0.031 / 0.66 顺带覆盖三位小数。
+        #
+        # 但高负载下还有第二条路会把它害死：如果上一节的 ask 帧把 dt_trusted
+        # 撑大（例如 0.05s），串行 4 批到达间隔 < 2.5s 时 dt_est > DT_TRUST_MAX，
+        # 服务端会沿用被污染的 dt，把 50 个负值样本摊到 2.5 秒上。4 批共 10 秒，
+        # 最后 1 秒窗口里只剩约 20 个负值，前面 30 个还是右倾样本，均值一混就
+        # 变成「水平」。所以：
+        #   1. 换专用设备名，彻底摆脱前文对 dt_trusted 的污染；
+        #   2. 每批之间 sleep 0.6s（> DT_TRUST_MAX×50=2.5s 的 1/4，但足够让
+        #      服务端把两批当成“新的一秒”），确保最后 1 秒窗口被负值灌满。
+        neg_dev = "负值-01"
+        for _ in range(4):
+            out6 = post_raw("http://127.0.0.1:%d/api/telemetry" % port,
+                            firmware_body([(-0.7, 0.031, 0.66)] * 50, device=neg_dev))
+            time.sleep(0.6)
         check("负值/三位小数解析正确",
-              out6.get("ok") is True and "右" in out6.get("activity", ""),
+              out6.get("ok") is True and out6.get("activity") == "静置·向左倾斜",
               "实际: %s" % out6.get("activity"))
 
         raw_src = firmware_body([(0.0, 0.0, 1.0)] * 50, source="QMA7981")
@@ -945,6 +1023,14 @@ def main():
               and any(s.get("name") == saved2 and s.get("device") == who for s in fb),
               "最近上报=%s / 留档=%s / 缺省列表=%s"
               % (who, saved2, [(s.get("device"), s.get("name")) for s in fb][:3]))
+        if saved2:
+            st_del, _ = cam_post("/api/shots/delete",
+                                 json.dumps({"name": saved2}).encode(),
+                                 "application/json")
+            fb_after = get_json("http://127.0.0.1:%d/api/shots" % port).get("shots") or []
+            check("/api/shots/delete 不带 device 也能删最近设备照片",
+                  st_del == 200 and not any(s.get("name") == saved2 for s in fb_after),
+                  "HTTP %d" % st_del)
 
         # ---- 18. 多设备（PROPOSAL §4.1 / 优先级 ③）---------------------------
         # 这一节必须放在最后：它往服务端注册了新设备，会改变"最近上报过的设备"
@@ -1745,6 +1831,211 @@ def main():
               'id="feed"' in page and "仪表盘文件缺失" not in page,
               "长度 %d 字节" % len(page))
 
+        # ---- 31. 文件管理：列/预览/下载/删除/上传 + 边界与坏输入 --------------
+        # 用户明确要求这三类坏输入必须有测试钉住：路径穿越、超大文件、非法设备名。
+        print("\n[31] 文件管理")
+        fbase = "http://127.0.0.1:%d" % port
+        fdev = "文件测试-01"
+
+        def f_call(path, data=None, method=None, headers=None):
+            req = urllib.request.Request(fbase + path, data=data, method=method)
+            for k, v in (headers or {}).items():
+                req.add_header(k, v)
+            try:
+                with OPENER.open(req, timeout=15) as r:
+                    return r.status, r.read()
+            except urllib.error.HTTPError as e:
+                return e.code, e.read()
+
+        def f_upload(cat, dev, name, blob, ctype="application/octet-stream"):
+            q = ("?cat=" + urllib.parse.quote(cat)
+                 + "&device=" + urllib.parse.quote(dev)
+                 + "&name=" + urllib.parse.quote(name))
+            return f_call("/api/files/upload" + q, blob, method="POST",
+                          headers={"Content-Type": ctype})
+
+        jpg = b"\xff\xd8\xff" + b"fake-jpeg" * 200
+        st, _ = f_upload("shots", fdev, "a.jpg", jpg, "image/jpeg")
+        check("上传假 JPEG → 200", st == 200, "HTTP %d" % st)
+
+        st, body = f_call("/api/files?cat=shots&device=" + urllib.parse.quote(fdev))
+        d = json.loads(body.decode("utf-8"))
+        names = [f["name"] for f in (d.get("categories") or [{}])[0].get("files", [])]
+        check("列表能列出刚上传的文件", st == 200 and "a.jpg" in names,
+              "HTTP %d / %s" % (st, names[:5]))
+
+        # 预览：请求 limit 超过上限时必须被夹到 256KB，并明确标注截断
+        big = ("日志行1\n" + "x" * 300000).encode("utf-8")
+        st, _ = f_upload("logs", "", "big-test.txt", big, "text/plain")
+        check("上传日志文本 → 200", st == 200, "HTTP %d" % st)
+        st, body = f_call("/api/files/preview?cat=logs&name=big-test.txt&limit=999999")
+        d = json.loads(body.decode("utf-8"))
+        check("预览 limit 被夹到 256KB",
+              d.get("limit") == 256 * 1024 and len(d.get("text", "")) <= 256 * 1024,
+              "limit=%s len=%s" % (d.get("limit"), len(d.get("text", ""))))
+        check("超大文件预览标注 truncated", d.get("truncated") is True,
+              "bytes=%s" % d.get("bytes"))
+
+        st, got = f_call("/api/files/download?cat=logs&name=big-test.txt")
+        check("下载与原文件逐字节一致", st == 200 and got == big,
+              "HTTP %d / %d vs %d" % (st, len(got), len(big)))
+
+        # 路径穿越：文件名、反斜杠、设备名三处各来一条
+        bad_cases = [
+            ("文件名 ../", "/api/files/preview?cat=logs&name="
+             + urllib.parse.quote("../outside.txt")),
+            ("文件名反斜杠", "/api/files/download?cat=logs&name="
+             + urllib.parse.quote("..\\outside.txt")),
+            ("设备名 ..", "/api/files?cat=shots&device=" + urllib.parse.quote("..")),
+            ("未知分类", "/api/files?cat=secrets"),
+        ]
+        for label, path in bad_cases:
+            st, _ = f_call(path)
+            check("路径穿越被拒: %s" % label, st == 400, "HTTP %d" % st)
+
+        st, _ = f_upload("shots", "..", "evil.jpg", jpg, "image/jpeg")
+        check("非法设备名上传被拒", st == 400, "HTTP %d" % st)
+        st, _ = f_upload("shots", fdev, "evil.exe", b"MZ", "application/octet-stream")
+        check("扩展名不在白名单被拒", st == 415, "HTTP %d" % st)
+
+        # 超大文件：Content-Length 刚过 8MB 上限。必须能被服务端读完再回 413，
+        # 不能直接 RST —— 那条是 T58 的教训。
+        huge = b"z" * (8 * 1024 * 1024 + 1)
+        st, body = f_upload("logs", "", "too-big.txt", huge, "text/plain")
+        d = json.loads(body.decode("utf-8"))
+        check("超大上传 → 413 且带 max_bytes",
+              st == 413 and d.get("max_bytes") == 8 * 1024 * 1024,
+              "HTTP %d / %s" % (st, d.get("error")))
+
+        # 删除：穿越必须拒，正常删除要真的少一条
+        try:
+            out = post_json(fbase + "/api/files/delete",
+                            {"cat": "logs", "device": "", "name": "../outside.txt"})
+            ok_del_bad, detail_del_bad = False, "竟然接受了: %s" % out
+        except urllib.error.HTTPError as e:
+            ok_del_bad, detail_del_bad = e.code == 400, "HTTP %d" % e.code
+        except Exception as e:  # noqa: BLE001
+            ok_del_bad, detail_del_bad = False, "%s: %s" % (type(e).__name__, e)
+        check("删除时路径穿越被拒", ok_del_bad, detail_del_bad)
+
+        out = post_json(fbase + "/api/files/delete",
+                        {"cat": "shots", "device": fdev, "name": "a.jpg"})
+        check("正常删除返回 ok", out.get("ok") is True, "实际: %s" % out)
+        st, body = f_call("/api/files?cat=shots&device=" + urllib.parse.quote(fdev))
+        d = json.loads(body.decode("utf-8"))
+        names = [f["name"] for f in (d.get("categories") or [{}])[0].get("files", [])]
+        check("删除后列表里确实没有了", "a.jpg" not in names, "实际: %s" % names[:5])
+
+        # ---- 边界用例（2026-11-05 补） ----
+        # 空目录：全新设备的 shots 目录还没建，必须 ok + 空列表，而不是报错
+        st, body = f_call("/api/files?cat=shots&device=" + urllib.parse.quote("空目录-01"))
+        d = json.loads(body.decode("utf-8"))
+        c0 = (d.get("categories") or [{}])[0]
+        check("空目录 → 200 且空列表", st == 200 and c0.get("files") == [],
+              "HTTP %d / %s" % (st, c0.get("note")))
+
+        # Unicode 文件名：中文名必须能上传→列出→删除整条走通
+        uname = "遥测-测试日志.jsonl"
+        st, _ = f_upload("logs", "", uname, "中文内容\n".encode("utf-8"), "text/plain")
+        check("Unicode 文件名上传 → 200", st == 200, "HTTP %d" % st)
+        st, body = f_call("/api/files?cat=logs")
+        d = json.loads(body.decode("utf-8"))
+        names = [f["name"] for f in (d.get("categories") or [{}])[0].get("files", [])]
+        check("Unicode 文件名能列出", uname in names, "实际: %s" % names[:5])
+        out = post_json(fbase + "/api/files/delete",
+                        {"cat": "logs", "device": "", "name": uname})
+        check("Unicode 文件名能删除", out.get("ok") is True, "实际: %s" % out)
+
+        # 超长文件名：白名单上限 96 字符，超了必须 400 而不是落盘
+        long_name = "a" * 100 + ".txt"
+        st, _ = f_upload("logs", "", long_name, b"x", "text/plain")
+        check("超长文件名上传被拒", st == 400, "HTTP %d" % st)
+
+        # 删除不存在的文件 → 404（不是 200 也不是 500）
+        try:
+            post_json(fbase + "/api/files/delete",
+                      {"cat": "logs", "device": "", "name": "no-such-file.txt"})
+            check("删除不存在文件 → 404", False, "竟然删成功了")
+        except urllib.error.HTTPError as e:
+            check("删除不存在文件 → 404", e.code == 404, "HTTP %d" % e.code)
+
+        # 并发删除同一文件：一个 200、一个 404，不允许两个都"成功"
+        f_upload("logs", "", "race-del.txt", b"r", "text/plain")
+        race_codes = []
+
+        def _del_race():
+            try:
+                post_json(fbase + "/api/files/delete",
+                          {"cat": "logs", "device": "", "name": "race-del.txt"})
+                race_codes.append(200)
+            except urllib.error.HTTPError as e:
+                race_codes.append(e.code)
+            except Exception:  # noqa: BLE001
+                race_codes.append(-1)
+
+        t1 = threading.Thread(target=_del_race)
+        t2 = threading.Thread(target=_del_race)
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+        check("并发删除同一文件 → 恰好一个 200 一个 404",
+              sorted(race_codes) == [200, 404], "实际: %s" % race_codes)
+
+        # 文件被占用时删除走 OSError 分支 → 400 + ok:false（Windows 限定；
+        # Linux 允许删打开中的文件，CI 上跳过这条）
+        if os.name == "nt":
+            f_upload("logs", "", "locked.txt", b"L", "text/plain")
+            locked_path = os.path.join(data_dir, "locked.txt")
+            fh = open(locked_path, "rb")  # noqa: SIM115 - 就是要占着它
+            try:
+                try:
+                    post_json(fbase + "/api/files/delete",
+                              {"cat": "logs", "device": "", "name": "locked.txt"})
+                    check("文件被占用时删除 → 400", False, "竟然删成功了")
+                except urllib.error.HTTPError as e:
+                    check("文件被占用时删除 → 400", e.code == 400, "HTTP %d" % e.code)
+            finally:
+                fh.close()
+            post_json(fbase + "/api/files/delete",
+                      {"cat": "logs", "device": "", "name": "locked.txt"})
+        else:
+            print("  [SKIP] 文件占用删除（仅 Windows 可复现，Linux 允许删打开中的文件）")
+
+        # 大列表上限：目录里放 505 个文件，列表必须截到 500 且 capped=True，
+        # 且留下的是**最近的** 500 条（编号最大的那条必须在）
+        for i in range(505):
+            with open(os.path.join(data_dir, "bulk-%03d.log" % i), "wb") as f:
+                f.write(b"b")
+            ts = 1700000000 + i
+            os.utime(os.path.join(data_dir, "bulk-%03d.log" % i), (ts, ts))
+        st, body = f_call("/api/files?cat=logs")
+        d = json.loads(body.decode("utf-8"))
+        c0 = (d.get("categories") or [{}])[0]
+        bulk_names = [f["name"] for f in c0.get("files", []) if f["name"].startswith("bulk-")]
+        check("大列表截到 500 条且有 capped 标志",
+              len(c0.get("files", [])) <= 500 and c0.get("capped") is True,
+              "len=%s capped=%s" % (len(c0.get("files", [])), c0.get("capped")))
+        check("截断留下的是最近的文件", "bulk-504.log" in bulk_names,
+              "最近一条在不在: %s" % ("bulk-504.log" in bulk_names))
+        for n in bulk_names:
+            try:
+                post_json(fbase + "/api/files/delete",
+                          {"cat": "logs", "device": "", "name": n})
+            except Exception:  # noqa: BLE001
+                pass
+        for i in range(505):
+            p = os.path.join(data_dir, "bulk-%03d.log" % i)
+            if os.path.exists(p):
+                os.remove(p)
+
+        # 收尾：把测试写进日志目录的文本删掉，别污染后续运行
+        try:
+            post_json(fbase + "/api/files/delete",
+                      {"cat": "logs", "device": "", "name": "big-test.txt"})
+        except Exception:  # noqa: BLE001
+            pass
+
     finally:
         for p in (srv, srv2, nlboard):
             if p is None:
@@ -1761,12 +2052,16 @@ def main():
             shutil.rmtree(tmp, ignore_errors=True)
 
     passed = sum(1 for _, ok, _ in RESULTS if ok)
-    total = len(RESULTS)
+    skipped = sum(1 for _, ok, _ in RESULTS if ok is None)
+    total = len(RESULTS) - skipped
     print("\n" + "=" * 70)
-    print("结果: %d/%d 通过" % (passed, total))
+    print("结果: %d/%d 通过%s" % (passed, total,
+          ("，%d 项因采样不足跳过" % skipped) if skipped else ""))
     for name, ok, detail in RESULTS:
-        if not ok:
+        if ok is False:
             print("  FAIL: %s  %s" % (name, detail))
+        elif ok is None:
+            print("  SKIP: %s  %s" % (name, detail))
     print("=" * 70)
     return 0 if passed == total else 1
 
