@@ -37,6 +37,9 @@ const logs = [];
 function start(args, tag, extraEnv) {
   const env = Object.assign({}, process.env, {
     no_proxy: '127.0.0.1,localhost', NO_PROXY: '127.0.0.1,localhost',
+    // 门禁必须是封闭环境：仓库根目录 .env 里的真实 LLM key 被子进程静默加载的话，
+    // 「提问」断言会去打真实模型（慢、不稳定）。显式置空 = 本实例走本地规则 AI。
+    RW1_LLM_API_KEY: '',
   }, extraEnv || {});
   /* 把子进程输出落盘：失败时能一眼看出是"服务端没起来"还是"产品 bug"，
      而不是对着一个空日志猜。 */
@@ -304,6 +307,27 @@ async function step(name, fn) {
     }
   });
 
+  await step('事件筛选：切到「指令」只剩 cmd 类且确有内容，切回全部恢复', async () => {
+    /* 到这一步页面已经下发过 led_blink / set_orient —— 「指令」类必然非空，
+       所以这条不会退化成"空态也算过"的摆设断言。 */
+    await page.waitForSelector('#feed .item', { timeout: 20000 });
+    await page.selectOption('#evfilter', 'cmd');
+    await sleep(600);                      // 等一次 SSE 重绘（500ms 一帧）
+    const r = await page.evaluate(() => {
+      const dots = Array.from(document.querySelectorAll('#feed .item .k'));
+      return {
+        n: dots.length,
+        bad: dots.filter(el => el.className.indexOf('k-cmd') < 0).length,
+      };
+    });
+    if (r.n < 1) throw new Error('筛选「指令」后一条都没有（前面明明下发过）');
+    if (r.bad) throw new Error('筛选「指令」后仍混着 ' + r.bad + ' 条其它类型');
+    await page.selectOption('#evfilter', 'all');
+    await sleep(600);
+    const all = await page.locator('#feed .item').count();
+    if (all < r.n) throw new Error('切回全部后反而变少: ' + r.n + ' -> ' + all);
+  });
+
   await step('设置面板存在，且空着不发', async () => {
     const has = await page.locator('#cfgssid, #cfgpass, #cfgurl, #cfgper, #cfgapply').count();
     if (has < 5) throw new Error('设置表单元素不全（找到 ' + has + ' 个）');
@@ -545,6 +569,45 @@ async function step(name, fn) {
     }
     await tpage.close();
     console.log('     401 → 提示+摊开密钥框+归还文字 → 填密钥 → 带头发送 200');
+  });
+
+  await step('文件列表竞态回归：快切分类时晚到的旧响应不覆盖新列表', async () => {
+    /* 2026-11-05 修的真 bug：loadFiles 旧实现在响应回来时无条件渲染，
+       快切分类/设备时慢的旧口径响应会把新列表盖掉（多视口截图核对时实测复现）。
+       这里用路由拦截把旧口径（shots）的响应**挂起**，让新口径（logs）先渲染完，
+       再放出旧响应 —— 修好的页面应当把它丢掉，列表仍是日志。 */
+    const held = [];
+    let armed = true;
+    const isFilesIndex = u => u.pathname === '/api/files';
+    const holdShots = route => {
+      if (armed && route.request().url().indexOf('cat=shots') >= 0) {
+        held.push(route); return;                       // 挂起旧口径，先不回
+      }
+      route.continue().catch(() => {});
+    };
+    await page.route(isFilesIndex, holdShots);
+    try {
+      await page.selectOption('#filecat', 'audio');    // 先离开默认的 shots（否则 change 不触发）
+      await page.selectOption('#filecat', 'shots');    // 旧请求（被挂起）
+      await sleep(300);                                 // 确保旧请求已在途
+      await page.selectOption('#filecat', 'logs');      // 新请求（放行）
+      await page.waitForSelector('#filelist .frow, #filelist .empty', { timeout: 15000 });
+      await sleep(300);
+      for (const r of held) { try { await r.continue(); } catch (e) {} }  // 旧响应晚到
+      await sleep(800);
+      const cat = await page.inputValue('#filecat');
+      const rows = await page.locator('#filelist .frow').count();
+      const names = await page.locator('#filelist .fname').allTextContents();
+      if (cat !== 'logs') throw new Error('分类没停在 logs: ' + cat);
+      if (!rows) throw new Error('旧响应把 logs 列表盖没了（rows=0）');
+      if (!/\.(jsonl|log|txt)/.test(names.join(' '))) {
+        throw new Error('列表内容不是日志文件: ' + names.join(','));
+      }
+      console.log('     旧口径响应被挂起 → 新口径先渲染 → 放出旧响应 → 列表未被覆盖');
+    } finally {
+      armed = false;
+      await page.unroute(isFilesIndex, holdShots).catch(() => {});
+    }
   });
 
   await step('没有横向溢出', async () => {

@@ -54,8 +54,10 @@ const logs = [];
 function start(args, tag) {
   const env = Object.assign({}, process.env, {
     no_proxy: '127.0.0.1,localhost', NO_PROXY: '127.0.0.1,localhost',
+    RW1_LLM_API_KEY: '',
   });
   const fs2 = require('fs');
+  fs2.mkdirSync(SHOT_DIR, { recursive: true });
   const logPath = path.join(SHOT_DIR, 'pollcheck-' + tag + '.log');
   const fd = fs2.openSync(logPath, 'w');
   logs.push(logPath);

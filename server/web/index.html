@@ -719,6 +719,9 @@ button.primary:hover:not(:disabled){
 button.danger{color:var(--color-fall);border-color:var(--tint-danger-line)}
 button.danger:hover:not(:disabled){background:var(--tint-danger);color:var(--color-fall);border-color:var(--color-danger)}
 button.sm{height:28px;padding:0 var(--sp-3);font-size:var(--fs-meta)}
+/* 卡片头工具行里的下拉（事件筛选）：与 .sm 按钮同高，别让 36px 的全局默认
+   把整行撑歪。字号/圆角/配色全部沿用既有令牌。 */
+.card-head .tools select{height:28px;font-size:var(--fs-meta)}
 /* 图标按钮：和状态胶囊同高（28px），走"退下去"那一档 ——
    主题切换是工具，不该跟主操作抢注意力。 */
 button.icon{width:32px;height:28px;padding:0;display:grid;place-items:center;flex:none}
@@ -804,9 +807,22 @@ select{padding-right:var(--sp-2);font-family:var(--font-mono);font-size:var(--fs
   display:flex;align-items:center;gap:var(--sp-3);
   padding:var(--sp-2);border-radius:var(--radius-control);
   border:1px solid var(--color-line);background:var(--color-surface);
+  cursor:pointer;transition:border-color var(--dur-1) var(--ease-out);
 }
+.shot:hover{border-color:var(--color-line-strong)}
+.shot:focus-visible{outline:2px solid var(--color-action-primary);outline-offset:2px}
 .shot img{width:56px;height:42px;object-fit:cover;border-radius:var(--radius-control);background:var(--video-bg);flex:none}
 .shot .nm{font:400 var(--fs-meta)/1.5 var(--font-mono);flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+/* 大图预览：复用 .modal 的全部令牌与动效，只放宽宽度这一档。
+   图高按视口封顶 —— 否则竖拍的照片能把操作按钮顶出屏幕外。 */
+dialog.modal-wide{width:min(860px,calc(100vw - 32px))}
+#shotimg{
+  display:block;margin:0 auto;max-width:100%;max-height:min(62vh,560px);
+  object-fit:contain;background:var(--video-bg);border-radius:var(--radius-control);
+}
+#shotcap{font:400 var(--fs-meta)/1.6 var(--font-mono);color:var(--color-text-muted);word-break:break-all}
+/* 删除靠左、下载/关闭靠右：破坏性动作不和安全动作挤在一堆 */
+#shotdel{margin-right:auto}
 
 /* ---- 存储占用圆环 ---- */
 .ringwrap{display:flex;align-items:center;gap:var(--sp-6);flex-wrap:wrap}
@@ -853,6 +869,10 @@ dialog.modal{
   border-radius:var(--radius-modal);
   background:var(--color-surface);color:var(--color-text);
   box-shadow:var(--shadow-3), inset 0 1px 0 var(--sheen);
+  /* 居中必须显式写回来：第 263 行的全局 reset（*{margin:0}）把 UA 给
+     <dialog> 的 margin:auto 吃掉了，于是所有弹窗都贴在视口左上角
+     （2026-11-12 截图抓到：确认框、大图预览全在角上）。 */
+  margin:auto;
 }
 dialog.modal::backdrop{background:var(--modal-backdrop);backdrop-filter:blur(3px)}
 /* 进出场动效：用 animation 而不是 transition —— <dialog> 的显示/隐藏
@@ -866,6 +886,45 @@ dialog.modal[open]::backdrop{animation:modal-veil var(--dur-2) var(--ease-out)}
 .modal-body h3{font:600 var(--fs-h2)/1.25 var(--font-display);letter-spacing:-.015em}
 .modal-body p{font-size:var(--fs-body);color:var(--color-text-muted)}
 .modal-foot{display:flex;justify-content:flex-end;gap:var(--sp-3);padding:0 var(--sp-8) var(--sp-8)}
+
+/* ---- 文件管理（2026-11-04） ---------------------------------------------
+   长名单截断 + title 悬浮给全名；限高滚动避免 500 条时把页面拉得过长。
+   字号/圆角/颜色全部沿用既有令牌，没有新的散值。 */
+#filelist .frow{
+  display:flex;align-items:center;gap:var(--sp-2);flex-wrap:wrap;
+  padding:var(--sp-3) 0;border-bottom:1px solid var(--color-line);
+}
+#filelist .frow:last-child{border-bottom:0}
+#filelist .fname{
+  flex:1 1 160px;min-width:0;
+  font:400 var(--fs-meta)/1.5 var(--font-mono);color:var(--color-text);
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+}
+#filelist{max-height:min(46vh,360px);overflow-y:auto}
+#filelist .fmeta{
+  font:400 var(--fs-micro)/1.4 var(--font-mono);
+  color:var(--color-text-faint);white-space:nowrap;
+}
+/* 批量操作（2026-11-04）：勾选框沿用设备列表那一套（15px + accent-color），
+   「全选」标签做成整块可点，移动端不用去戳 15px 的小方块。 */
+#filelist .fchk{
+  accent-color:var(--color-action-primary);width:15px;height:15px;
+  flex:0 0 auto;cursor:pointer;
+}
+#fileacts label{
+  display:inline-flex;align-items:center;gap:var(--sp-2);
+  font:400 var(--fs-meta)/1 var(--font-mono);color:var(--color-text-muted);
+  cursor:pointer;user-select:none;
+}
+/* 预览弹窗比确认框宽：日志一行可能有一两百个字符，448px 里读不动 */
+dialog.modal#fprevd{width:min(720px,calc(100vw - 32px))}
+#fprevtext{
+  margin:0;max-height:min(56vh,420px);overflow:auto;
+  padding:var(--sp-3);border:1px solid var(--color-line);
+  border-radius:var(--radius-control);background:var(--color-surface-2);
+  font:400 var(--fs-meta)/1.6 var(--font-mono);color:var(--color-text);
+  white-space:pre-wrap;overflow-wrap:anywhere;
+}
 
 /* ==========================================================================
    响应式：窄屏优先保证"读得到、点得到"，不追求信息量
@@ -1018,7 +1077,7 @@ dialog.modal[open]::backdrop{animation:modal-veil var(--dur-2) var(--ease-out)}
       <div class="hero-ai">
         <div class="reply" id="replybox">
           <span class="tag"><svg class="ico" viewBox="0 0 24 24" stroke-width="1.8" aria-hidden="true"><path d="M12 3l1.9 4.9L19 9.8l-4.2 3.2L16.2 19 12 16.2 7.8 19l1.4-6L5 9.8l5.1-1.9z"/></svg> AI 回复</span>
-          <div class="txt" id="reply">还没有提问。</div>
+          <div class="txt" id="reply" aria-live="polite">还没有提问。</div>
           <div class="reply-foot">
             <span>按板子 BOOT 键提问，<b>三击</b>说话</span>
             <span id="voicehint">回复同时显示在板子屏幕上</span>
@@ -1049,7 +1108,7 @@ dialog.modal[open]::backdrop{animation:modal-veil var(--dur-2) var(--ease-out)}
          900px 高的笔记本切在折线以下（规则要求主操作必须跳出来）。 -->
     <div class="stage-actions">
       <span class="cmdbar" id="cmdbts"></span>
-      <span id="cmdhint" class="hint"></span>
+      <span id="cmdhint" class="hint" role="status"></span>
     </div>
 
     <div class="stage-block">
@@ -1092,7 +1151,17 @@ dialog.modal[open]::backdrop{animation:modal-veil var(--dur-2) var(--ease-out)}
         <div class="card-head">
           <h3><svg class="ico" viewBox="0 0 24 24" stroke-width="1.8" aria-hidden="true"><path d="M2.5 12h4l2.2-5 3.1 10 2.7-7 1.8 2h5.2"/></svg> 事件流</h3>
           <span class="tools">
+            <select id="evfilter" title="按类型筛选事件（只看这一类，其余藏起来）">
+              <option value="all" selected>全部</option>
+              <option value="fall">跌落/告警</option>
+              <option value="shake">晃动</option>
+              <option value="activity">活动变化</option>
+              <option value="ask">提问/AI</option>
+              <option value="cmd">指令</option>
+              <option value="sys">系统</option>
+            </select>
             <span class="src" id="evcount"></span>
+            <button id="evcsv" class="sm" type="button" title="把当前筛选下的事件导出成 CSV（UTF-8 带 BOM，Excel 直接打开不乱码；「查看全部」展开时导出全量 200 条）">导出</button>
             <button id="evmore" class="sm" type="button" title="从服务端取回更早的事件（保留上限 200 条）">查看全部</button>
           </span>
         </div>
@@ -1117,7 +1186,9 @@ dialog.modal[open]::backdrop{animation:modal-veil var(--dur-2) var(--ease-out)}
             <!-- 一开始就 hidden：没有 src 时浏览器会画一个"图片裂了"的破图标，
                  比什么都不显示还难看。收到第一帧再让它出现。 -->
             <img id="camimg" alt="" hidden>
-            <div class="nosig" id="camnosig">点右侧「开启实时画面」<br>
+            <!-- 不写"点右侧"：900px 以下 .camwrap 变成上下堆叠，按钮跑到图片**下面**，
+                 文案指错方向比不指更糟（2026-11-10 QA 抓到）。 -->
+            <div class="nosig" id="camnosig">点「开启实时画面」<br>
               （板子离线 / 摄像头自检没过时不会有画面）</div>
           </div>
           <div class="camside">
@@ -1146,6 +1217,7 @@ dialog.modal[open]::backdrop{animation:modal-veil var(--dur-2) var(--ease-out)}
           <span class="src" id="shotwho">—</span>
         </div>
         <div class="list" id="shotlist"></div>
+        <span id="shothint" class="hint" role="status"></span>
       </div>
 
       <div class="card" id="card3d" hidden>
@@ -1204,12 +1276,12 @@ dialog.modal[open]::backdrop{animation:modal-veil var(--dur-2) var(--ease-out)}
         </div>
         <div class="actions">
           <button id="cfgapply">下发到板子</button>
-          <span id="cfghint" class="hint"></span>
+          <span id="cfghint" class="hint" role="status"></span>
         </div>
         <div class="hint">
           <b>改 WiFi 会先试连、连上了才保存</b>（最多 8 秒）—— 密码填错不会把板子弄失联。
-          <b>上报周期就是「灵敏度」</b>：50ms=20Hz（最跟手）/ 100ms=10Hz / 500ms=2Hz（默认）。
-          越小越跟手，但 WiFi 压力越大；50ms 已接近单次往返的量级，跑不到也正常。
+          <b>上报周期就是「灵敏度」</b>：100ms=10Hz（最跟手）/ 250ms=4Hz / 500ms=2Hz（默认）。
+          范围 100–2000 ms，越小越跟手，但 WiFi 压力越大。
         </div>
       </div>
 
@@ -1223,6 +1295,37 @@ dialog.modal[open]::backdrop{animation:modal-veil var(--dur-2) var(--ease-out)}
         </div>
         <div id="sdring" class="ringwrap"></div>
         <div class="list" id="sdfiles"></div>
+      </div>
+
+      <div class="card" id="cardfiles">
+        <div class="card-head">
+          <h3><svg class="ico" viewBox="0 0 24 24" stroke-width="1.8" aria-hidden="true"><path d="M3 7.5V5.2a1 1 0 0 1 1-1h4.3l1.8 2H20a1 1 0 0 1 1 1v12.6a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1z"/><path d="M3 9h18"/></svg> 文件管理</h3>
+          <span class="src" id="fileswho">—</span>
+        </div>
+        <div class="formrow">
+          <div class="field">
+            <label for="filecat">分类</label>
+            <select id="filecat" title="照片/录音按设备分目录；日志是服务端数据目录里的 jsonl">
+              <option value="shots">照片</option>
+              <option value="audio">录音</option>
+              <option value="logs">日志</option>
+            </select>
+          </div>
+          <div class="field">
+            <label>上传到当前分类</label>
+            <div class="actions">
+              <button id="fileupbtn" class="sm" type="button">选择文件…</button>
+              <input id="fileup" type="file" hidden>
+            </div>
+          </div>
+        </div>
+        <div class="actions" id="fileacts">
+          <button id="filesrefresh" class="sm" type="button">刷新列表</button>
+          <label id="fileselwrap" hidden><input type="checkbox" id="fileselall"> 全选</label>
+          <button id="filedelsel" class="sm danger" type="button" hidden>删除所选</button>
+          <span id="fileshint" class="hint">预览只读前 256 KB（超出会标注已截断）· 删除不可恢复</span>
+        </div>
+        <div class="list" id="filelist"></div>
       </div>
     </div>
   </section>
@@ -1250,6 +1353,33 @@ dialog.modal[open]::backdrop{animation:modal-veil var(--dur-2) var(--ease-out)}
   <div class="modal-foot">
     <button id="cfm-cancel" type="button">取消</button>
     <button id="cfm-ok" type="button" class="danger">确定</button>
+  </div>
+</dialog>
+
+<!-- 照片大图预览：缩略图只有 56×42，拍没拍清楚根本看不出 ——
+     点行开大图，能下载、能删。Esc / 「关闭」退出。 -->
+<dialog class="modal modal-wide" id="shotview">
+  <div class="modal-body">
+    <img id="shotimg" alt="">
+    <p id="shotcap"></p>
+  </div>
+  <div class="modal-foot">
+    <button id="shotdel" type="button" class="danger">删除</button>
+    <button id="shotdl" type="button">下载</button>
+    <button id="shotclose" type="button">关闭</button>
+  </div>
+</dialog>
+
+<dialog class="modal" id="fprevd">
+  <div class="modal-body">
+    <h3 id="fprevname">预览</h3>
+    <p class="hint" id="fprevinfo"></p>
+    <pre id="fprevtext"></pre>
+  </div>
+  <div class="modal-foot">
+    <button id="fprevcopy" type="button">复制全文</button>
+    <button id="fprevdl" type="button">下载</button>
+    <button id="fprevclose" type="button">关闭</button>
   </div>
 </dialog>
 
@@ -1432,7 +1562,12 @@ var CMD_UI = {
   led_set:     { label:"LED 常亮", params:{on:true}, toggle:true },
   set_orient:  { label:"设置方向档位" },
   set_config:  { label:"下发板子设置" },
-  sd_format:   { label:"格式化 SD 卡", danger:true },
+  sd_format:   { label:"格式化 SD 卡", danger:true,
+    /* 确认文案跟着指令走，不写死在 sendCmd 里 —— 否则下一个 danger 指令
+       会被问"要不要格式化 SD 卡"（2026-11-10 QA 建议 #3）。 */
+    confirm:{ title:"格式化 SD 卡",
+              body:"板子上的 SD 卡会被整张清空，卡里原有内容全部丢失，无法恢复。",
+              ok:"格式化" } },
   sd_ls:       { label:"读取存储信息" },
   /* sd_rm 需要文件名参数，裸点必然失败 —— 它只该从「存储管理」里每个文件的
      删除按钮触发，所以这里标 hidden，不在指令栏出按钮。 */
@@ -1502,8 +1637,11 @@ function drawChart(){
 
   var n = samples.length;
   if (n < 2){
-    ctx.fillStyle = cFaint; ctx.textAlign = "left";
-    ctx.fillText("等待开发板上报…", padL+6*dpr, padT+14*dpr);
+    /* 空态提示画在**绘图区正中**，不要贴着 y 轴刻度。
+       原来画在 (padL+6, padT+14)，和顶部的 "2.0" 刻度纵向只差 5px、同 10px 字号，
+       读出来是 "2.0 等待开发板上报…"（2026-11-10 QA 抓到）。 */
+    ctx.fillStyle = cFaint; ctx.textAlign = "center";
+    ctx.fillText("等待开发板上报…", padL + plotW/2, padT + plotH/2);
     return;
   }
 
@@ -1874,9 +2012,8 @@ function syncButtons(){
 function sendCmd(name, btn, overrideParams){
   var ui0 = CMD_UI[name] || {};
   if (ui0.danger){
-    confirmDialog("格式化 SD 卡",
-                  "板子上的 SD 卡会被整张清空，卡里原有内容全部丢失，无法恢复。",
-                  "格式化").then(function(ok){
+    var cfm = ui0.confirm || { title:(ui0.label || name), body:"此操作无法撤销。", ok:(ui0.label || name) };
+    confirmDialog(cfm.title, cfm.body, cfm.ok).then(function(ok){
       if (ok) doSendCmd(name, btn, overrideParams);
     });
     return;
@@ -1953,7 +2090,7 @@ function camFrame(){
     if (ns) ns.style.display = "none";
     var st = $("camstat");
     if (st) st.textContent = "画面 " + im.naturalWidth + "×" + im.naturalHeight +
-                             "（约 2 帧/秒）";
+                             "（板端推流 " + camFps() + " 帧/秒）";
   };
   im.onerror = function(){
     camBusy = false;
@@ -2005,37 +2142,76 @@ function camSetLive(on){
   sendCmd("cam_stream", null, {on: on, fps: fps});
 }
 function shotRow(dev, name, bytes, local){
-  return '<div class="shot"><img src="' + (local ? local : "/api/shots/" +
-      encodeURIComponent(dev) + "/" + encodeURIComponent(name)) + '" alt="">' +
+  /* 整行是可点的（role=button + tabindex，与设备行 / 存储圆环同一套路），
+     点开大图预览；行内的「删除」按钮自己 stopPropagation 语义靠委托里
+     排除 [data-shot] 实现。 */
+  return '<div class="shot" role="button" tabindex="0" data-open="' + esc(name) +
+      '" data-open-dev="' + esc(dev) + '" data-local="' + (local ? "1" : "") + '">' +
+      '<img src="' + (local ? local : "/api/shots/" +
+      encodeURIComponent(dev) + "/" + encodeURIComponent(name)) + '" alt="' + esc(name) + '">' +
     '<span class="nm">' + esc(name) + '<br><span class="hint">' +
     (bytes ? fmtBytes(bytes) : "") + (local ? " · 本机存档" : " · 板子/服务器") + '</span></span>' +
     '<button class="sm" data-shot="' + esc(name) + '" data-local="' + (local ? "1" : "") + '">删除</button></div>';
+}
+/* 本机存档的 objectURL 登记表：name → url。每次 renderShots 对账 ——
+  名字还在就复用同一个 URL（浏览器不必重新解码），名字没了才 revoke。
+  旧实现每渲染一次新建一批 URL 且从不 revoke，拍几十张照就漏几十份 blob 引用。 */
+var shotUrls = {};
+function shotHint(t){
+  var el = $("shothint");
+  if (el && el.textContent !== t) el.textContent = t;
+}
+function doDeleteShot(nm, dev, local){
+  if (local){
+    idbDel(nm, function(){ shotHint(""); renderShots(); });
+    return;
+  }
+  apiFetch("/api/shots/delete", {method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({device: dev, name: nm})})
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+      /* 旧实现 .then(renderShots) 不看结果：401 / 失败时列表照刷，
+         没删掉的照片"消失一下又回来"，还没有任何解释。 */
+      if (d && d.ok === false){ shotHint("删除失败：" + (d.error || d.hint || "未知错误")); return; }
+      shotHint("");
+      renderShots();
+    })
+    .catch(function(e){ shotHint("删除失败：" + e); });
 }
 function renderShots(){
   var host = $("shotlist");
   if (!host) return;
   var dev = selDevice || "";      /* 空着就交给服务端回退到"最近上报的那台" */
   var who = $("shotwho");
-  if (who) who.textContent = dev || "—";
   var server = [];
   var finish = function(){
+    /* 单板场景 selDevice 是空的、照片归"最近上报的那台"（服务端回退）——
+       标题要跟着回退结果走，否则会写着「—」却列出 Group-07 的照片。 */
+    if (who) who.textContent = dev || (server[0] && server[0].device) || "—";
     /* 服务器上的 + 本机 IndexedDB 里的，合起来展示（本机在前，刷新页面也不丢） */
     idbList(function(local){
+      var alive = {};
+      local.forEach(function(x){
+        alive[x.name] = 1;
+        /* idbList 每次调用都为同一张照片新建一个 URL：顶替旧的要顺手 revoke，
+           否则每渲染一次漏一份（旧 <img> 随 innerHTML 一起被换掉， revoke 安全）。 */
+        if (shotUrls[x.name] && shotUrls[x.name] !== x.url) URL.revokeObjectURL(shotUrls[x.name]);
+        shotUrls[x.name] = x.url;
+      });
+      Object.keys(shotUrls).forEach(function(nm){
+        if (!alive[nm]){ URL.revokeObjectURL(shotUrls[nm]); delete shotUrls[nm]; }
+      });
       var html = local.map(function(x){ return shotRow(dev, x.name, x.bytes, x.url); }).join("") +
                  server.map(function(x){ return shotRow(x.device, x.name, x.bytes, null); }).join("");
       host.innerHTML = html || '<div class="empty">还没有照片。点上面的「拍照」按钮。</div>';
       Array.prototype.forEach.call(host.querySelectorAll("[data-shot]"), function(btn){
         btn.onclick = function(){
           var nm = btn.getAttribute("data-shot");
+          var row = btn.closest ? btn.closest(".shot") : null;
+          var dv = row ? row.getAttribute("data-open-dev") : dev;
           confirmDialog("删除照片", "将永久删除 " + nm + "，无法恢复。", "删除").then(function(ok){
-            if (!ok) return;
-            if (btn.getAttribute("data-local")) {
-              idbDel(nm, renderShots);
-            } else {
-              apiFetch("/api/shots/delete", {method: "POST",
-                headers: {"Content-Type": "application/json"},
-                body: JSON.stringify({device: dev, name: nm})}).then(renderShots);
-            }
+            if (ok) doDeleteShot(nm, dv, !!btn.getAttribute("data-local"));
           });
         };
       });
@@ -2045,6 +2221,307 @@ function renderShots(){
     .then(function(d){ server = (d && d.shots) || []; finish(); })
     .catch(function(){ finish(); });
 }
+
+/* ---- 大图预览 ---- */
+var shotViewCur = null;   /* 当前打开的 {name, dev, local} */
+function openShotView(row){
+  var dlg = $("shotview");
+  if (!dlg || typeof dlg.showModal !== "function") return;
+  var nm = row.getAttribute("data-open");
+  var dev = row.getAttribute("data-open-dev") || "";
+  var local = row.getAttribute("data-local") === "1";
+  var src = local ? (shotUrls[nm] || "")
+                  : "/api/shots/" + encodeURIComponent(dev) + "/" + encodeURIComponent(nm);
+  if (!src) return;
+  var img = $("shotimg");
+  img.src = src;
+  img.alt = nm;
+  var cap = $("shotcap");
+  if (cap) cap.textContent = nm + (local ? " · 本机存档" : (dev ? " · " + dev : ""));
+  shotViewCur = {name: nm, dev: dev, local: local};
+  dlg.showModal();
+}
+/* 委托挂在容器上一次：行每次 renderShots 都重建，handler 不能跟着重建 */
+function bindShotList(host){
+  if (!host || host.__bound) return;
+  host.__bound = 1;
+  host.addEventListener("click", function(ev){
+    /* 点「删除」是删除，不该顺带开大图 */
+    if (ev.target && ev.target.closest && ev.target.closest("[data-shot]")) return;
+    var row = ev.target && ev.target.closest ? ev.target.closest(".shot") : null;
+    if (row) openShotView(row);
+  });
+  host.addEventListener("keydown", function(ev){
+    if (ev.key !== "Enter" && ev.key !== " " && ev.key !== "Spacebar") return;
+    var row = ev.target && ev.target.closest ? ev.target.closest(".shot") : null;
+    if (!row) return;
+    ev.preventDefault();
+    openShotView(row);
+  });
+}
+
+/* ---- 文件管理（照片 / 录音 / 日志）------------------------------------
+   服务端只暴露这三个自有目录，文件名/设备名/分类都在服务端做白名单校验；
+   页面这边只负责拼 URL 和展示 —— 把"能不能删"的判断留在服务端，
+   免得改一行前端就绕过了。 */
+var fileCat = "shots";
+var filePreviewName = "";
+var fileCurDev = "";                 /* 最近一次列目录时服务端回填的真实设备（单板模式下 selDevice 为空） */
+var fileSel = Object.create(null);   /* 批量删除的选中集：name -> true */
+var fileScope = "";                  /* 选中集所属的「分类|设备」；换了就清空，别跨设备误删 */
+var FILE_ACCEPT = {shots: ".jpg,.jpeg,.png", audio: ".wav", logs: ".jsonl,.log,.txt"};
+
+/* 批量删除条的显示状态：没选中就藏起来，「全选」按部分选中显示半选。 */
+function syncFileSel(){
+  var all = $("fileselall"), wrap = $("fileselwrap"), btn = $("filedelsel");
+  var boxes = document.querySelectorAll("#filelist [data-fsel]");
+  var total = boxes.length, n = 0;
+  for (var k in fileSel) if (fileSel[k]) n++;
+  if (wrap){ wrap.hidden = total === 0; }
+  if (all){
+    all.disabled = total === 0;
+    all.checked = total > 0 && n === total;
+    all.indeterminate = n > 0 && n < total;
+  }
+  if (btn){
+    btn.hidden = n === 0;
+    btn.textContent = "删除所选（" + n + "）";
+  }
+}
+
+function fileTargetDev(){
+  return fileCat === "logs" ? "" : (selDevice || fileCurDev || "");
+}
+function fileUrl(kind, name){
+  return "/api/files/" + kind
+    + "?cat=" + encodeURIComponent(fileCat)
+    + "&device=" + encodeURIComponent(fileTargetDev())
+    + "&name=" + encodeURIComponent(name);
+}
+function loadFiles(){
+  var host = $("filelist");
+  if (!host) return;
+  fileCurDev = selDevice || "";
+  var scope = fileCat + "|" + (selDevice || "");
+  if (scope !== fileScope){ fileSel = Object.create(null); fileScope = scope; }
+  var who = $("fileswho");
+  if (who) who.textContent = (fileCat === "logs" ? "日志目录" : (selDevice || "—"));
+  /* 快切分类/设备时会有在途的旧请求：响应回来时按发出时的口径对一遍，
+     不是当前口径就丢掉 —— 不然慢的旧响应会把新列表盖掉（实测复现过）。 */
+  var reqCat = fileCat, reqDev = selDevice || "";
+  fetch("/api/files?cat=" + encodeURIComponent(reqCat)
+        + "&device=" + encodeURIComponent(reqDev))
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+      if (reqCat !== fileCat || reqDev !== (selDevice || "")) return;
+      if (!d || !d.ok) throw new Error((d && d.error) || "列目录失败");
+      var c = (d.categories || [])[0] || {files: [], note: ""};
+      fileCurDev = (fileCat === "logs") ? "" : (c.device || d.device || selDevice || "");
+      if (who && d.device) who.textContent = (fileCat === "logs" ? "日志目录" : d.device);
+      var files = c.files || [];
+      /* 服务端只回最近 500 条（capped）时要说出来 —— 不然用户以为"文件丢了"。
+         只在 capped 或残留 capped 文案时才动提示行：删除进度/结果消息也走这行，
+         无条件的覆盖会把"已删除 N 个"抹掉。 */
+      var fhint = $("fileshint");
+      if (fhint && c.capped){
+        fhint.textContent = "仅显示最近 500 条，更早的请到数据目录直接删 · 删除不可恢复";
+      } else if (fhint && fhint.textContent.indexOf("仅显示最近") === 0){
+        fhint.textContent = "预览只读前 256 KB（超出会标注已截断）· 删除不可恢复";
+      }
+      /* 换分类/换设备后把不在列表里的选中项丢掉 —— 免得删掉同名但别的设备的文件 */
+      var keep = Object.create(null);
+      files.forEach(function(f){ if (fileSel[f.name]) keep[f.name] = true; });
+      fileSel = keep;
+      if (!files.length){
+        host.innerHTML = '<div class="empty">' + esc(c.note || ("该分类暂无文件")) + '</div>';
+        syncFileSel();
+        return;
+      }
+      host.innerHTML = files.map(function(f){
+        var when = new Date(f.mtime * 1000).toLocaleString();
+        return '<div class="frow">'
+          + '<input type="checkbox" class="fchk" data-fsel="' + esc(f.name) + '"'
+          + (fileSel[f.name] ? ' checked' : '') + ' title="选中后可批量删除">'
+          + '<span class="fname" title="' + esc(f.name) + '">' + esc(f.name) + '</span>'
+          + '<span class="fmeta" title="' + esc(when) + '">' + fmtBytes(f.bytes) + '</span>'
+          + (f.text ? '<button class="sm" type="button" data-fpv="' + esc(f.name) + '">预览</button>' : '')
+          + '<button class="sm" type="button" data-fdl="' + esc(f.name) + '">下载</button>'
+          + '<button class="sm" type="button" data-fdel="' + esc(f.name) + '">删除</button>'
+          + '</div>';
+      }).join("");
+      Array.prototype.forEach.call(host.querySelectorAll("[data-fsel]"), function(cb){
+        cb.onchange = function(){
+          if (cb.checked) fileSel[cb.getAttribute("data-fsel")] = true;
+          else delete fileSel[cb.getAttribute("data-fsel")];
+          syncFileSel();
+        };
+      });
+      Array.prototype.forEach.call(host.querySelectorAll("[data-fpv]"), function(btn){
+        btn.onclick = function(){ previewFile(btn.getAttribute("data-fpv")); };
+      });
+      Array.prototype.forEach.call(host.querySelectorAll("[data-fdl]"), function(btn){
+        btn.onclick = function(){ window.location.href = fileUrl("download", btn.getAttribute("data-fdl")); };
+      });
+      Array.prototype.forEach.call(host.querySelectorAll("[data-fdel]"), function(btn){
+        btn.onclick = function(){ deleteFile(btn.getAttribute("data-fdel")); };
+      });
+      syncFileSel();
+    })
+    .catch(function(e){
+      if (reqCat !== fileCat || reqDev !== (selDevice || "")) return;
+      host.innerHTML = '<div class="empty">读取失败：' + esc(e.message) + '</div>';
+    });
+}
+
+function previewFile(name){
+  var dlg = $("fprevd");
+  fetch(fileUrl("preview", name) + "&limit=262144")
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+      if (!d || !d.ok) throw new Error((d && d.error) || "预览失败");
+      filePreviewName = name;
+      $("fprevname").textContent = d.name;
+      var txt = d.text || "";
+      var lines = txt ? txt.split("\n").length : 0;
+      $("fprevinfo").textContent = fmtBytes(d.bytes) + " · " + lines + " 行 · " +
+        (d.truncated ? "⚠ 只显示前 " + fmtBytes(d.limit) + "，其余请下载原文件" : "完整内容");
+      $("fprevtext").textContent = txt;
+      if (dlg && typeof dlg.showModal === "function") dlg.showModal();
+      else window.open(fileUrl("download", name), "_blank");
+    })
+    .catch(function(e){ $("fileshint").textContent = "预览失败：" + e.message; });
+}
+
+function deleteFile(name){
+  confirmDialog("删除文件", "将永久删除 " + name + "，无法恢复。", "删除").then(function(ok){
+    if (!ok) return;
+    apiFetch("/api/files/delete", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({cat: fileCat, device: fileTargetDev(), name: name})
+    }).then(function(r){ return r.json(); }).then(function(d){
+      if (!d || !d.ok) throw new Error((d && d.error) || "删除失败");
+      $("fileshint").textContent = "已删除 " + d.deleted;
+      loadFiles();
+    }).catch(function(e){ $("fileshint").textContent = "删除失败：" + e.message; });
+  });
+}
+
+/* 批量删除：逐条复用单文件删除接口（服务端路径夹紧/校验只有一份，前端不另开写口），
+   串行执行并在提示行报进度；失败的不中断，最后一起汇总。 */
+function deleteSelected(){
+  var names = [];
+  for (var k in fileSel) if (fileSel[k]) names.push(k);
+  if (!names.length) return;
+  confirmDialog("批量删除文件",
+    "将永久删除选中的 " + names.length + " 个文件，无法恢复。", "删除").then(function(ok){
+    if (!ok) return;
+    var btn = $("filedelsel");
+    if (btn) btn.disabled = true;
+    var i = 0, okN = 0, failed = 0;
+    (function next(){
+      if (i >= names.length){
+        if (btn) btn.disabled = false;
+        $("fileshint").textContent = failed
+          ? "已删除 " + okN + " 个，" + failed + " 个失败（刷新后可重试）"
+          : "已删除 " + okN + " 个文件";
+        fileSel = Object.create(null);
+        loadFiles();
+        return;
+      }
+      var nm = names[i++];
+      $("fileshint").textContent = "删除中 " + i + "/" + names.length + " · " + nm;
+      apiFetch("/api/files/delete", {
+        method: "POST", headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({cat: fileCat, device: fileTargetDev(), name: nm})
+      }).then(function(r){ return r.json(); }).then(function(d){
+        if (!d || !d.ok) throw new Error((d && d.error) || "删除失败");
+        okN++;
+      }).catch(function(){ failed++; }).then(next);
+    })();
+  });
+}
+
+/* 预览弹窗的「复制全文」：日志要贴进工单/聊天时不用再手动框选；
+   先试异步剪贴板（页面在 https/localhost 下可用），失败退回选区 + execCommand。 */
+function copyPreview(){
+  var btn = $("fprevcopy"), txt = ($("fprevtext") && $("fprevtext").textContent) || "";
+  if (!txt) return;
+  var restore = function(ok){
+    if (!btn) return;
+    btn.textContent = ok ? "已复制" : "复制失败";
+    setTimeout(function(){ btn.textContent = "复制全文"; }, 1800);
+  };
+  if (navigator.clipboard && navigator.clipboard.writeText){
+    navigator.clipboard.writeText(txt).then(function(){ restore(true); },
+                                           function(){ restore(false); });
+    return;
+  }
+  try{
+    var range = document.createRange();
+    range.selectNodeContents($("fprevtext"));
+    var sel = window.getSelection();
+    sel.removeAllRanges(); sel.addRange(range);
+    restore(document.execCommand("copy"));
+    sel.removeAllRanges();
+  }catch(e){ restore(false); }
+}
+
+function uploadFile(){
+  var up = $("fileup");
+  var f = up && up.files && up.files[0];
+  if (!f) return;
+  var url = "/api/files/upload?cat=" + encodeURIComponent(fileCat)
+    + "&device=" + encodeURIComponent(fileTargetDev())
+    + "&name=" + encodeURIComponent(f.name);
+  $("fileshint").textContent = "上传中 " + f.name + " …";
+  apiFetch(url, {method: "POST",
+                 headers: {"Content-Type": f.type || "application/octet-stream"},
+                 body: f})
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+      if (!d || !d.ok) throw new Error((d && d.error) || "上传失败");
+      $("fileshint").textContent = "已上传 " + d.name + " · " + fmtBytes(d.bytes)
+        + (d.replaced ? "（已覆盖原文件）" : "");
+      up.value = "";
+      loadFiles();
+    })
+    .catch(function(e){ $("fileshint").textContent = "上传失败：" + e.message; });
+}
+
+(function bindFiles(){
+  var cat = $("filecat");
+  if (!cat) return;
+  var up = $("fileup");
+  if (up) up.accept = FILE_ACCEPT[fileCat] || "";
+  cat.onchange = function(){
+    fileCat = this.value;
+    fileSel = Object.create(null);
+    if (up) up.accept = FILE_ACCEPT[fileCat] || "";
+    $("fileshint").textContent = "预览只读前 256 KB（超出会标注已截断）· 删除不可恢复";
+    loadFiles();
+  };
+  if ($("filesrefresh")) $("filesrefresh").onclick = loadFiles;
+  if ($("fileupbtn") && up) $("fileupbtn").onclick = function(){ up.click(); };
+  if (up) up.onchange = uploadFile;
+  if ($("fileselall")) $("fileselall").onchange = function(){
+    var on = this.checked;
+    Array.prototype.forEach.call(document.querySelectorAll("#filelist [data-fsel]"), function(cb){
+      cb.checked = on;
+      if (on) fileSel[cb.getAttribute("data-fsel")] = true;
+      else delete fileSel[cb.getAttribute("data-fsel")];
+    });
+    syncFileSel();
+  };
+  if ($("filedelsel")) $("filedelsel").onclick = deleteSelected;
+  if ($("fprevcopy")) $("fprevcopy").onclick = copyPreview;
+  var dlg = $("fprevd");
+  if (dlg){
+    if ($("fprevclose")) $("fprevclose").onclick = function(){ dlg.close(); };
+    if ($("fprevdl")) $("fprevdl").onclick = function(){
+      if (filePreviewName) window.location.href = fileUrl("download", filePreviewName);
+    };
+  }
+})();
 
 /* ---- 本机存档：IndexedDB（用户要求"存浏览器里、保持持久性"）----
  * 用 IndexedDB 而不是 localStorage：照片是二进制，localStorage 只能存字符串且只有 5MB。 */
@@ -2225,7 +2702,12 @@ function renderSd(){
     b.onclick = function(){
       var fn = b.getAttribute("data-rm");
       confirmDialog("删除板子上的文件", "将永久删除 SD 卡里的 " + fn + "，无法恢复。", "删除")
-        .then(function(ok){ if (ok) sendCmd("sd_rm", null, {name: fn}); });
+        /* 这里必须走 doSendCmd（跳过 sendCmd 里的"危险操作再确认一次"）：
+           sd_rm 在 CMD_UI 里标了 danger，是为了不让它出现在指令栏，
+           但确认框已经在上面弹过了。走 sendCmd 会**再弹一次**，而且那次的文案
+           是写死的「格式化 SD 卡 / 整张清空」—— 删一个文件被说成清空整张卡
+           （2026-11-10 QA 抓到，用户点一次没反应、看到"格式化"又不敢点）。 */
+        .then(function(ok){ if (ok) doSendCmd("sd_rm", null, {name: fn}); });
     };
   });
 }
@@ -2261,6 +2743,10 @@ function renderCmds(cmds){
   var el = $("cmds");
   if (!cmds.length){
     setHTML(el, '<div class="empty">还没有下发过指令。</div>');
+    /* 存储面板的"还没读过 —— 点上面的「读取存储信息」"也在这里画。
+       以前这里直接 return，而 renderSd() 在函数末尾 —— 于是**一条指令都没下发过时**
+       存储面板永远是一片空白（文案写了，但代码永远走不到）。 */
+    renderSd();
     return;
   }
   setHTML(el, cmds.slice(0,8).map(function(c){
@@ -2279,8 +2765,13 @@ function renderCmds(cmds){
     /* 第 4 周：标出这条指令是不是"说话触发的" —— 网页上点的和板子前说的
        混在同一个列表里，不标就分不清"刚才那句『拍张照』到底执行了没有"。 */
     var src = (c.source === "nl") ? '<span class="meta">语音</span>' : "";
+    /* 下发时刻：服务端 commands_snapshot 带 created（epoch 秒）。
+       追"刚才那条到底什么时候发的"不用再去翻服务端日志。 */
+    var ts = (typeof c.created === "number" && isFinite(c.created))
+      ? '<span class="meta">' + new Date(c.created*1000).toLocaleTimeString("zh-CN", {hour12:false}) + '</span>'
+      : "";
     return '<div class="item"><span class="st st-' + esc(c.state) + '">' + esc(STNAME[c.state]||c.state) + '</span>'
-         + '<span class="name">' + esc(c.name) + '</span>' + ps + src
+         + ts + '<span class="name">' + esc(c.name) + '</span>' + ps + src
          + '<span class="meta">' + esc(c.id) + '</span>' + lat + extra + '</div>';
   }).join(""));
 
@@ -2311,6 +2802,56 @@ function evItem(ev){
        + '<span>' + esc(ev.text) + '</span></div>';
 }
 
+/* 事件流唯一的 innerHTML 写入口。旧实现有两处错：
+   1) 空态走 setHTML（缓存记在 el.__html）、正常态直接写 innerHTML —— 两套缓存
+      各说各话：切到「0 条事件」的设备时 setHTML 看见 __html 没变就跳过写入，
+      屏幕上留着**上一台设备**的事件（比空着更误导）；
+   2) 重绘不锚定滚动 —— 事件是头部插入的，每来一条，用户正在读的那行就往下
+      滑一格；读得多快滑得多快。
+   锚定做法：重绘前记住"视口顶端正在读的那一行"（按文本认），重绘后把它
+   送回原来的视口位置。注意**不能**用 scrollHeight 差值补偿：列表恒为 40 行
+   （头进一条、尾掉一条），差值永远是 0。 */
+function paintFeed(html){
+  var el = $("feed");
+  if (!el || evHTML === html) return;
+  var sc = el.scrollTop, key = null, dy = 0;
+  if (sc > 0){
+    for (var i = 0; i < el.children.length; i++){
+      var k = el.children[i];
+      if (k.offsetTop + k.offsetHeight > sc){ key = k.textContent; dy = sc - k.offsetTop; break; }
+    }
+  }
+  evHTML = html;
+  el.innerHTML = html;
+  if (key !== null){
+    for (var j = 0; j < el.children.length; j++){
+      if (el.children[j].textContent === key){ el.scrollTop = el.children[j].offsetTop + dy; break; }
+    }
+  }
+}
+
+/* 事件类型筛选（2026-11-03）：课上追"那块板为什么掉线/有没有跌落"时，
+   事件流混着活动变化、提问、系统消息，找一条要翻半天。
+   纯前端筛选，不改服务端：kind 本来就是结构化字段，SSE 与 /api/events 都带。
+   筛选对「最近 40 条」与「查看全部」两个视图同样生效。 */
+var evFilter = "all";
+/* 展开态下取回的全量列表：换筛选时靠它重画，不用重新取。 */
+var evFullList = null;
+var EV_GROUPS = {
+  fall:     {fall:1, alert:1},
+  shake:    {shake:1},
+  activity: {activity:1},
+  ask:      {ask:1, ai:1},
+  cmd:      {cmd:1},
+  sys:      {info:1, warn:1, btn:1}
+};
+
+function evMatch(ev){
+  if (evFilter === "all") return true;
+  var g = EV_GROUPS[evFilter] || {};
+  return !!g[ev.kind || "info"];
+}
+
 function renderEvents(evts, total){
   /* 事件流的权威通道也是 SSE。/api/latest 不带 events，所以这里缺字段时
      **什么都不要做**（包括画"暂无事件"空态）—— 画了就是跟 SSE 打架。
@@ -2318,16 +2859,29 @@ function renderEvents(evts, total){
      没有这个字段时退回 `evts.length`（老服务端 / 单独调用）。 */
   if (evts && evts.length){ lastEvts = evts; lastEvTotal = total; }
   if (evExpanded) return;          /* 展开态由 toggleEvents 自己管，别盖 */
-  if (!evts || !evts.length) return;
-  var h = evts.slice(0,40).map(evItem).join("");
+  /* ⚠️ "字段缺失"和"真的没有事件"必须分开：
+     /api/latest 是 5Hz 轮询、**不带 events**，如果在这里画空态，
+     就会每 200ms 把 SSE 刚画好的列表抹掉（T47 的抖动换个方向再现）。
+     只有拿到**空数组**（SSE 说"现在确实 0 条"）才画空态。 */
+  if (!evts) return;
+  if (!evts.length){
+    /* 空态：卡片不能一片空白（「指令记录」「照片」「存储」都有空态文案，这里漏了）。
+       SSE 每帧都会调到这儿，靠 paintFeed 的 evHTML 去重，不会重复写 DOM。 */
+    paintFeed('<div class="empty">还没有事件。板子上报或下发指令后会出现在这里。</div>');
+    if ($("evcount").textContent) $("evcount").textContent = "";
+    return;
+  }
+  var list = evts.filter(evMatch);
+  var h = list.length ? list.slice(0,40).map(evItem).join("")
+                      : '<div class="empty">该类型暂无事件</div>';
   var n = (total !== undefined && total !== null) ? total : evts.length;
   var label = (n > evts.length) ? ("最近 " + evts.length + " 条 / 共 " + n + " 条")
                                 : ("最近 " + n + " 条");
-  if (h !== evHTML){
-    evHTML = h;
-    $("feed").innerHTML = h;
-    $("evcount").textContent = label;
-  } else if ($("evcount").textContent !== label){
+  if (evFilter !== "all"){
+    label += " · 筛选后 " + list.length + " 条";
+  }
+  paintFeed(h);
+  if ($("evcount").textContent !== label){
     /* 条数变了但可见的那 40 条没变（比如又来了第 41 条把最旧的挤出去前）——
        文案也得跟上，否则"共 N 条"会停在旧值。 */
     $("evcount").textContent = label;
@@ -2336,9 +2890,32 @@ function renderEvents(evts, total){
 
 function setEvExpanded(on){
   evExpanded = on;
+  if (!on) evFullList = null;      /* 收起后丢掉全量缓存，下次展开重新取 */
   var b = $("evmore");
   if (b) b.textContent = on ? "只看最近" : "查看全部";
-  if (!on && lastEvts){ evHTML = ""; renderEvents(lastEvts, lastEvTotal); }
+  if (!on && lastEvts){
+    evHTML = "";
+    renderEvents(lastEvts, lastEvTotal);
+    /* 200 条 ↔ 40 条是两份不同的列表，滚动位置没有可延续的意义 */
+    var f = $("feed");
+    if (f) f.scrollTop = 0;
+  }
+}
+
+/* 展开态（或收起态）换筛选时的重画。展开用全量缓存，收起用最近一帧 SSE。 */
+function refilterEvents(){
+  evHTML = "";
+  if (evExpanded && evFullList){
+    var list = evFullList.filter(evMatch);
+    paintFeed(list.length ? list.map(evItem).join("")
+                          : '<div class="empty">该类型暂无事件</div>');
+    var f = $("feed");
+    if (f) f.scrollTop = 0;
+    $("evcount").textContent = "全部 " + evFullList.length + " 条"
+      + (evFilter !== "all" ? (" · 筛选后 " + list.length + " 条") : "");
+  } else if (lastEvts){
+    renderEvents(lastEvts, lastEvTotal);
+  }
 }
 
 function toggleEvents(){
@@ -2351,11 +2928,42 @@ function toggleEvents(){
       var evts = d.events || [];
       if (!evts.length){ $("evcount").textContent = "还没有事件"; return; }
       setEvExpanded(true);
-      evHTML = evts.map(evItem).join("");
-      $("feed").innerHTML = evHTML;
-      $("evcount").textContent = "全部 " + evts.length + " 条";
+      evFullList = evts;
+      refilterEvents();
     })
     .catch(function(){ $("evcount").textContent = "取事件失败"; });
+}
+
+/* 事件导出 CSV：课上复盘要把"那一节课发生了什么"带走时，
+   复制粘贴 200 条 HTML 不现实。导出的是**当前筛选下**的集合 ——
+   展开态导全量 200 条，收起态导最近一帧（与屏幕上看到的一致）。 */
+function csvCell(s){
+  return '"' + String(s === null || s === undefined ? "" : s).replace(/"/g, '""') + '"';
+}
+function exportEventsCsv(){
+  var src = (evExpanded && evFullList) ? evFullList : (lastEvts || []);
+  var list = src.filter(evMatch);
+  if (!list.length){
+    $("evcount").textContent = "没有可导出的事件";
+    return;
+  }
+  var pad = function(n){ return (n < 10 ? "0" : "") + n; };
+  var rows = ["time,kind,text"];
+  list.forEach(function(ev){
+    var d = new Date(ev.ts * 1000);
+    var ts = d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate())
+           + " " + pad(d.getHours()) + ":" + pad(d.getMinutes()) + ":" + pad(d.getSeconds());
+    rows.push(csvCell(ts) + "," + csvCell(ev.kind || "info") + "," + csvCell(ev.text || ""));
+  });
+  /* BOM 不能省：Windows 的 Excel 按 ANSI 猜无 BOM 的 CSV，中文必乱码。
+     写成 \ufeff 转义而不是字面字符 —— 字面 BOM 不可见，编辑器可能把它剥掉。 */
+  var blob = new Blob(["\ufeff" + rows.join("\r\n")], {type: "text/csv;charset=utf-8"});
+  var a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "rw1-events.csv";
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(function(){ URL.revokeObjectURL(a.href); a.remove(); }, 0);
 }
 
 /* ---------------- 设备列表（多板） ----------------
@@ -2458,6 +3066,27 @@ function renderDevices(list, current){
      现在服务端两个通道都带 devices 了，这条只是**防御性兜底**：
      以后再加新通道、忘了带 devices 时，页面不会再闪。 */
   if (!Array.isArray(list)) return;
+  /* 档位显示**和"要不要画设备列表"无关**。
+     单板时下面那块卡片是隐藏的，但「指令记录」里的"当前 oN"仍然要显示 ——
+     所以 devOrient 必须先更新，再决定画不画列表。
+     （2026-11-10 QA 抓到：单板场景永远显示"还没收到板端上报的档位"，
+     因为原来更新 devOrient 的循环在 list.length<=1 的提前 return 之后。） */
+  var orientDirty = false;
+  list.forEach(function(d){
+    if (d.orient !== null && d.orient !== undefined){
+      if (devOrient[d.id] !== d.orient) orientDirty = true;
+      devOrient[d.id] = d.orient;
+    }
+  });
+  /* devOrient 以设备名为键、只增不删：一学期换几十个设备名就积几十个死键
+     （syncOrient 在没勾选时会把**所有键**列出来）。按本帧名单修剪 ——
+     服务端册子里已经没有的设备，档位留着也没人看（2026-11-10 QA 建议 #4）。 */
+  Object.keys(devOrient).forEach(function(id){
+    var alive = list.some(function(d){ return d.id === id; });
+    if (!alive){ delete devOrient[id]; orientDirty = true; }
+  });
+  if (orientDirty) syncOrient();
+
   /* 只有一台板时不显示这块 —— 单板课堂不该凭空多出一张卡片 */
   if (list.length <= 1){
     card.hidden = true;
@@ -2524,15 +3153,11 @@ function renderDevices(list, current){
      复选框的 checked 只在不一致时赋值 —— 无条件赋值会让用户正在点的
      那颗框被"改回旧值"，表现为点了没反应（旧实现每帧整体重建，
      20 台时这问题必现）。 */
-  var online = 0, orientDirty = false;
+  var online = 0;
   list.forEach(function(d){
     var row = devRows[d.id];
     if (!row) return;
     if (d.online) online++;
-    if (d.orient !== null && d.orient !== undefined){
-      if (devOrient[d.id] !== d.orient) orientDirty = true;
-      devOrient[d.id] = d.orient;
-    }
     var sel = d.id === current;
     if (row.__sel !== sel){
       row.__sel = sel;
@@ -2563,9 +3188,7 @@ function renderDevices(list, current){
     $("devcount").textContent = cntTxt;
   }
   syncDevAllText();
-  /* 档位显示跟着 devOrient 走。它只在**档位真的变了**时才刷 ——
-     原来每次都刷，textContent 每秒被写十遍同样的内容。 */
-  if (orientDirty) syncOrient();
+  /* 档位显示（syncOrient）已经在函数开头刷过了 —— 那里单板/多板都会走到。 */
 }
 
 /* 「全选」按钮：全都勾上 / 全都取消。文案随状态变，避免用户看不出当前是哪种。
@@ -2603,12 +3226,23 @@ function selectDevice(id){
      留着上一台的容量/文件列表会显示成新设备的数据（而且看起来完全正常，
      比空着更误导）。 */
   lastSd = null;
+  /* 文件管理也是"这台板"的目录：卡片上写着上一台的名字和文件，
+     实际却会去读新设备的目录 —— 必须立刻按新设备重列。 */
+  if (typeof loadFiles === "function") loadFiles();
   /* 展开态的长列表是**上一台板**的事件，换设备必须收起 —— 和 lastSd 同理，
      留着别人的历史比空着更误导。这里只复位标记与按钮文案，不额外取数：
      下面那行 pull() 会让 renderEvents 用新设备的数据重画。 */
   evExpanded = false;
+  evFullList = null;
   evHTML = "";                 /* 逼下一帧按新设备的数据重画，而不是"看起来没变" */
   if ($("evmore")) $("evmore").textContent = "查看全部";
+  /* 上一台设备读到的滚动位置对新一台没有意义 —— 归零，从最新一条看起 */
+  var feed0 = $("feed");
+  if (feed0) feed0.scrollTop = 0;
+  /* 照片列表同理：它按设备取 /api/shots，不重画就会出现「标题写着 B 板、
+     列表里是 A 板的照片」（和上面 lastSd 那条一模一样，都是"看着正常"的误导）。
+     本机存档（IndexedDB）不分设备，重画后照旧显示。 */
+  renderShots();
   pull();              /* 先拉一次快照，不必等下一帧 SSE */
   stream();            /* SSE 是按设备过滤的，换设备要重连 */
 }
@@ -2969,6 +3603,14 @@ if ($("theme")) $("theme").onclick = function(){
    单独绑、不放进上面那个 fetch 回调里 —— 它不依赖 /api/commands 的结果，
    放进去只会平白多一条"拿不到命令名就连按钮都点不动"的耦合。 */
 if ($("evmore")) $("evmore").onclick = toggleEvents;
+/* 事件类型筛选：纯前端，切换时按当前视图（收起=最近一帧 SSE / 展开=全量缓存）重画 */
+if ($("evfilter")) $("evfilter").onchange = function(){ evFilter = this.value; refilterEvents(); };
+if ($("evcsv")) $("evcsv").onclick = exportEventsCsv;
+/* 文件管理卡片：设备还没上报时服务端会退回最近的那台；
+   页面先按当前选择画一次，选设备时 selectDevice 会再刷。 */
+try { loadFiles(); } catch (e) {
+  if (window.console) console.warn("文件管理初始化失败（不影响其它功能）: " + e);
+}
 fitCanvas();
 fetch("/api/logs").then(function(r){ return r.json(); }).then(function(l){
   if (l && l.dir) $("logdir").textContent = "落盘 " + l.dir;
@@ -2986,6 +3628,28 @@ fetch("/api/commands" + devQuery()).then(function(r){ return r.json(); }).then(f
     /* 正在推流时改帧率 → 立刻重发一次命令，不用先关再开。
      * 没在推流就什么都不做：等用户点「开启实时画面」时会带上新帧率。 */
     if ($("camfps")) $("camfps").onchange = function(){ if (camOn) camSetLive(true); };
+    if ($("shotview")){
+      bindShotList($("shotlist"));
+      $("shotclose").onclick = function(){ $("shotview").close(""); };
+      $("shotdl").onclick = function(){
+        if (!shotViewCur) return;
+        var a = document.createElement("a");
+        a.href = $("shotimg").src;
+        a.download = shotViewCur.name;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+      };
+      $("shotdel").onclick = function(){
+        if (!shotViewCur) return;
+        var cur = shotViewCur;
+        confirmDialog("删除照片", "将永久删除 " + cur.name + "，无法恢复。", "删除").then(function(ok){
+          if (!ok) return;
+          $("shotview").close("");
+          doDeleteShot(cur.name, cur.dev, cur.local);
+        });
+      };
+    }
     renderShots();
   } catch (e) {
     if (window.console) console.warn("摄像头初始化失败（不影响其它功能）: " + e);

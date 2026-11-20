@@ -480,7 +480,7 @@ class Renderer:
             ry = e["UI_AXIS_Y"] + i * (e["UI_AXIS_ROW_H"] + e["UI_AXIS_GAP"])
             ac = [C["AXIS_X"], C["AXIS_Y"], C["AXIS_Z"]][i]
             text(d, e["UI_AXIS_LBL_X"], ry, e["UI_AXIS_LBL_W"], e["UI_AXIS_ROW_H"],
-                 name, self.num[14], ac, "left")
+                 name, self.num[12], ac, "left")
             byy = ry + (e["UI_AXIS_ROW_H"] - e["UI_AXIS_BAR_H"]) // 2
             bx = e["UI_AXIS_BAR_X"]
             bw = e["UI_AXIS_BAR_W"]
@@ -499,7 +499,7 @@ class Renderer:
                 ry + (e["UI_AXIS_ROW_H"] - (bh + 2)) // 2,
                 1, bh + 2, fill=C["MARK"], radius=0)
             text(d, e["UI_AXIS_VAL_X"], ry, e["UI_AXIS_VAL_W"], e["UI_AXIS_ROW_H"],
-                 "%+.2f" % val, self.num[14], ac, "right")
+                 "%+.2f" % val, self.num[12], ac, "right")
 
         # ---------------- AI 回复卡片 ----------------
         cy0 = e["UI_CARD_Y"]
@@ -528,7 +528,7 @@ class Renderer:
         text(d, e["UI_TAG_X"], cy0 + e["UI_TAG_Y"], e["UI_TAG_W"], e["UI_TAG_H"],
              "AI", self.num[14], ai_accent, "center")
 
-        body = st["reply"] if st["reply"] else "按 BOOT 键向电脑服务器的 AI 提问"
+        body = st["reply"] if st["reply"] else "单击 BOOT 提问 · 三击说话"
         _, total = reply_page(body, 0, e["UI_REPLY_COLS"])
 
         if st["pending"]:
@@ -679,7 +679,7 @@ def selfcheck(env, r: "Renderer") -> list[str]:
     probe = Image.new("RGB", (8, 8))
     pd = ImageDraw.Draw(probe)
     for st in states():
-        body = st["reply"] if st["reply"] else "按 BOOT 键向电脑服务器的 AI 提问"
+        body = st["reply"] if st["reply"] else "单击 BOOT 提问 · 三击说话"
         page, total = reply_page(body, 0, env["UI_REPLY_COLS"])
         shown = fit_text(pd, page, r.cjk[14], env["UI_REPLY_W"], max_lines=2)
         lines = shown.split("\n")

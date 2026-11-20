@@ -78,11 +78,12 @@
 | `device/main/net_config.c` | **运行期配置的唯一入口**：凭据只从配网写进的 NVS 来（不再回退 Kconfig，见下） |
 | `device/main/provisioning.c` | SoftAP + `esp_http_server` 配网页；`provisioning_page.h` 是内联的单页 HTML |
 | `device/main/prov_form.c` | 配网表单的解析与校验。**刻意零 IDF 依赖**，可用 host 侧编译器直接测 |
-| `device/main/Kconfig.projbuild` | WiFi 账号、服务器 URL、采样周期、上报周期——现在只是**出厂默认值**，优先用配网页改 |
+| `device/main/Kconfig.projbuild` | 采样/上报周期、重连次数与自检等**出厂默认值**（WiFi 与服务器地址只走配网页/NVS，不进 menuconfig） |
 | `tools/gen_font.py` | **必跑**：中文字体子集生成器（生成 git-ignored 的 `device/main/rw1_font.c`） |
 | `tools/fake_board.py` | 假开发板：不接硬件就能灌数据、调仪表盘 |
 | `tools/ui_preview.py` | 板端 240x240 界面预览渲染器：**解析 `ui.c` 里的 `UI_*` 宏**出图，没有硬件也能验证界面 |
-| `tools/verify_server.py` | 服务端回归测试（跑完自报「N/N 通过」，断言数随功能增长；含"大模型不阻塞板端"验证） || `tools/idf_build.py` | 在 Git Bash 里调用 `idf.py` 的包装器（见常见问题） |
+| `tools/verify_server.py` | 服务端回归测试（跑完自报「N/N 通过」，断言数随功能增长；含"大模型不阻塞板端"验证） |
+| `tools/idf_build.py` | 在 Git Bash 里调用 `idf.py` 的包装器（见常见问题） |
 | `tools/tools_serial_capture.py` | 非交互串口抓取（复位→打印N秒→退出，需 pyserial） |
 | `build_device.bat` / `flash_device.bat` | 干净环境编译 / 烧录+串口抓取（参数化 COM 口与秒数） |
 | LICENSE / NOTICE | MIT；第三方组件与字体授权说明 |
@@ -150,6 +151,7 @@ python server\server.py
 | `GET /api/latest` | 快照（状态 + 8s 曲线降采样 + 事件流 + 指令列表），JSON。可加 `?device=` |
 | `GET /api/stream` | SSE 实时推送（仪表盘用）。可加 `?device=`；首帧同时带 `devices` 列表 |
 | `GET /api/events` | **事件流的全量出口**（SSE 每帧只发最近 40 条，为的是省带宽）。`?device=` 选设备，`?limit=` 1–200（默认 200）；返回 `{ok, device, events, kept}`。仪表盘事件卡片右上角的「查看全部」走这个 |
+| `GET/POST /api/files*` | 文件管理：`/api/files` 列目录、`/api/files/preview`（限 256KB）、`/api/files/download`、`/api/files/upload`（限 8MB）、`/api/files/delete` |
 | `GET /api/logs` | 落盘目录与文件大小 |
 | `GET /` | 网页仪表盘 |
 
@@ -817,6 +819,25 @@ I (1456) camera: 自检 PASS —— 摄像头可用（已关闭，未占用带�
 在 `CONFIG_FATFS_LFN_NONE` 下板子**既看不见也删不掉**，只能用「格式化 SD 卡」
 （`sd_format`）整卡格式化。
 
+### 文件管理（网页）
+
+「板子管理」页底部的「文件管理」面板直接管理**服务端落盘目录**里的文件
+（截图 / 音频 / 日志三个分类，接口 `/api/files`）：
+
+- **上传**：按分类限扩展名（截图 jpg/jpeg/png、音频 wav、日志 jsonl/log/txt），
+  超限返回 413 并带 `max_bytes`；**预览**只读前 256 KB，超出在弹窗里标注「已截断」；
+  预览弹窗有「复制全文」，日志贴进工单不用手动框选。
+- **删除**：单行删除与「全选 → 删除所选」批量删除都走同一个 `/api/files/delete`
+  接口（路径校验只有服务端一份，前端不另开写口），删除不可恢复，有二次确认。
+  换分类/换设备会清空选中集，避免误删别的设备的同名文件。
+- 文件名/设备名/分类在服务端做路径夹紧与白名单校验，`../`、反斜杠、未知分类、
+  越界扩展名一律 400/415。回归覆盖在 `tools/verify_server.py` 的「文件管理」一节
+  （含空目录、Unicode/超长文件名、删不存在文件、并发删同一文件、500 条截断）。
+- **列表上限 500 条/分类**：超限时服务端只回**最近的** 500 条并带 `capped` 标志，
+  页面提示行会写明「仅显示最近 500 条」；更早的文件直接到数据目录删。
+
+注意这管的是**电脑上的落盘文件**，不是板子 SD 卡；SD 卡用上一节的「存储管理」。
+
 ### 数据落盘（第 1 周的"存储"）
 
 服务器默认把数据写到 `server/data/`，按天分文件、JSONL 追加：
@@ -896,9 +917,21 @@ set RW1_LLM_MODEL=qwen-turbo
 python server\server.py
 ```
 
+也可以复制 `.env.example` 为 `.env` 填好（`.env` 已在 `.gitignore`，密钥不入库；
+提问路径用到时自动读取，已存在的环境变量优先）。全部可配键见 `.env.example` 注释：
+`RW1_LLM_API_KEY` / `RW1_LLM_BASE_URL` / `RW1_LLM_MODEL` / `RW1_LLM_TIMEOUT`（默认 25s）/
+`RW1_LLM_BOARD_TIMEOUT`（板端提问收紧上限，默认 10s）/ `RW1_LLM_RETRIES`（默认 2）。
+
 大模型调用跑在后台线程里，HTTP 响应立刻返回，所以模型再慢也不会让板端超时。
 多个请求并发时有上限（默认 4 个在飞，`RW1_LLM_MAX_CONCURRENT` 可调），
-排太久会明说并回退本地 AI，不会全班一起干等。
+排太久会明说并回退本地 AI，不会全班一起干等。失败自动重试并给出可读中文原因
+（密钥被拒 / 限流 / 超时 / 上游服务错误 / DNS 解析失败…），任何失败都回退本地规则 AI。
+
+> **已踩过的坑（勿删 UA 请求头）**：部分上游网关（Cloudflare 前置的 new-api 等）
+> 按 User-Agent 签名封禁 Python urllib 的默认 UA，直接回 HTTP 403 `error code: 1010`，
+> 而同 key 用 curl 却正常。服务端所有出站请求（大模型 / 云端 ASR）统一携带显式
+> UA `RW1/1.1`（常量 `LLM_USER_AGENT`），把这个头删掉会立刻复现 403。
+> 排查入口：事件流里的 warn 会写明原因类别。
 
 ### 可选：访问密钥（课堂防误触）
 
