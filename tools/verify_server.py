@@ -33,6 +33,17 @@ ROOT = os.path.dirname(HERE)
 SERVER_PY = os.path.join(ROOT, "server", "server.py")
 PY = sys.executable
 
+if sys.stdout and hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+if sys.stderr and hasattr(sys.stderr, "reconfigure"):
+    try:
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 # 沙箱/本机可能有全局 http_proxy，会把 127.0.0.1 的请求也劫走
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
@@ -46,6 +57,11 @@ OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 # 它们根本不是"偶发"，是"有多少子进程被代理吃掉"的必然结果。
 CHILD_ENV = dict(os.environ)
 CHILD_ENV["no_proxy"] = CHILD_ENV["NO_PROXY"] = "127.0.0.1,localhost"
+# 门禁必须是封闭环境：仓库根目录的 .env（大模型 key）被子进程静默加载的话，
+# 前半段「没配 key → 本地规则AI」的断言会突然去打真实模型（慢、不稳定、花钱）。
+# 显式置空 = 明确"本实例无 LLM"（_load_dotenv 不覆盖已存在的键）。
+# 需要 LLM 的第 [7] 节自己在 env2 里覆盖成 sk-test。
+CHILD_ENV["RW1_LLM_API_KEY"] = ""
 for _k in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY",
            "all_proxy", "ALL_PROXY"):
     CHILD_ENV.pop(_k, None)
@@ -61,8 +77,42 @@ RESULTS = []
 
 def check(name, ok, detail=""):
     RESULTS.append((name, bool(ok), detail))
-    print("  [%s] %s%s" % ("PASS" if ok else "FAIL", name, ("  — " + detail) if detail else ""))
+    try:
+        print("  [%s] %s%s" % ("PASS" if ok else "FAIL", name, ("  — " + detail) if detail else ""))
+    except UnicodeEncodeError:
+        safe_detail = detail.encode("ascii", errors="backslashreplace").decode("ascii")
+        safe_name = name.encode("ascii", errors="backslashreplace").decode("ascii")
+        print("  [%s] %s%s" % ("PASS" if ok else "FAIL", safe_name, ("  — " + safe_detail) if detail else ""))
     return ok
+
+
+def skip(name, detail=""):
+    """观测型断言在采样被机器负载饿死时记 SKIP，而不是 FAIL。
+
+    2026-11-03 实测：多进程并行压满 CPU 时，6 秒晃动场景只采到 26 个状态
+    （目标约 60 个），「剧烈晃动」「疑似跌落」的可见窗只有零点几秒，被整段
+    错过 —— 那种 FAIL 度量的是负载，不是产品。SKIP 不占通过数也不算失败，
+    安静环境下这些断言照常以 FAIL 标准执行。
+    """
+    RESULTS.append((name, None, detail))
+    try:
+        print("  [SKIP] %s%s" % (name, ("  — " + detail) if detail else ""))
+    except UnicodeEncodeError:
+        safe_detail = detail.encode("ascii", errors="backslashreplace").decode("ascii")
+        safe_name = name.encode("ascii", errors="backslashreplace").decode("ascii")
+        print("  [SKIP] %s%s" % (safe_name, ("  — " + safe_detail) if detail else ""))
+    return False
+
+
+def sampled_enough(seen, seconds):
+    """采样率至少达到目标（100 ms 一档）的一半，否则观测型断言是在测负载。
+
+    返回 (是否够, 说明)。配合 skip() 使用：不够时观测断言记 SKIP。
+    """
+    got = len(seen)
+    need = int(seconds * 10 * 0.5)
+    return got >= need, "采样被饿死：%d 秒场景只采到 %d 个状态（低于 %d 个不计结论）" % (
+        seconds, got, need)
 
 
 def free_port():
@@ -234,8 +284,57 @@ def feed(port, scenario, seconds, ask_at=None, expect_steps=None):
         cmd += ["--ask-at", str(a)]
     if expect_steps is not None:
         cmd += ["--expect-steps", str(expect_steps)]
-    p = subprocess.run(cmd, capture_output=True, text=True, env=CHILD_ENV)
+    p = subprocess.run(cmd, capture_output=True, encoding="utf-8", errors="replace", env=CHILD_ENV)
     return p.returncode, p.stdout + p.stderr
+
+
+def feed_observe(port, scenario, seconds, device=None, with_proc=False, expect_steps=None,
+                 snaps=None):
+    """跑一段假板子场景，**边跑边采样** `activity`，返回观察到的活动词列表。
+
+    传入 `snaps=[]` 时，每个采样点的完整快照（含 shake_count 等字段）也会
+    追加进去 —— 「计数是窗口值」这类断言要读的是现象发生**期间**的值，
+    不是场景收尾那一帧（收尾幅度已衰减，读出来是 0）。
+
+    为什么不能跑完再读一次：`activity` 是"随最后一批数据变化"的瞬时字段。
+    场景结束之后再读，读到的是**收尾那一批**的分类结果 —— 晃动场景的尾部
+    幅度已经衰减，很容易被判成"运动/步行"。2026-10-30 实测：同一份代码
+    连跑三次，第三次就报了「判定为剧烈晃动 → 实际: 运动/步行(约16步)」，
+    而前两次都是绿的。根因是观测时机，不是分类器。
+
+    同一天「步行」那条也栽在同一个坑上：它跑完 14 秒只读一次快照，
+    而 1.8 Hz 步行在 0.6 秒短窗里只有约 1 个周期，零穿越率本来就在
+    1.2 Hz 判据附近抖 —— 收尾那一帧撞上边界就报「运动 (峰值 1.6g)」。
+    实测（100 ms 采样跑满 14 秒）：**20 段全是"运动/步行"，没有一次抖动**，
+    所以产品是对的，错的是"只看一眼"的观测方式。
+
+    与第 [5] 节的轮询同理：**采样率必须快于被测现象的可见时长**。这里用
+    100 ms（场景持续 6 秒 → 约 60 个采样点），抖动就不再决定结果。
+
+    `with_proc=True` 时额外返回 `(seen, returncode, output)`，给需要同时
+    校验假板子自检（`--expect-steps`）的场景用。
+    """
+    cmd = [PY, os.path.join(HERE, "fake_board.py"),
+           "--url", "http://127.0.0.1:%d" % port,
+           "--scenario", scenario, "--seconds", str(seconds), "--quiet"]
+    if expect_steps is not None:
+        cmd += ["--expect-steps", str(expect_steps)]
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                         encoding="utf-8", errors="replace", env=CHILD_ENV)
+    seen = []
+    while p.poll() is None:
+        try:
+            s = latest(port, device)
+            seen.append(s["activity"])
+            if snaps is not None:
+                snaps.append(s)
+        except (urllib.error.URLError, OSError, ValueError):
+            pass
+        time.sleep(0.1)
+    if with_proc:
+        out = p.stdout.read() if p.stdout is not None else ""
+        return seen, p.returncode, out
+    return seen
 
 
 def latest(port, device=None):
@@ -245,6 +344,27 @@ def latest(port, device=None):
     却去查另一台的事件流，报"命令事件进了事件流"失败，单独复跑又全绿）。"""
     q = "?device=" + urllib.parse.quote(device) if device else ""
     return get_json("http://127.0.0.1:%d/api/latest%s" % (port, q))
+
+
+def events_of(port, device=None):
+    """从 **SSE** 读一帧，拿该设备当前的事件流。
+
+    2026-10-12 起事件流是 SSE 的独通道：`/api/latest`（网页 10Hz 轮询）为省
+    "锁内序列化全量历史"的开销不再带 events（服务端 `snapshot(with_events=
+    False)`）。这是**有意的契约分工**（命令历史同样只走 SSE 与 /api/commands），
+    所以断言改的是**数据来源**，不是把字段加回轮询通道去迁就旧写法。
+    SSE 首帧即时（服务端先发再 sleep），读一帧即拿到当时的完整 deque（≤200 条）。
+    """
+    q = "?device=" + urllib.parse.quote(device) if device else ""
+    try:
+        with OPENER.open("http://127.0.0.1:%d/api/stream%s" % (port, q), timeout=8) as r:
+            line = r.readline().decode("utf-8", "replace")
+        if not line.startswith("data: "):
+            return []
+        return json.loads(line[6:]).get("events", [])
+    except Exception as exc:  # noqa: BLE001 —— 读失败按空处理，让断言把真相报出来
+        print("    [警告] SSE 读事件流失败: %s" % exc)
+        return []
 
 
 def main():
@@ -268,12 +388,30 @@ def main():
                             "--data-dir", data_dir, "--retain-days", "0",
                             "--cmd-timeout", "5"],
                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                           text=True, env=env, cwd=ROOT)
+                           encoding="utf-8", errors="replace", env=env, cwd=ROOT)
     mock = ThreadingHTTPServer(("127.0.0.1", llm_port), MockLLM)
     threading.Thread(target=mock.serve_forever, daemon=True).start()
 
     rc = 0
     nlboard = None          # 第 4 周的自然语言测试里才起；提前定义，finally 才能安全收尾
+    srv2 = None             # 第 25 节（访问密钥门）的第二个实例；同上
+    TOKEN = "classroom-secret-42"
+    # ⚠️ free_port() 是"bind(0) 再立刻释放"，而 **Windows 的临时端口是游标式
+    # 分配** —— 主实例刚占过一个端口，第二次极可能把同一个端口再发回来。
+    # 撞了的话第 25 节的请求全会打到主实例（没有门）上去，三个 401 断言
+    # 会集体误报成"门没生效"。所以这里重抽，并在第 25 节再加一道
+    # "新实例的设备列表必须是空的"实测判别（见下文）。
+    port2 = free_port()
+    while port2 == port:
+        port2 = free_port()
+    # ⚠️ 变量名不能叫 env2：第 21 节（假大模型）已经有一个同名 env2，
+    # 会在 try 块里把这里覆盖掉 —— 第一版就是这么踩的（srv2 拿到的是
+    # 只有 LLM 密钥的环境，令牌门"没生效"，三个 401 断言集体误报）。
+    token_env = dict(CHILD_ENV)  # 照抄 T63 的纪律：别各自 dict(os.environ)
+    token_env["RW1_API_TOKEN"] = TOKEN
+    # 顺便在这个实例上验"录音全局预算"：压到 1 段/分钟，这样第二段就必须 429。
+    # 放在这里而不是主实例，是因为主实例的语音用例本身要传好几段。
+    token_env["RW1_AUDIO_MAX_PER_MIN"] = "1"
     try:
         # 等服务器起来
         for _ in range(50):
@@ -286,11 +424,39 @@ def main():
             print("服务器没起来")
             return 1
 
+        # ---- 0. 静态自检：看护线程每天要调的方法，现在就必须存在 -------------
+        # 2026-10-25 事故：JsonlLogger 的清理方法曾叫 _purge_old，而看护线程调的
+        # 是 LOGGER.purge_old() —— 服务端连跑 24 小时后那里抛 AttributeError，
+        # **看护线程整个死掉**（设备离线判定/指令超时/日志清理全部静默停摆）。
+        # 短期回归测不到它（谁也不会把测试跑满 24 小时），所以这里用 importlib
+        # 把 server.py 当模块加载（import 只定义、不执行 main()），点名
+        # 「长期路径上要调的东西，现在就存在」——T69「工具写好了 ≠ 生效」的变体：
+        # 方法改了名，调用点未必跟上。
+        print("\n[0] 静态自检")
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("rw1_server_static", SERVER_PY)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        check("看护线程每日调用的 JsonlLogger.purge_old 存在（24h 看护死亡的静态门禁）",
+              callable(getattr(mod.JsonlLogger, "purge_old", None)),
+              "实际: %r" % getattr(mod.JsonlLogger, "purge_old", None))
+
         # ---- 1. 静置 ----------------------------------------------------
         print("\n[1] 静置")
         feed(port, "idle", 6)
         act = latest(port)["activity"]
         check("静置·水平", act == "静置·水平", "实际: %s" % act)
+
+        # ---- 1b. 遥测响应里的服务端自报耗时 -------------------------------
+        # `tools/load_classroom.py` 靠它把"服务端慢"和"测试进程自己排队"分开。
+        # 少了这个字段，压测只能量客户端往返，而 20 块假板子是同一进程里的线程、
+        # 抢同一把 GIL —— 那个数会把服务端的问题放大十倍（2026-11-01 实测
+        # 往返 p50=400ms，服务端处理其实只有个位数毫秒）。
+        out_ms = post_raw("http://127.0.0.1:%d/api/telemetry" % port,
+                          firmware_body([(0.0, 0.0, 1.0)] * 50))
+        check("遥测响应带服务端自报耗时 ms",
+              isinstance(out_ms.get("ms"), int) and 0 <= out_ms["ms"] <= 5000,
+              "实际: %r" % (out_ms.get("ms"),))
 
         # ---- 2. 倾斜方向（屏幕坐标系）------------------------------------
         print("\n[2] 向右倾斜")
@@ -300,19 +466,44 @@ def main():
 
         # ---- 3. 计步（修复前物理上做不到）--------------------------------
         print("\n[3] 步行 1.8Hz / 14 秒")
-        rc2, out = feed(port, "walk", 14, expect_steps=8)
+        # 边跑边采，别只看收尾那一帧（见 feed_observe 的注释：1.8 Hz 步行在
+        # 0.6 秒短窗里只有约 1 个周期，零穿越率本来就在判据附近抖）。
+        seen_walk, rc2, out = feed_observe(port, "walk", 14, with_proc=True,
+                                           expect_steps=8)
         snap = latest(port)
-        check("检测到步行而非晃动", "步行" in snap["activity"], "实际: %s" % snap["activity"])
+        enough, why = sampled_enough(seen_walk, 14)
+        if enough:
+            check("检测到步行而非晃动", any("步行" in a for a in seen_walk),
+                  "采到 %d 个状态，出现过: %s"
+                  % (len(seen_walk), sorted({a for a in seen_walk if a})))
+        else:
+            skip("检测到步行而非晃动", why)
         check("窗口内步数 >= 8", snap["step_count"] >= 8, "实际: %d" % snap["step_count"])
-        check("fake_board 自检通过", rc2 == 0)
+        _tail = (out or "").strip().splitlines()
+        check("fake_board 自检通过", rc2 == 0,
+              "rc=%d%s" % (rc2, ("  |  " + _tail[-1]) if _tail else ""))
 
         # ---- 4. 晃动 ----------------------------------------------------
         print("\n[4] 晃动 5Hz / 6 秒")
-        feed(port, "shake", 6)
-        snap = latest(port)
-        check("判定为剧烈晃动", snap["activity"] == "剧烈晃动", "实际: %s" % snap["activity"])
-        check("晃动计数为窗口内计数（非累计）", 0 < snap["shake_count"] <= 20,
-              "实际: %d" % snap["shake_count"])
+        # 边跑边采（见 feed_observe 的注释）：只看"这 6 秒里出现过剧烈晃动"，
+        # 不看"收尾那一瞬间是什么" —— 后者由最后一批数据的相位决定，是抛硬币。
+        snaps4 = []
+        seen_shake = feed_observe(port, "shake", 6, snaps=snaps4)
+        enough, why = sampled_enough(seen_shake, 6)
+        if enough:
+            check("判定为剧烈晃动", "剧烈晃动" in seen_shake,
+                  "采到 %d 个状态，出现过: %s"
+                  % (len(seen_shake), sorted(set(seen_shake))))
+        else:
+            skip("判定为剧烈晃动", why)
+        # 计数同样要读**现象期间**的值：场景收尾幅度衰减，结束后再读 snapshot
+        # 已经是最后一帧的 0（2026-11-03 高负载下实测复现）。
+        peak_shake = max((s.get("shake_count", 0) for s in snaps4), default=0)
+        if snaps4:
+            check("晃动计数为窗口内计数（非累计）", 0 < peak_shake <= 20,
+                  "采样期峰值: %d" % peak_shake)
+        else:
+            skip("晃动计数为窗口内计数（非累计）", "一个快照都没采到")
 
         # ---- 5. 跌落（250ms 失重）---------------------------------------
         print("\n[5] 跌落（第 6 秒 250ms 失重）")
@@ -326,9 +517,19 @@ def main():
                 seen.append(latest(port)["activity"])
             except (urllib.error.URLError, OSError, ValueError):
                 pass
-            time.sleep(0.3)
-        check("检测到疑似跌落", any("跌落" in a for a in seen),
-              "采到 %d 个状态" % len(seen))
+            # ⚠️ 轮询必须**快于被测现象的可见时长**，否则这条断言本身就成了抛硬币。
+            # 「疑似跌落」只在上报周期内可见（约 0.35~0.5 s：失重 250 ms + 下一批
+            # 覆盖它之前的间隔）。原来这里 sleep(0.3)，加上请求本身约 0.1 s 的往返，
+            # 实际采样间隔 ≈ 0.4 s，正好比可见窗长 —— 2026-10-30 实测同一天里
+            # 连跑三次挂了一次，而用 50 ms 间隔复测时"跌落"命中 7 次（检测没问题）。
+            # 所以这里改 0.1 s：抓住现象，而不是降低断言标准。
+            time.sleep(0.1)
+        enough, why = sampled_enough(seen, 9)
+        if enough:
+            check("检测到疑似跌落", any("跌落" in a for a in seen),
+                  "采到 %d 个状态" % len(seen))
+        else:
+            skip("检测到疑似跌落", why)
 
         # ---- 6. 持久化 ---------------------------------------------------
         print("\n[6] JSONL 落盘")
@@ -345,9 +546,24 @@ def main():
             check("遥测行数 >= 50", len(lines) >= 50, "实际 %d 行" % len(lines))
         if evt:
             kinds = set()
+            ev_kinds = []
             for ln in open(os.path.join(data_dir, evt[0]), encoding="utf-8"):
-                kinds.add(json.loads(ln).get("k"))
+                rec = json.loads(ln)
+                kinds.add(rec.get("k"))
+                ev_kinds.append(rec.get("kind"))
             check("事件文件里只有事件记录", kinds == {"e"}, "实际: %s" % kinds)
+            # 跌落的**确定性判据**：事件是 append-only 的，不像 activity 字段
+            # 只在那 0.5 秒里可见。上一节按 0.1s 轮询抓瞬时状态（验证的是板端
+            # 屏幕会看到什么），这里再钉一次"事件真的落了盘" —— 两者互补：
+            # 前者管"看得见"，后者管"留得住"，且不受机器忙闲影响。
+            # （2026-10-30 采纳协作者的复核意见：轮询瞬时状态本质是碰运气。）
+            deadline = time.time() + 2.0
+            while "fall" not in ev_kinds and time.time() < deadline:
+                time.sleep(0.1)
+                ev_kinds = [json.loads(ln).get("kind")
+                            for ln in open(os.path.join(data_dir, evt[0]), encoding="utf-8")]
+            check("跌落事件已落盘（确定性判据，不依赖轮询时机）",
+                  "fall" in ev_kinds, "实际事件类型: %s" % sorted(set(ev_kinds)))
 
         # ---- 7. 大模型不阻塞板端（P0 修复的核心）-------------------------
         print("\n[7] 慢速大模型（%d 秒）不阻塞板端" % MockLLM.delay)
@@ -454,10 +670,28 @@ def main():
         check("ask 帧方向判定正确", out5.get("activity") == "静置·向右倾斜",
               "实际: %s" % out5.get("activity"))
 
-        raw_neg = firmware_body([(-0.012, 0.998, 0.031)] * 50)
-        out6 = post_raw("http://127.0.0.1:%d/api/telemetry" % port, raw_neg)
+        # 与 ask 帧同一原因：倾斜分类只看**最后 1 秒**的样本（analysis.py 的
+        # tail），单发一批时结论由上一节残留样本决定 —— 机器一忙，残留样本
+        # 超出 1 秒被剔除，「右」就翻成「下」（2026-11-03 高负载实测复现）。
+        # 所以先把最后 1 秒灌满待测向量。向量选 x 为负：负号被解析丢掉的话
+        # 方向从「左」翻成「右」，这条断言才真正咬住「负值解析」；
+        # 0.031 / 0.66 顺带覆盖三位小数。
+        #
+        # 但高负载下还有第二条路会把它害死：如果上一节的 ask 帧把 dt_trusted
+        # 撑大（例如 0.05s），串行 4 批到达间隔 < 2.5s 时 dt_est > DT_TRUST_MAX，
+        # 服务端会沿用被污染的 dt，把 50 个负值样本摊到 2.5 秒上。4 批共 10 秒，
+        # 最后 1 秒窗口里只剩约 20 个负值，前面 30 个还是右倾样本，均值一混就
+        # 变成「水平」。所以：
+        #   1. 换专用设备名，彻底摆脱前文对 dt_trusted 的污染；
+        #   2. 每批之间 sleep 0.6s（> DT_TRUST_MAX×50=2.5s 的 1/4，但足够让
+        #      服务端把两批当成“新的一秒”），确保最后 1 秒窗口被负值灌满。
+        neg_dev = "负值-01"
+        for _ in range(4):
+            out6 = post_raw("http://127.0.0.1:%d/api/telemetry" % port,
+                            firmware_body([(-0.7, 0.031, 0.66)] * 50, device=neg_dev))
+            time.sleep(0.6)
         check("负值/三位小数解析正确",
-              out6.get("ok") is True and "右" in out6.get("activity", ""),
+              out6.get("ok") is True and out6.get("activity") == "静置·向左倾斜",
               "实际: %s" % out6.get("activity"))
 
         raw_src = firmware_body([(0.0, 0.0, 1.0)] * 50, source="QMA7981")
@@ -469,6 +703,44 @@ def main():
         print("\n[12] 远程指令 capture_once 往返")
         check("非法指令名被拒绝", _expect_400(
             "http://127.0.0.1:%d/api/command" % port, {"name": "rm -rf /"}))
+
+        # 坏 body 必须被拒成**可读的 400**（2026-11-02 修复）。修复前的实测：
+        #   - 非 JSON 垃圾 → `_read_json` 返回 {} → `_command` 兜出默认
+        #     capture_once，**真的下发了一条命令**（HTTP 200 + request_id）；
+        #   - JSON 数组 → `list.get` AttributeError → 500 + traceback + 断连；
+        #   - Content-Length 不是数字 → `int()` ValueError，同样是断连。
+        try:
+            post_bytes("http://127.0.0.1:%d/api/command" % port, b"this is not json")
+            ok_g, detail_g = False, "竟然接受了"
+        except urllib.error.HTTPError as e:
+            ok_g, detail_g = e.code == 400, "HTTP %d" % e.code
+        except Exception as e:  # noqa: BLE001
+            ok_g, detail_g = False, "%s: %s" % (type(e).__name__, e)
+        check("非 JSON 的命令 body 被拒（不当默认命令下发）", ok_g, detail_g)
+
+        try:
+            post_raw("http://127.0.0.1:%d/api/command" % port, "[1,2,3]")
+            ok_a, detail_a = False, "竟然接受了"
+        except urllib.error.HTTPError as e:
+            ok_a, detail_a = e.code == 400, "HTTP %d" % e.code
+        except Exception as e:  # noqa: BLE001
+            ok_a, detail_a = False, "%s: %s" % (type(e).__name__, e)
+        check("JSON 数组（不是对象）的命令 body 被拒", ok_a, detail_a)
+
+        # 非法 Content-Length：urllib 发不出这种请求，只能裸 socket。
+        # 期望拿到一行可读的 400，而不是"连接被服务端掐断"（recv 空 / RST）。
+        head, detail_cl = b"", ""
+        try:
+            _s = socket.create_connection(("127.0.0.1", port), timeout=5)
+            _s.sendall(b"POST /api/command HTTP/1.1\r\nHost: t\r\n"
+                       b"Content-Length: abc\r\nConnection: close\r\n\r\n")
+            head = _s.recv(4096)
+            _s.close()
+        except OSError as e:
+            detail_cl = "%s: %s" % (type(e).__name__, e)
+        check("非法 Content-Length 得到可读的 400（不是断连）",
+              head.startswith(b"HTTP/1.1 400"),
+              detail_cl or head.split(b"\r\n", 1)[0].decode("latin-1", "replace"))
 
         r12_dev = "往返-01"        # 固定设备名：不再依赖"最近上报的那台"（见 _wait_cmd 注释）
         board = subprocess.Popen(
@@ -522,7 +794,7 @@ def main():
             check("回传里带着同一个 request_id", False, "没有 result")
         check("命令事件进了事件流",
               any("capture_once" in (e.get("text") or "")
-                  for e in latest(port, r12_dev).get("events", [])))
+                  for e in events_of(port, r12_dev)))
 
         # ---- 13. 指令超时看护 ---------------------------------------------
         print("\n[13] 指令超时（板子故意不执行）")
@@ -538,6 +810,12 @@ def main():
             if r13_dev in live:
                 break
             time.sleep(0.25)
+        else:
+            # 没有这个 else 的话，板子没起来时这里会**静默通过**，
+            # 失败拖到后面变成"命令没走到 timeout — 实际: None"这种看不懂的报错。
+            # 一个明确的"板子没上报"比五条莫名其妙的断言有用得多（手册 T59）。
+            check("测试用的板子已上报（%s 在册）" % r13_dev, False,
+                  "实际在册: %s" % live)
         r2 = post_json("http://127.0.0.1:%d/api/command" % port,
                        {"name": "capture_once", "device": r13_dev})
         cid2 = r2.get("id")
@@ -561,7 +839,7 @@ def main():
         deaf.wait(timeout=25)
         check("板子不执行时被判超时", st2 == "timeout", "实际: %s" % st2)
         check("超时事件进了事件流",
-              any("超时" in (e.get("text") or "") for e in latest(port).get("events", [])))
+              any("超时" in (e.get("text") or "") for e in events_of(port)))
 
         # ---- 15. 远端物理反馈指令（第 3 周）--------------------------------
         print("\n[14] 物理反馈指令 led_blink / led_set")
@@ -577,6 +855,9 @@ def main():
             if r14_dev in live:
                 break
             time.sleep(0.25)
+        else:
+            check("测试用的板子已上报（%s 在册）" % r14_dev, False,
+                  "实际在册: %s" % live)
 
         r3 = post_json("http://127.0.0.1:%d/api/command" % port,
                        {"name": "led_blink", "params": {"n": 3, "on_ms": 80, "off_ms": 80},
@@ -646,7 +927,7 @@ def main():
                   "实际: %s" % auto[0].get("params"))
         check("自动告警进了事件流",
               any("跌落" in (e.get("text") or "") and "LED 告警" in (e.get("text") or "")
-                  for e in latest(port).get("events", [])))
+                  for e in events_of(port)))
 
         # ---- 17. 命令历史有上限（放最后，因为它会堆一队列指令）--------------
         print("\n[16] 命令历史不无限增长")
@@ -706,6 +987,16 @@ def main():
         check("非 JPEG 的帧被拒（400）", st == 400, "实际: %s" % st)
         st, _ = cam_get("/api/shots/" + camdev + "/..%2F..%2Fserver.py")
         check("照片路径穿越被拒（404）", st == 404, "实际: %s" % st)
+        # 文件名里的冒号也要拒（2026-11-02 补）：Windows 上它是 NTFS 备用数据流的
+        # 分隔符。读取那条原本也会 404（文件不存在），但**走的是校验之后**的
+        # isfile；删除那条修复前是 404（os.remove 报错），现在必须在**校验层**
+        # 就拦成 400 —— 白名单就该在门口拦，不该靠"碰巧没有这个文件"。
+        st, _ = cam_get("/api/shots/%s/x.jpg:evil" % camdev)
+        check("照片名带冒号被拒（404，NTFS 数据流不可达）", st == 404, "实际: %s" % st)
+        st, _ = cam_post("/api/shots/delete",
+                         json.dumps({"device": camdev, "name": "x.jpg:evil"}).encode(),
+                         "application/json")
+        check("删除接口在校验层拒绝带冒号的文件名（400）", st == 400, "实际: %s" % st)
 
         # 删除
         if shots.get("shots"):
@@ -717,6 +1008,29 @@ def main():
             left = get_json("http://127.0.0.1:%d/api/shots?device=%s" % (port, camdev))
             check("删完列表里没有了", len(left.get("shots", [])) == len(shots["shots"]) - 1,
                   "实际: %d 张" % len(left.get("shots", [])))
+
+        # 缺省 device 的回退：网页单板场景 selDevice 是空的，/api/shots 不带 device
+        # 就必须回退到"最近上报的那台"（原来落到兜底名 "-"，于是去翻一个永远不存在
+        # 的目录，列表恒为空 —— 照片明明存下来了却一张也不显示）。
+        # 这里用**当前最近上报的那台**留档一张再查，不依赖 cam-01 在不在册
+        # （它只推帧、从不上报遥测，恰恰是"指名查不许被回退"那一面的例子）。
+        who = get_json("http://127.0.0.1:%d/api/latest" % port).get("device") or ""
+        st, body = cam_post("/api/frame?device=" + urllib.parse.quote(who) + "&save=1", frame2)
+        saved2 = json.loads(body.decode()).get("saved") if st == 200 else None
+        fb = get_json("http://127.0.0.1:%d/api/shots" % port).get("shots") or []
+        check("/api/shots 不带 device 会回退到最近上报的那台（照片列得出来）",
+              bool(who) and bool(saved2)
+              and any(s.get("name") == saved2 and s.get("device") == who for s in fb),
+              "最近上报=%s / 留档=%s / 缺省列表=%s"
+              % (who, saved2, [(s.get("device"), s.get("name")) for s in fb][:3]))
+        if saved2:
+            st_del, _ = cam_post("/api/shots/delete",
+                                 json.dumps({"name": saved2}).encode(),
+                                 "application/json")
+            fb_after = get_json("http://127.0.0.1:%d/api/shots" % port).get("shots") or []
+            check("/api/shots/delete 不带 device 也能删最近设备照片",
+                  st_del == 200 and not any(s.get("name") == saved2 for s in fb_after),
+                  "HTTP %d" % st_del)
 
         # ---- 18. 多设备（PROPOSAL §4.1 / 优先级 ③）---------------------------
         # 这一节必须放在最后：它往服务端注册了新设备，会改变"最近上报过的设备"
@@ -1003,11 +1317,16 @@ def main():
             [PY, os.path.join(HERE, "fake_board.py"),
              "--url", nbase, "--device", nl_dev, "--scenario", "idle",
              "--period", "0.25", "--seconds", "60", "--quiet"],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=CHILD_ENV)
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            encoding="utf-8", errors="replace", env=CHILD_ENV)
         for _ in range(BOARD_WAIT_STEPS):
-            if nl_dev in [d["id"] for d in get_json(nbase + "/api/devices").get("devices", [])]:
+            live = [d["id"] for d in get_json(nbase + "/api/devices").get("devices", [])]
+            if nl_dev in live:
                 break
             time.sleep(0.25)
+        else:
+            check("测试用的板子已上报（%s 在册）" % nl_dev, False,
+                  "实际在册: %s" % live)
 
         def ask_nl(text):
             """把一句话当成"板端提问"发上去 —— 板端就是这么发的（ask=1 + q=文字）。"""
@@ -1107,7 +1426,7 @@ def main():
               "实际: %s / %r" % (done_nl and done_nl["state"], snap_nl.get("ai_reply")))
         check("自然语言请求进了事件流（说了什么 → 什么指令）",
               any("自然语言请求" in (e.get("text") or "")
-                  for e in snap_nl.get("events", [])))
+                  for e in events_of(port, nl_dev)))
 
         # 新指令必须**作废**还在后台跑的那次生成 —— 否则几秒后旧回答会盖掉指令回显，
         # 用户看到的是"刚才那个问题的答案"，而他明明已经改口了。
@@ -1153,9 +1472,13 @@ def main():
              "--period", "0.25", "--seconds", "60", "--no-cmd", "--quiet"],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=CHILD_ENV)
         for _ in range(BOARD_WAIT_STEPS):
-            if slow_dev in [d["id"] for d in get_json(nbase + "/api/devices").get("devices", [])]:
+            live = [d["id"] for d in get_json(nbase + "/api/devices").get("devices", [])]
+            if slow_dev in live:
                 break
             time.sleep(0.25)
+        else:
+            check("测试用的板子已上报（%s 在册）" % slow_dev, False,
+                  "实际在册: %s" % live)
 
         def ask_on(dev_id, text):
             return post_raw(nbase + "/api/telemetry",
@@ -1196,8 +1519,8 @@ def main():
               reply_late == "已停止", "实际: %r" % reply_late)
         check("丢弃这件事在事件流里留了痕（不是静默吞掉）",
               any("来晚了" in (e.get("text") or "")
-                  for e in latest(port, slow_dev).get("events", [])),
-              "实际: %s" % [e.get("text") for e in latest(port, slow_dev).get("events", [])[:3]])
+                  for e in events_of(port, slow_dev)),
+              "实际: %s" % [e.get("text") for e in events_of(port, slow_dev)[:3]])
         try:
             slowboard.kill()
             slowboard.wait(timeout=5)
@@ -1232,8 +1555,489 @@ def main():
         except Exception:  # noqa: BLE001
             pass
 
+        # ---- 25. 访问密钥门（#51 遗留项二，2026-10-12）---------------------
+        # 威胁模型：教室里任何连上同一 WiFi 的人。破坏性动作（sd_format）与
+        # 花钱的动作（问大模型）**只能从网页来** —— 板子只会上报遥测/帧/音频，
+        # 命令永远是服务端下发下去的。所以门网页写入口**不需要动固件**：
+        # 这里起第二个实例（RW1_API_TOKEN 已设）逐条验，主实例（无密钥）
+        # 的 128 条断言同时就是"默认关闭、行为不变"的证据。
+        print("\n[25] 访问密钥门（配了 RW1_API_TOKEN 的第二个实例）")
+        srv2 = subprocess.Popen([PY, "-u", SERVER_PY, "--port", str(port2),
+                                 "--data-dir", data_dir + "2", "--retain-days", "0"],
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                encoding="utf-8", errors="replace", env=token_env, cwd=ROOT)
+        up = False
+        for _ in range(50):
+            try:
+                get_json("http://127.0.0.1:%d/api/latest" % port2, timeout=1)
+                up = True
+                break
+            except (urllib.error.URLError, OSError):
+                time.sleep(0.2)
+        # ⚠️ check() 的第三个参数在 PASS 时也会打印，所以别把"失败提示语"
+        # 写在那里 —— 否则日志里一片 [PASS] 跟着"起不来（看日志）"，
+        # 下一个值班的会被自己人吓到（2026-10-14 实测踩到过）。
+        # 成功/失败各有各的真实观察值。
+        check("带密钥的服务端起得来", up,
+              ("实际: 端口 %d 应答正常" % port2) if up
+              else "实际: %d 端口 %d 次探测都没应答，起不来（ srv2 日志见 --keep 保留的临时目录）" % (port2, 50))
+
+        # 判别"这真的是一个新进程"：全新实例没有任何板子上报过，
+        # 设备列表必然为空；若端口和主实例撞了，这里会看到主实例的一堆设备。
+        # 没有这道判别，端口相撞会让下面三个 401 断言集体误报。
+        fresh = False
+        if up:
+            try:
+                fresh = not get_json("http://127.0.0.1:%d/api/devices" % port2,
+                                     timeout=3).get("devices")
+            except (urllib.error.URLError, OSError):
+                fresh = False
+        check("第二个实例是全新进程（端口没和主实例撞上）", fresh,
+              ("实际: 端口 %d 上是全新实例，设备列表为空" % port2) if fresh
+              else "实际: %d 端口上应答的服务端带着历史设备，端口撞了" % port2)
+
+        def post_tok(path, payload, token=None, use_query=False):
+            url = "http://127.0.0.1:%d%s" % (port2, path)
+            if token and use_query:
+                url += ("&" if "?" in url else "?") + "token=" + urllib.parse.quote(token)
+            req = urllib.request.Request(
+                url, data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json",
+                         # use_query 时**只**走查询参数，不发头 ——
+                         # 否则头先通过，就证明不了查询参数这条路是通的
+                         "X-RW1-Token": ("" if use_query else (token or ""))})
+            try:
+                with OPENER.open(req, timeout=6) as r:
+                    return r.status, json.loads(r.read().decode("utf-8"))
+            except urllib.error.HTTPError as e:
+                raw = e.read().decode("utf-8", "replace")
+                try:
+                    return e.code, json.loads(raw)
+                except ValueError:
+                    return e.code, {"raw": raw[:120]}
+
+        # 只有在"确实是带密钥的新实例"时，下面的 401 断言才有意义
+        if up and fresh:
+            st, body = post_tok("/api/command", {"name": "capture_once"})
+            check("没带密钥 → 401", st == 401, "实际: %s %s" % (st, body))
+            st, body = post_tok("/api/command", {"name": "capture_once"}, "wrong-key")
+            check("带错密钥 → 401", st == 401, "实际: %s" % st)
+            st, body = post_tok("/api/command", {"name": "capture_once"}, TOKEN)
+            check("带对密钥 → 正常下发", st == 200 and body.get("ok"),
+                  "实际: %s %s" % (st, body))
+            st, body = post_tok("/api/command", {"name": "capture_once"}, TOKEN,
+                                use_query=True)
+            check("?token= 查询参数同样认（给不方便加头的客户端）",
+                  st == 200 and body.get("ok"), "实际: %s" % st)
+            st, body = post_tok("/api/ask", {"text": "你好"})
+            check("提问入口同样要密钥（花钱的动作）", st == 401, "实际: %s" % st)
+            # 板子上报**不要**密钥：老固件没有密钥可带，门了就是把全班挡在门外
+            try:
+                with OPENER.open(urllib.request.Request(
+                        "http://127.0.0.1:%d/api/telemetry" % port2,
+                        data=firmware_body([(0.0, 0.0, 1.0)] * 20,
+                                           device="tok-01").encode("utf-8"),
+                        headers={"Content-Type": "application/json"}), timeout=8) as r:
+                    tcode = r.status
+            except urllib.error.HTTPError as e:
+                tcode = e.code
+            check("板子上报不带密钥也收（后向兼容）", tcode == 200,
+                  "实际: HTTP %s" % tcode)
+        # 主实例（没配密钥）：行为必须与以前逐字节一样
+        mbody = post_json("http://127.0.0.1:%d/api/command" % port,
+                          {"name": "capture_once"})
+        check("没配密钥的实例完全不设防（与历史行为一致）",
+              mbody.get("ok") is True, "实际: %s" % mbody)
+
+        # 录音全局预算（这个实例被压到 1 段/分钟）：
+        # 每设备 1.5s 冷却挡不住"换设备名"，所以用**另一个设备名**再发一段 ——
+        # 必须被全局预算拦下，否则"换个名字就能继续烧 ASR/LLM 费用"。
+        a1 = post_bytes("http://127.0.0.1:%d/api/audio?device=budget-a" % port2,
+                        b"\x01\x02" * 800)
+        try:
+            post_bytes("http://127.0.0.1:%d/api/audio?device=budget-b" % port2,
+                       b"\x01\x02" * 800)
+            budget_code = 200
+        except urllib.error.HTTPError as e:
+            budget_code = e.code
+        check("录音全局预算生效（换设备名也绕不过去）",
+              a1.get("ok") is True and budget_code == 429,
+              "实际: first=%s second=%s" % (a1.get("ok"), budget_code))
+
+        # ---- 26. 外部数据健壮性（2026-10-30 加固）-------------------------
+        # 几条都是"一条外部输入把服务端打出一个异常"的路径。它们都不可能来自
+        # 本仓库的固件（固件有 sanitize3、有 clamp），但教室里任何一台机器都能发。
+        #
+        # 修之前的表现（实测）：`{"batch":[[NaN,NaN,NaN]]}` → analyze 里
+        # `int(nan)` 抛 ValueError，而且抛在 _send() **之前** → 客户端收到的是
+        # "连接被掐断"而不是 500；NaN 留在窗口里，接下来 8 秒内每一帧正常数据
+        # 都会在同一个 int(nan) 上再抛一次；/api/latest 再把 NaN 序列化出去，
+        # 浏览器 JSON.parse 抛错 → 整页停在旧数据上。
+        print("\n[26] 畸形载荷不再打穿数据流（2026-10-30 加固）")
+        pdev = "rob-01"
+        tbase = "http://127.0.0.1:%d/api/telemetry?device=%s" % (
+            port, urllib.parse.quote(pdev))
+
+        def _reject_json_const(name):
+            raise ValueError("非法 JSON 常量: %s" % name)
+
+        nan_body = post_raw(
+            tbase,
+            '{"device":"%s","batch":[[NaN,NaN,NaN],[0,0,1],[0,0,1]]}' % pdev)
+        check("含 NaN 的批次仍被接受（坏点丢弃、好点照常分析）",
+              nan_body.get("ok") is True, "实际: %s" % nan_body)
+
+        raw_latest = OPENER.open(
+            "http://127.0.0.1:%d/api/latest?device=%s" % (port, pdev),
+            timeout=6).read().decode("utf-8")
+        try:
+            json.loads(raw_latest, parse_constant=_reject_json_const)
+            strict_ok = True
+        except ValueError as exc:
+            strict_ok = False
+            print("   严格 JSON 解析失败: %s" % exc)
+        check("快照里不再出现 NaN/Infinity（浏览器 JSON.parse 能过）", strict_ok)
+
+        check("整批都是 NaN 时被拒（一条可用样本都没有 → 400）",
+              _expect_400(tbase, {"device": pdev,
+                                  "batch": [[float("nan")] * 3]}))
+
+        inf_cmd = post_json("http://127.0.0.1:%d/api/command" % port,
+                            {"name": "led_blink", "device": pdev,
+                             "params": {"n": "inf"}})
+        check("params 里的 \"inf\" 不再打出 500（回退默认值）",
+              inf_cmd.get("ok") is True, "实际: %s" % inf_cmd)
+
+        post_json("http://127.0.0.1:%d/api/command" % port,
+                  {"name": "set_config", "device": pdev, "params": {"period_ms": 50}})
+        cmds_out = get_json("http://127.0.0.1:%d/api/commands?device=%s"
+                            % (port, urllib.parse.quote(pdev)))
+        per_sent = ((cmds_out.get("commands") or [{}])[0].get("params") or {}).get("period_ms")
+        check("上报周期下界被夹到 100ms（50ms=20Hz 会打爆连接数）",
+              per_sent == 100, "实际: %s" % per_sent)
+
+        # 照片响应不能同时带 no-store 和 max-age（实测过：浏览器按最严的来，
+        # 于是永远不缓存，每翻一次列表重下一遍）
+        jpeg = b"\xff\xd8" + b"\x00" * 64 + b"\xff\xd9"
+        OPENER.open(urllib.request.Request(
+            "http://127.0.0.1:%d/api/frame?device=%s&save=1"
+            % (port, urllib.parse.quote(pdev)),
+            data=jpeg, headers={"Content-Type": "image/jpeg"}), timeout=10).read()
+        shots = (get_json("http://127.0.0.1:%d/api/shots?device=%s"
+                          % (port, urllib.parse.quote(pdev))).get("shots") or [])
+        if shots:
+            with OPENER.open("http://127.0.0.1:%d/api/shots/%s/%s"
+                             % (port, urllib.parse.quote(pdev), shots[0]["name"]),
+                             timeout=10) as rr:
+                cc = rr.headers.get_all("Cache-Control") or []
+            check("照片响应只有一个 Cache-Control（no-store 与 max-age 不再打架）",
+                  len(cc) == 1, "实际: %s" % cc)
+        else:
+            check("照片接口可用（save=1 之后能在列表里查到）", False, "列表为空")
+
+        # ---- 27. 跨站写请求与花钱接口的限流（2026-10-30）-------------------
+        # CORS 只挡"读响应"，挡不住"请求被执行"。没有这道检查时，老师/同学
+        # 浏览任意网页，那个网页一条 fetch 就能下发 sd_format（格掉学生的卡）。
+        print("\n[27] 跨站写请求被挡 · 花钱接口有冷却（2026-10-30）")
+
+        def _cmd_with(headers, payload):
+            h = {"Content-Type": "application/json"}
+            h.update(headers)
+            req = urllib.request.Request(
+                "http://127.0.0.1:%d/api/command" % port,
+                data=json.dumps(payload).encode("utf-8"), headers=h)
+            try:
+                with OPENER.open(req, timeout=8) as r:
+                    return r.status
+            except urllib.error.HTTPError as e:
+                return e.code
+
+        check("别的网站发来的写请求被拒（403）",
+              _cmd_with({"Origin": "http://evil.example"}, {"name": "capture_once"}) == 403)
+        check("同源写请求照常放行（Origin == Host）",
+              _cmd_with({"Origin": "http://127.0.0.1:%d" % port},
+                        {"name": "capture_once"}) == 200)
+        check("不带 Origin 的脚本调用照常放行（curl / 板端）",
+              _cmd_with({}, {"name": "capture_once"}) == 200)
+
+        adev = "rob-audio"
+        aurl = "http://127.0.0.1:%d/api/audio?device=%s" % (
+            port, urllib.parse.quote(adev))
+        first_ok = post_bytes(aurl, b"\x01\x02" * 800).get("ok") is True
+        try:
+            post_bytes(aurl, b"\x01\x02" * 800)
+            second_code = 200
+        except urllib.error.HTTPError as e:
+            second_code = e.code
+        check("同一台板 1.5 秒内第二次录音被限流（429）",
+              first_ok and second_code == 429, "实际: first=%s second=%s"
+              % (first_ok, second_code))
+
+        # ---- 28. SSE 瘦身后的两个出口（2026-10-30）-------------------------
+        # SSE 每帧只发"前端真会画出来的那些"（40 条事件 / 8 条命令），
+        # 单页面带宽从 228 KB/s 降到约 59 KB/s。历史要全量就得有另一个出口，
+        # 这条断言钉住它存在、且 limit 真的生效。
+        print("\n[28] 事件历史出口（SSE 瘦身后的全量通道）")
+        ev_all = get_json("http://127.0.0.1:%d/api/events?device=%s"
+                          % (port, urllib.parse.quote(pdev)))
+        check("/api/events 可按设备取事件",
+              ev_all.get("device") == pdev and isinstance(ev_all.get("events"), list),
+              "实际: device=%s, n=%s" % (ev_all.get("device"),
+                                         len(ev_all.get("events") or [])))
+        ev_1 = get_json("http://127.0.0.1:%d/api/events?device=%s&limit=1"
+                        % (port, urllib.parse.quote(pdev)))
+        check("/api/events 的 limit 生效（只要 1 条）",
+              len(ev_1.get("events") or []) <= 1, "实际: %d 条"
+              % len(ev_1.get("events") or []))
+
+        # ---- 29. 写接口不许"猜"目标设备（2026-10-30）-----------------------
+        # 把设备名拼错一个字，原来会退回到"最近上报过的那台" —— 于是 sd_format
+        # 发给了另一块板，页面上还显示"已下发"。读写语义必须分开：读接口容错，
+        # 写接口一字不差。
+        print("\n[29] 写指令给不存在的设备名 → 拒绝，且一条都不发")
+
+        def _cmd_count(dev_id):
+            got = get_json("http://127.0.0.1:%d/api/commands?device=%s"
+                           % (port, urllib.parse.quote(dev_id)))
+            return len(got.get("commands") or [])
+
+        before_n = _cmd_count(pdev)
+        try:
+            post_json("http://127.0.0.1:%d/api/command" % port,
+                      {"name": "sd_format", "device": "rob-0l"})   # 故意拼错
+            typo_code = 200
+        except urllib.error.HTTPError as e:
+            typo_code = e.code
+        check("拼错的设备名 → 404（不再静默发给另一块板）", typo_code == 404,
+              "实际: HTTP %s" % typo_code)
+        check("被拒之后一条命令都没建（全有或全无）",
+              _cmd_count(pdev) == before_n,
+              "实际: %d → %d" % (before_n, _cmd_count(pdev)))
+        # 不带 device 的老调用方仍要能下发（单板场景的兼容路径）
+        legacy = post_json("http://127.0.0.1:%d/api/command" % port,
+                           {"name": "capture_once"})
+        check("不带 device 的老调用仍能下发（兼容单板场景）",
+              legacy.get("ok") is True, "实际: %s" % legacy)
+
+        # ---- 30. 仪表盘页面从文件服务（2026-10-30 拆包后的路由）------------
+        # 单元测试钉的是 dashboard_html() 这个函数；这里钉的是**路由**：
+        # `/` 必须真的返回 text/html 且是那份页面（拆包时最容易漏的就是这一步）。
+        print("\n[30] 页面路由（拆包后仍然服务同一个页面）")
+        with OPENER.open("http://127.0.0.1:%d/" % port, timeout=8) as r:
+            page = r.read().decode("utf-8", "replace")
+            ctype = r.headers.get("Content-Type", "")
+        check("/ 返回 text/html", "text/html" in ctype, "实际: %s" % ctype)
+        check("/ 返回的是真页面（不是「文件缺失」兜底页）",
+              'id="feed"' in page and "仪表盘文件缺失" not in page,
+              "长度 %d 字节" % len(page))
+
+        # ---- 31. 文件管理：列/预览/下载/删除/上传 + 边界与坏输入 --------------
+        # 用户明确要求这三类坏输入必须有测试钉住：路径穿越、超大文件、非法设备名。
+        print("\n[31] 文件管理")
+        fbase = "http://127.0.0.1:%d" % port
+        fdev = "文件测试-01"
+
+        def f_call(path, data=None, method=None, headers=None):
+            req = urllib.request.Request(fbase + path, data=data, method=method)
+            for k, v in (headers or {}).items():
+                req.add_header(k, v)
+            try:
+                with OPENER.open(req, timeout=15) as r:
+                    return r.status, r.read()
+            except urllib.error.HTTPError as e:
+                return e.code, e.read()
+
+        def f_upload(cat, dev, name, blob, ctype="application/octet-stream"):
+            q = ("?cat=" + urllib.parse.quote(cat)
+                 + "&device=" + urllib.parse.quote(dev)
+                 + "&name=" + urllib.parse.quote(name))
+            return f_call("/api/files/upload" + q, blob, method="POST",
+                          headers={"Content-Type": ctype})
+
+        jpg = b"\xff\xd8\xff" + b"fake-jpeg" * 200
+        st, _ = f_upload("shots", fdev, "a.jpg", jpg, "image/jpeg")
+        check("上传假 JPEG → 200", st == 200, "HTTP %d" % st)
+
+        st, body = f_call("/api/files?cat=shots&device=" + urllib.parse.quote(fdev))
+        d = json.loads(body.decode("utf-8"))
+        names = [f["name"] for f in (d.get("categories") or [{}])[0].get("files", [])]
+        check("列表能列出刚上传的文件", st == 200 and "a.jpg" in names,
+              "HTTP %d / %s" % (st, names[:5]))
+
+        # 预览：请求 limit 超过上限时必须被夹到 256KB，并明确标注截断
+        big = ("日志行1\n" + "x" * 300000).encode("utf-8")
+        st, _ = f_upload("logs", "", "big-test.txt", big, "text/plain")
+        check("上传日志文本 → 200", st == 200, "HTTP %d" % st)
+        st, body = f_call("/api/files/preview?cat=logs&name=big-test.txt&limit=999999")
+        d = json.loads(body.decode("utf-8"))
+        check("预览 limit 被夹到 256KB",
+              d.get("limit") == 256 * 1024 and len(d.get("text", "")) <= 256 * 1024,
+              "limit=%s len=%s" % (d.get("limit"), len(d.get("text", ""))))
+        check("超大文件预览标注 truncated", d.get("truncated") is True,
+              "bytes=%s" % d.get("bytes"))
+
+        st, got = f_call("/api/files/download?cat=logs&name=big-test.txt")
+        check("下载与原文件逐字节一致", st == 200 and got == big,
+              "HTTP %d / %d vs %d" % (st, len(got), len(big)))
+
+        # 路径穿越：文件名、反斜杠、设备名三处各来一条
+        bad_cases = [
+            ("文件名 ../", "/api/files/preview?cat=logs&name="
+             + urllib.parse.quote("../outside.txt")),
+            ("文件名反斜杠", "/api/files/download?cat=logs&name="
+             + urllib.parse.quote("..\\outside.txt")),
+            ("设备名 ..", "/api/files?cat=shots&device=" + urllib.parse.quote("..")),
+            ("未知分类", "/api/files?cat=secrets"),
+        ]
+        for label, path in bad_cases:
+            st, _ = f_call(path)
+            check("路径穿越被拒: %s" % label, st == 400, "HTTP %d" % st)
+
+        st, _ = f_upload("shots", "..", "evil.jpg", jpg, "image/jpeg")
+        check("非法设备名上传被拒", st == 400, "HTTP %d" % st)
+        st, _ = f_upload("shots", fdev, "evil.exe", b"MZ", "application/octet-stream")
+        check("扩展名不在白名单被拒", st == 415, "HTTP %d" % st)
+
+        # 超大文件：Content-Length 刚过 8MB 上限。必须能被服务端读完再回 413，
+        # 不能直接 RST —— 那条是 T58 的教训。
+        huge = b"z" * (8 * 1024 * 1024 + 1)
+        st, body = f_upload("logs", "", "too-big.txt", huge, "text/plain")
+        d = json.loads(body.decode("utf-8"))
+        check("超大上传 → 413 且带 max_bytes",
+              st == 413 and d.get("max_bytes") == 8 * 1024 * 1024,
+              "HTTP %d / %s" % (st, d.get("error")))
+
+        # 删除：穿越必须拒，正常删除要真的少一条
+        try:
+            out = post_json(fbase + "/api/files/delete",
+                            {"cat": "logs", "device": "", "name": "../outside.txt"})
+            ok_del_bad, detail_del_bad = False, "竟然接受了: %s" % out
+        except urllib.error.HTTPError as e:
+            ok_del_bad, detail_del_bad = e.code == 400, "HTTP %d" % e.code
+        except Exception as e:  # noqa: BLE001
+            ok_del_bad, detail_del_bad = False, "%s: %s" % (type(e).__name__, e)
+        check("删除时路径穿越被拒", ok_del_bad, detail_del_bad)
+
+        out = post_json(fbase + "/api/files/delete",
+                        {"cat": "shots", "device": fdev, "name": "a.jpg"})
+        check("正常删除返回 ok", out.get("ok") is True, "实际: %s" % out)
+        st, body = f_call("/api/files?cat=shots&device=" + urllib.parse.quote(fdev))
+        d = json.loads(body.decode("utf-8"))
+        names = [f["name"] for f in (d.get("categories") or [{}])[0].get("files", [])]
+        check("删除后列表里确实没有了", "a.jpg" not in names, "实际: %s" % names[:5])
+
+        # ---- 边界用例（2026-11-05 补） ----
+        # 空目录：全新设备的 shots 目录还没建，必须 ok + 空列表，而不是报错
+        st, body = f_call("/api/files?cat=shots&device=" + urllib.parse.quote("空目录-01"))
+        d = json.loads(body.decode("utf-8"))
+        c0 = (d.get("categories") or [{}])[0]
+        check("空目录 → 200 且空列表", st == 200 and c0.get("files") == [],
+              "HTTP %d / %s" % (st, c0.get("note")))
+
+        # Unicode 文件名：中文名必须能上传→列出→删除整条走通
+        uname = "遥测-测试日志.jsonl"
+        st, _ = f_upload("logs", "", uname, "中文内容\n".encode("utf-8"), "text/plain")
+        check("Unicode 文件名上传 → 200", st == 200, "HTTP %d" % st)
+        st, body = f_call("/api/files?cat=logs")
+        d = json.loads(body.decode("utf-8"))
+        names = [f["name"] for f in (d.get("categories") or [{}])[0].get("files", [])]
+        check("Unicode 文件名能列出", uname in names, "实际: %s" % names[:5])
+        out = post_json(fbase + "/api/files/delete",
+                        {"cat": "logs", "device": "", "name": uname})
+        check("Unicode 文件名能删除", out.get("ok") is True, "实际: %s" % out)
+
+        # 超长文件名：白名单上限 96 字符，超了必须 400 而不是落盘
+        long_name = "a" * 100 + ".txt"
+        st, _ = f_upload("logs", "", long_name, b"x", "text/plain")
+        check("超长文件名上传被拒", st == 400, "HTTP %d" % st)
+
+        # 删除不存在的文件 → 404（不是 200 也不是 500）
+        try:
+            post_json(fbase + "/api/files/delete",
+                      {"cat": "logs", "device": "", "name": "no-such-file.txt"})
+            check("删除不存在文件 → 404", False, "竟然删成功了")
+        except urllib.error.HTTPError as e:
+            check("删除不存在文件 → 404", e.code == 404, "HTTP %d" % e.code)
+
+        # 并发删除同一文件：一个 200、一个 404，不允许两个都"成功"
+        f_upload("logs", "", "race-del.txt", b"r", "text/plain")
+        race_codes = []
+
+        def _del_race():
+            try:
+                post_json(fbase + "/api/files/delete",
+                          {"cat": "logs", "device": "", "name": "race-del.txt"})
+                race_codes.append(200)
+            except urllib.error.HTTPError as e:
+                race_codes.append(e.code)
+            except Exception:  # noqa: BLE001
+                race_codes.append(-1)
+
+        t1 = threading.Thread(target=_del_race)
+        t2 = threading.Thread(target=_del_race)
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+        check("并发删除同一文件 → 恰好一个 200 一个 404",
+              sorted(race_codes) == [200, 404], "实际: %s" % race_codes)
+
+        # 文件被占用时删除走 OSError 分支 → 400 + ok:false（Windows 限定；
+        # Linux 允许删打开中的文件，CI 上跳过这条）
+        if os.name == "nt":
+            f_upload("logs", "", "locked.txt", b"L", "text/plain")
+            locked_path = os.path.join(data_dir, "locked.txt")
+            fh = open(locked_path, "rb")  # noqa: SIM115 - 就是要占着它
+            try:
+                try:
+                    post_json(fbase + "/api/files/delete",
+                              {"cat": "logs", "device": "", "name": "locked.txt"})
+                    check("文件被占用时删除 → 400", False, "竟然删成功了")
+                except urllib.error.HTTPError as e:
+                    check("文件被占用时删除 → 400", e.code == 400, "HTTP %d" % e.code)
+            finally:
+                fh.close()
+            post_json(fbase + "/api/files/delete",
+                      {"cat": "logs", "device": "", "name": "locked.txt"})
+        else:
+            print("  [SKIP] 文件占用删除（仅 Windows 可复现，Linux 允许删打开中的文件）")
+
+        # 大列表上限：目录里放 505 个文件，列表必须截到 500 且 capped=True，
+        # 且留下的是**最近的** 500 条（编号最大的那条必须在）
+        for i in range(505):
+            with open(os.path.join(data_dir, "bulk-%03d.log" % i), "wb") as f:
+                f.write(b"b")
+            ts = 1700000000 + i
+            os.utime(os.path.join(data_dir, "bulk-%03d.log" % i), (ts, ts))
+        st, body = f_call("/api/files?cat=logs")
+        d = json.loads(body.decode("utf-8"))
+        c0 = (d.get("categories") or [{}])[0]
+        bulk_names = [f["name"] for f in c0.get("files", []) if f["name"].startswith("bulk-")]
+        check("大列表截到 500 条且有 capped 标志",
+              len(c0.get("files", [])) <= 500 and c0.get("capped") is True,
+              "len=%s capped=%s" % (len(c0.get("files", [])), c0.get("capped")))
+        check("截断留下的是最近的文件", "bulk-504.log" in bulk_names,
+              "最近一条在不在: %s" % ("bulk-504.log" in bulk_names))
+        for n in bulk_names:
+            try:
+                post_json(fbase + "/api/files/delete",
+                          {"cat": "logs", "device": "", "name": n})
+            except Exception:  # noqa: BLE001
+                pass
+        for i in range(505):
+            p = os.path.join(data_dir, "bulk-%03d.log" % i)
+            if os.path.exists(p):
+                os.remove(p)
+
+        # 收尾：把测试写进日志目录的文本删掉，别污染后续运行
+        try:
+            post_json(fbase + "/api/files/delete",
+                      {"cat": "logs", "device": "", "name": "big-test.txt"})
+        except Exception:  # noqa: BLE001
+            pass
+
     finally:
-        for p in (srv, nlboard):
+        for p in (srv, srv2, nlboard):
             if p is None:
                 continue
             try:
@@ -1248,12 +2052,16 @@ def main():
             shutil.rmtree(tmp, ignore_errors=True)
 
     passed = sum(1 for _, ok, _ in RESULTS if ok)
-    total = len(RESULTS)
+    skipped = sum(1 for _, ok, _ in RESULTS if ok is None)
+    total = len(RESULTS) - skipped
     print("\n" + "=" * 70)
-    print("结果: %d/%d 通过" % (passed, total))
+    print("结果: %d/%d 通过%s" % (passed, total,
+          ("，%d 项因采样不足跳过" % skipped) if skipped else ""))
     for name, ok, detail in RESULTS:
-        if not ok:
+        if ok is False:
             print("  FAIL: %s  %s" % (name, detail))
+        elif ok is None:
+            print("  SKIP: %s  %s" % (name, detail))
     print("=" * 70)
     return 0 if passed == total else 1
 

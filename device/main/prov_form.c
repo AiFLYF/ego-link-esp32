@@ -10,7 +10,7 @@
 #include <string.h>
 
 #define PERIOD_MIN_MS 100
-#define PERIOD_MAX_MS 10000
+#define PERIOD_MAX_MS 2000
 
 static int hexval(char c)
 {
@@ -107,7 +107,7 @@ bool prov_validate(const net_config_t *cfg, char *err, size_t errcap)
     }
     if (cfg->period_ms != 0 &&
         (cfg->period_ms < PERIOD_MIN_MS || cfg->period_ms > PERIOD_MAX_MS)) {
-        strlcpy(err, "上报周期应在 100–10000 ms 之间", errcap);
+        strlcpy(err, "上报周期应在 100–2000 ms 之间", errcap);
         return false;
     }
     return true;

@@ -28,8 +28,8 @@
  *    服务器给的细节（水平 / 向左倾斜 / 峰值 / 约N步）另起一行小字，不再被截断。
  * 2. **颜色即语义**：静置绿 / 步行紫 / 运动蓝 / 晃动琥珀 / 跌落红。
  *    跌落时活动环外多一圈呼吸红光，隔着两米也看得见。
- * 3. **长回复不丢字**：AI 回复按显示宽度自动分页（每页 ≤ 30 列，中文记 2 列），
- *    每 4 秒翻一页，右下角显示 `1/2`，比原来的 `…` 截断多出完整内容。
+ * 3. **长回复不丢字**：AI 回复按显示宽度自动分页（每页 ≤ 54 列，中文记 2 列），
+ *    每 4 秒翻一页，右上方以圆点（超长退回 `1/N`）指示页码，不再被 `…` 截断。
  * 4. **动效克制**：只有三处动画——姿态球跟随（260ms）、跌落呼吸光、离线呼吸点。
  *    其余状态一律静态，避免 240x240 SPI 屏因持续重绘产生撕裂。
  * 5. **几何与配色集中在下面的 UI_* 宏**：`tools/ui_preview.py` 会**解析这些宏**
@@ -81,49 +81,62 @@ static const char *TAG = "ui";
 #define UI_DOT_D        8
 #define UI_LINK_X       26
 #define UI_LINK_W       48
-#define UI_HZ_X         98
-#define UI_HZ_W         44
-#define UI_POSTS_X      132
-#define UI_POSTS_W      90
-#define UI_BADGE_X      186
-#define UI_BADGE_W      36
+/* ⚠️ 这三段的**盒子不许互相重叠**（2026-10-12 修）：
+ * 原来是 96..140（采样率）与 132..222（上报数）—— 中间有 12px 是重合的。
+ * 平时看不出来，是因为 "100Hz" 这种短文本居中后**没填满 44px 的盒子**；
+ * 一旦上报数涨到 6 位（"↑123456"），右对齐的文本就会顶到采样率上。
+ * 现在的排法是采样率 96..136、上报数 140..222，两者之间留 4px 硬间隔。 */
+#define UI_HZ_X         96
+#define UI_HZ_W         40
+#define UI_POSTS_X      140
+#define UI_POSTS_W      82
+#define UI_BADGE_X      184
+#define UI_BADGE_W      38
 #define UI_BADGE_H      16
 
-/* 两块主视觉面板 */
+/* 两块主视觉面板
+ * ⚠️ 2026-10-12 重排过一次纵向节奏（面板 88 → 92）：
+ * 原来活动环 y=0，它的描边**正好压在面板上边框上**——光学上叫"顶死"，
+ * 是最显眼的一种廉价感（元素与容器之间一点呼吸都没有）。
+ * 环下移 4px 之后面板装不下了，就把「面板→三轴条」「三轴条→AI 卡片」
+ * 两个间隙各收紧 2px 凑出来 —— 内容一个都没少，只是留白更均匀。 */
 #define UI_PANEL_Y      30
-#define UI_PANEL_H      88
+#define UI_PANEL_H      92
 #define UI_PANEL_W      108
 #define UI_PANEL_LX     8
 #define UI_PANEL_RX     124
+#define UI_PANEL_R      14                      /* 面板圆角（tools/ui_preview.py 读这个） */
 
 /* 左面板：活动环 */
 #define UI_RING_D       76
-#define UI_RING_Y       0
+#define UI_RING_Y       4
 #define UI_RING_W       7                       /* 环的线宽 */
 #define UI_WORD_W       52
 #define UI_WORD_H       18
-#define UI_WORD_Y       21                      /* 环心文字（活动词） */
+#define UI_WORD_Y       24                      /* 环心文字（活动词）——环心 y=42，词在上 */
 #define UI_ABS_W        52
 #define UI_ABS_H        14
-#define UI_ABS_Y        43                      /* 环心第二行（|a| 读数） */
-#define UI_PANEL_CAP_Y  72                      /* 面板底部小字 */
+#define UI_ABS_Y        46                      /* 环心第二行（|a| 读数）——词下 4px */
+#define UI_PANEL_CAP_Y  78                      /* 面板底部小字 */
 #define UI_PANEL_CAP_W  108
-#define UI_PANEL_CAP_H  14
+#define UI_PANEL_CAP_H  13
 #define UI_CAP_DOT_D    5                       /* 细节行左侧语义色圆点 */
 #define UI_CAP_DOT_X    10
 
-/* 右面板：姿态球 */
-#define UI_BALL_D       76
-#define UI_BALL_Y       0
+/* 右面板：姿态球（盘比环小 4px：它没有"断口"可以借位，
+ * 下方小字要跟盘的外沿真正分开，不能再像原来那样压着盘边） */
+#define UI_BALL_D       72
+#define UI_BALL_Y       4
 #define UI_BALL_W       1                       /* 外圈线宽 */
 #define UI_BUBBLE_D     18                      /* 重力球直径 */
 #define UI_BUBBLE_MAX   26                      /* 球心最大偏移（px），对应 1g */
-#define UI_LEVEL_D      22                      /* 中心「水平区」参考圈 */
+#define UI_LEVEL_D      20                      /* 中心「水平区」参考圈 */
+#define UI_PITCH_D      46                      /* 航姿罗盘 30° / 0.5g 参照圈 */
 #define UI_CROSS_LEN    52
 #define UI_CROSS_DIAG   34                      /* 45° 斜辅助线（水平仪刻度感） */
 
-/* 三轴对称条 */
-#define UI_AXIS_Y       124
+/* 三轴对称条（y 从 124 挪到 126：上面板长高了 4px，从两个间隙里各还了 2px） */
+#define UI_AXIS_Y       126
 #define UI_AXIS_ROW_H   13
 #define UI_AXIS_GAP     3
 #define UI_AXIS_LBL_X   8
@@ -164,16 +177,29 @@ static const char *TAG = "ui";
 /* ==========================================================================
  * 配色（深色玻璃拟态：深底 + 低对比描边 + 高饱和语义色）
  * ======================================================================== */
-#define UI_C_BG         0x0A0E14                /* 屏幕底色（顶亮底暗渐变） */
-#define UI_C_BG_DEEP    0x05070A
-#define UI_C_CARD       0x141A23                /* 面板/卡片底 */
-#define UI_C_CARD_HI    0x1B2230                /* 卡片渐变上端 */
-#define UI_C_LINE       0x252D3A                /* 描边 */
-#define UI_C_TRACK      0x232C39                /* 进度/环的底槽（提亮一档，轨道不再发灰） */
-#define UI_C_MARK       0x3D4757                /* 0 位中线 / 斜辅助线等刻度 */
-#define UI_C_TEXT       0xE6EDF3
-#define UI_C_DIM        0x8B949E
-#define UI_C_FAINT      0x5A6472
+/* ⚠️ 2026-10-12 重调过一次，只动了「层次」，没动「语义」：
+ *
+ *   · BG 从 0x0A0E14 压到 0x080B11（再深一档）
+ *   · CARD 从 0x141A23 抬到 0x161D28（再亮一档）
+ *
+ * 于是「底 → 面」的亮度差从 ~10 级拉到 ~14 级。原来这两个值太接近，
+ * 在 240x240 的 SPI 屏上**根本看不出卡片是浮起来的**，只能靠把描边调亮
+ * 来硬分层次 —— 而描边一多、一亮，整屏就显得脏、碎。
+ * 拉开了底与面的差，描边就可以反过来**压淡**，靠"面"而不是"线"分层。
+ *
+ * 语义色（GREEN/BLUE/PURPLE/AMBER/RED）**一个都没动**：
+ * 它们的含义与网页仪表盘的 --color-* 是一一对应的，换端不用重新学。 */
+#define UI_C_BG         0x080B11                /* 屏幕底色（顶亮底暗渐变） */
+#define UI_C_BG_DEEP    0x03050A
+#define UI_C_CARD       0x161D28                /* 面板/卡片底 */
+#define UI_C_CARD_HI    0x1E2734                /* 卡片渐变上端 */
+#define UI_C_LINE       0x242D39                /* 描边（比之前更冷、更淡） */
+#define UI_C_TRACK      0x212A36                /* 进度/环的底槽 */
+#define UI_C_MARK       0x3A4451                /* 0 位中线 / 斜辅助线等刻度 */
+#define UI_C_SHEEN      0xFFFFFF                /* 顶面 1px 内高光（靠 opa 压淡） */
+#define UI_C_TEXT       0xEBF1F7
+#define UI_C_DIM        0x8F99A6
+#define UI_C_FAINT      0x5B6570
 #define UI_C_GREEN      0x3FB950                /* 静置 / 在线 */
 #define UI_C_TEAL       0x2DD4BF
 #define UI_C_BLUE       0x58A6FF                /* 运动 / 信息 */
@@ -226,6 +252,9 @@ static lv_obj_t *s_lbl_reply;
 static lv_obj_t *s_lbl_page;
 static lv_obj_t *s_pdot[UI_PDOTS_N];           /* 分页圆点（总页数 ≤ N） */
 static lv_obj_t *s_spinner;
+static lv_obj_t *s_ai_stripe;
+static lv_obj_t *s_ai_tag;
+static lv_obj_t *s_ai_tag_lbl;
 
 /* 只在值变化时才动控件，避免 500ms 定时器把动画一次次重置 */
 #define UI_NONE (-1000000)
@@ -234,10 +263,16 @@ static char     s_last_reply[TRANSPORT_REPLY_LEN];
 static char     s_last_activity[TRANSPORT_ACTIVITY_LEN];
 static char     s_last_detail[32];          /* 细节行上次的文本（含本地算的倾斜方向） */
 static bool     s_last_pending;
+static uint8_t  s_last_ai_state;
+static char     s_last_ai_note[TRANSPORT_AI_NOTE_LEN];
 static int      s_last_abs = -1;
 static int      s_last_axis[3] = {UI_NONE, UI_NONE, UI_NONE};
 static int      s_last_badge = -1;
 static bool     s_last_online = true;
+static const char *s_last_link_text = NULL;
+static uint32_t s_last_link_color = 0;
+static uint32_t s_last_posts_ok = 0xFFFFFFFF;
+static char     s_last_tilt[32];
 static bool     s_fall_on;
 static int      s_bubble_tx = UI_NONE, s_bubble_ty = UI_NONE;
 static uint32_t s_last_ball_color;
@@ -309,6 +344,28 @@ static lv_obj_t *make_box(lv_obj_t *parent, int x, int y, int w, int h,
         lv_obj_set_style_bg_opa(o, LV_OPA_COVER, 0);
     }
     return o;
+}
+
+/* 顶面 1px 内高光：模拟"光从上方来"的边缘反射。
+   实现就是一条 1px 高的白条 + 很低的 opa，成本约等于画一根线 ——
+   比给整张卡片铺渐变便宜得多，而且不随内容重绘。
+   ⚠️ 只在**深色底**的容器上加：底色本来就亮的话这条高光看不见，
+   白加一层还会让描边显糊。 */
+static void add_sheen(lv_obj_t *parent, int w)
+{
+    lv_obj_t *o = make_box(parent, 1, 1, w - 2, 1, UI_C_SHEEN, 0, 0);
+    lv_obj_set_style_bg_opa(o, 24, 0);
+}
+
+/* "浮起"的阴影：深色界面靠"更黑"分层，不是靠把描边调亮。
+   ⚠️ 只给**静态容器**加（左面板 / 右面板 / AI 卡片），不给每帧刷新的控件加 ——
+   240x240 的 SPI 屏带宽有限，动的东西带阴影会持续触发大区域重绘。 */
+static void add_elevation(lv_obj_t *o)
+{
+    lv_obj_set_style_shadow_width(o, 12, 0);
+    lv_obj_set_style_shadow_ofs_y(o, 4, 0);
+    lv_obj_set_style_shadow_color(o, lv_color_hex(UI_C_BG_DEEP), 0);
+    lv_obj_set_style_shadow_opa(o, 70, 0);
 }
 
 static lv_obj_t *make_label(lv_obj_t *parent, int x, int y, int w, int h,
@@ -435,14 +492,24 @@ static void build_detail(act_kind_t kind, const char *activity,
         return;
     case ACT_STILL:
     case ACT_IDLE:      /* 离线：服务器文案是空的，只能本地算 */
-        if (strstr(activity, "向左") || strstr(activity, "左")) {
-            snprintf(out, out_sz, "向左倾斜");
-        } else if (strstr(activity, "向右") || strstr(activity, "右")) {
+        if (strstr(activity, "向右上")) {
+            snprintf(out, out_sz, "向右上倾斜");
+        } else if (strstr(activity, "向右下")) {
+            snprintf(out, out_sz, "向右下倾斜");
+        } else if (strstr(activity, "向左上")) {
+            snprintf(out, out_sz, "向左上倾斜");
+        } else if (strstr(activity, "向左下")) {
+            snprintf(out, out_sz, "向左下倾斜");
+        } else if (strstr(activity, "向右")) {
             snprintf(out, out_sz, "向右倾斜");
-        } else if (strstr(activity, "向上") || strstr(activity, "上")) {
+        } else if (strstr(activity, "向左")) {
+            snprintf(out, out_sz, "向左倾斜");
+        } else if (strstr(activity, "向上")) {
             snprintf(out, out_sz, "向上倾斜");
-        } else if (strstr(activity, "向下") || strstr(activity, "下")) {
+        } else if (strstr(activity, "向下")) {
             snprintf(out, out_sz, "向下倾斜");
+        } else if (strstr(activity, "水平")) {
+            snprintf(out, out_sz, "水平");
         } else {
             const char *w = local_tilt_word(x_g, y_g);
             if (strcmp(w, "水平") == 0) {
@@ -519,9 +586,18 @@ static int reply_page(const char *src, int page, char *out, size_t out_sz)
             p = brk;
         }
 
-        /* 防御：一页至少要吃掉一个字符，否则死循环 */
+        /* 防御：一页至少要吃掉一个字符，否则死循环（按 UTF-8 字符长度步进） */
         if (p == start) {
-            p += 1;
+            unsigned char c = (unsigned char)*p;
+            int clen = 1;
+            if (c >= 0xF0) {
+                clen = 4;
+            } else if (c >= 0xE0) {
+                clen = 3;
+            } else if (c >= 0xC0) {
+                clen = 2;
+            }
+            p += clen;
         }
 
         if (idx == page) {
@@ -656,6 +732,9 @@ static void move_bubble(int tx, int ty)
         return;
     }
 
+    lv_anim_delete(s_bubble, anim_translate_x);
+    lv_anim_delete(s_bubble, anim_translate_y);
+
     lv_anim_t a;
     lv_anim_init(&a);
     lv_anim_set_var(&a, s_bubble);
@@ -708,9 +787,13 @@ static void ui_timer_cb(lv_timer_t *timer)
         s_prov_shown = false;
         s_last_reply[0] = '\0';
         s_last_activity[0] = '\0';
+        s_last_detail[0] = '\0';
         s_last_abs = UI_NONE;
         s_last_badge = -1;
         s_last_online = false;      /* 强制下一帧重画在线状态 */
+        s_last_link_text = NULL;
+        s_last_posts_ok = 0xFFFFFFFF;
+        s_last_tilt[0] = '\0';
         lv_obj_set_hidden(s_prov_panel, true);
     }
 
@@ -745,9 +828,13 @@ static void ui_timer_cb(lv_timer_t *timer)
         link_text = "无服务";
         link_color = UI_C_RED;
     }
-    lv_label_set_text(s_lbl_link, link_text);
-    lv_obj_set_style_text_color(s_lbl_link, lv_color_hex(link_color), 0);
-    lv_obj_set_style_bg_color(s_dot, lv_color_hex(link_color), 0);
+    if (link_text != s_last_link_text || link_color != s_last_link_color) {
+        s_last_link_text = link_text;
+        s_last_link_color = link_color;
+        lv_label_set_text(s_lbl_link, link_text);
+        lv_obj_set_style_text_color(s_lbl_link, lv_color_hex(link_color), 0);
+        lv_obj_set_style_bg_color(s_dot, lv_color_hex(link_color), 0);
+    }
 
     if (online != s_last_online) {
         s_last_online = online;
@@ -756,11 +843,18 @@ static void ui_timer_cb(lv_timer_t *timer)
     }
 
     /* ---------- 状态胶囊：采样率 / 上报数 ---------- */
-    snprintf(buf, sizeof(buf), "%dHz", (int)(1000 / CONFIG_RW1_SAMPLE_PERIOD_MS));
-    lv_label_set_text(s_lbl_hz, buf);
+    static bool s_hz_init = false;
+    if (!s_hz_init) {
+        s_hz_init = true;
+        snprintf(buf, sizeof(buf), "%dHz", (int)(1000 / CONFIG_RW1_SAMPLE_PERIOD_MS));
+        lv_label_set_text(s_lbl_hz, buf);
+    }
 
-    snprintf(buf, sizeof(buf), "↑%u", (unsigned)st.posts_ok);
-    lv_label_set_text(s_lbl_posts, buf);
+    if (st.posts_ok != s_last_posts_ok) {
+        s_last_posts_ok = st.posts_ok;
+        snprintf(buf, sizeof(buf), "↑%u", (unsigned)st.posts_ok);
+        lv_label_set_text(s_lbl_posts, buf);
+    }
 
     /* ---------- 远程指令徽标 / 语音状态（互斥，出现时临时顶替上报数） ----------
      * 语音**优先于**远程指令：用户刚按完键，"它在听"是此刻最该看到的信息。
@@ -903,10 +997,18 @@ static void ui_timer_cb(lv_timer_t *timer)
     static float s_deg = 0.0f;
     static bool s_deg_primed = false;
     if (mag < 0.05f) {
-        snprintf(buf, sizeof(buf), show_ori ? "无读数 o%d" : "无读数", ori);
+        if (show_ori) {
+            snprintf(buf, sizeof(buf), "无读数 o%d", ori);
+        } else {
+            snprintf(buf, sizeof(buf), "无读数");
+        }
     } else if (mag < 0.35f) {
         s_deg_primed = false;          /* 失重后重新起滤，别拿旧值 */
-        snprintf(buf, sizeof(buf), show_ori ? "失重 o%d" : "失重", ori);
+        if (show_ori) {
+            snprintf(buf, sizeof(buf), "失重 o%d", ori);
+        } else {
+            snprintf(buf, sizeof(buf), "失重");
+        }
     } else {
         float c = fabsf(dz) / mag;
         if (c > 1.0f) {
@@ -923,9 +1025,17 @@ static void ui_timer_cb(lv_timer_t *timer)
         /* 去掉「倾角」和数字之间的空格：这个 CJK 字体里 ASCII 是**全角**的，
          * 一个空格就是 12px —— 带上它会顶破 100px 的标签宽度而**换行**，
          * 第二行又被 14px 的行高裁掉（用户拍到的"显示不全"就是这个）。 */
-        snprintf(buf, sizeof(buf), show_ori ? "倾角%d° o%d" : "倾角%d°", deg, ori);
+        if (show_ori) {
+            snprintf(buf, sizeof(buf), "倾角%d° o%d", deg, ori);
+        } else {
+            snprintf(buf, sizeof(buf), "倾角%d°", deg);
+        }
     }
-    lv_label_set_text(s_lbl_tilt, buf);
+    if (strcmp(s_last_tilt, buf) != 0) {
+        strncpy(s_last_tilt, buf, sizeof(s_last_tilt) - 1);
+        s_last_tilt[sizeof(s_last_tilt) - 1] = '\0';
+        lv_label_set_text(s_lbl_tilt, buf);
+    }
 
     /* ---------- 三轴对称条 ---------- */
     float axis[3] = {dx, dy, dz};
@@ -944,25 +1054,52 @@ static void ui_timer_cb(lv_timer_t *timer)
         }
     }
 
-    /* ---------- AI 回复：新内容就重排分页，否则每 4 秒翻一页 ---------- */
-    if (strcmp(st.reply, s_last_reply) != 0 || st.ai_pending != s_last_pending) {
+    /* ---------- AI 回复：新内容就重排分页，否则每 4 秒翻一页 ----------
+     * 显示优先级：FAILED（显示原因，红色）> 正文（琥珀）> 引导语（灰）。
+     * `ai_state` 是**成败**的权威来源；`ai_pending` 只表示服务端还在生成。
+     * 失败时绝不保留上一句旧回答 —— 那条要求来自"屏幕停在旧话上"的真实投诉。 */
+    if (strcmp(st.reply, s_last_reply) != 0 || st.ai_pending != s_last_pending ||
+        st.ai_state != s_last_ai_state || strcmp(st.ai_note, s_last_ai_note) != 0) {
         strlcpy(s_last_reply, st.reply, sizeof(s_last_reply));
         s_last_pending = st.ai_pending;
+        s_last_ai_state = st.ai_state;
+        strlcpy(s_last_ai_note, st.ai_note, sizeof(s_last_ai_note));
         s_page = 0;
         s_page_tick = 0;
 
-        bool has_reply = st.reply[0] != '\0';
-        const char *text = has_reply ? st.reply : "单击 BOOT 提问 · 三击说话";
+        bool failed = (st.ai_state == TRANSPORT_AI_FAILED && st.ai_note[0] != '\0');
+        bool has_reply = (st.ai_state == TRANSPORT_AI_OK && st.reply[0] != '\0');
+        const char *text;
+        uint32_t reply_c;
+        if (failed) {
+            text = st.ai_note;
+            reply_c = UI_C_RED;
+        } else if (has_reply) {
+            text = st.reply;
+            reply_c = UI_C_AMBER;
+        } else if (st.ai_state == TRANSPORT_AI_PENDING) {
+            text = st.ai_note[0] != '\0' ? st.ai_note : "正在思考…";
+            reply_c = UI_C_DIM;
+        } else {
+            text = "单击 BOOT 提问 · 三击说话";
+            reply_c = UI_C_FAINT;
+        }
         char pagebuf[128];
         s_page_total = reply_page(text, 0, pagebuf, sizeof(pagebuf));
         lv_label_set_text(s_lbl_reply, pagebuf);
-        /* 生成中压暗；空引导语用弱化灰，只有真正的 AI 回复才用琥珀色 */
-        uint32_t reply_c = st.ai_pending ? UI_C_DIM : has_reply ? UI_C_AMBER : UI_C_FAINT;
         lv_obj_set_style_text_color(s_lbl_reply, lv_color_hex(reply_c), 0);
 
-        lv_obj_set_hidden(s_spinner, !st.ai_pending);
-        refresh_pager(0, s_page_total, st.ai_pending);
-    } else if (!st.ai_pending && s_page_total > 1) {
+        bool spinning = (st.ai_state == TRANSPORT_AI_PENDING);
+        uint32_t accent = failed ? UI_C_RED : (has_reply || spinning) ? UI_C_AMBER : UI_C_BLUE;
+        if (s_ai_stripe != NULL) {
+            lv_obj_set_style_bg_color(s_ai_stripe, lv_color_hex(accent), 0);
+            lv_obj_set_style_bg_color(s_ai_tag, lv_color_hex(accent), 0);
+            lv_obj_set_style_text_color(s_ai_tag_lbl, lv_color_hex(accent), 0);
+        }
+
+        lv_obj_set_hidden(s_spinner, !spinning);
+        refresh_pager(0, s_page_total, spinning);
+    } else if (!s_last_pending && s_last_ai_state == TRANSPORT_AI_OK && s_page_total > 1) {
         if (++s_page_tick >= UI_PAGE_TICKS) {
             s_page_tick = 0;
             s_page = (s_page + 1) % s_page_total;
@@ -1012,11 +1149,16 @@ static void build_status_bar(lv_obj_t *scr)
 static void build_activity_panel(lv_obj_t *scr)
 {
     s_panel_act = make_box(scr, UI_PANEL_LX, UI_PANEL_Y, UI_PANEL_W, UI_PANEL_H,
-                           UI_C_CARD, UI_C_LINE, 16);
+                           UI_C_CARD, UI_C_LINE, UI_PANEL_R);
+    add_elevation(s_panel_act);
 
-    /* 跌落呼吸光环：比活动环大一圈，平时隐藏 */
-    s_glow = make_box(s_panel_act, (UI_PANEL_W - (UI_RING_D + 14)) / 2, UI_RING_Y - 7,
-                      UI_RING_D + 14, UI_RING_D + 14, 0, UI_C_RED, LV_RADIUS_CIRCLE);
+    /* 跌落呼吸光环：比活动环大一圈，平时隐藏。
+     * 尺寸是**贴着面板内沿算的**：环心 y = RING_Y + RING_D/2 = 42，
+     * 光环直径 RING_D+4 = 80 → y = 42-40 = 2，上下各留 2px，不会被面板裁掉。
+     * （原来 +14/-7 的光环上沿是负数，被面板裁掉一截 —— 呼吸红光只剩大半圈，
+     *   隔两米看就不再是"一圈光"而是"一段弧"，告警的分量弱了一半。） */
+    s_glow = make_box(s_panel_act, (UI_PANEL_W - (UI_RING_D + 4)) / 2, UI_RING_Y - 2,
+                      UI_RING_D + 4, UI_RING_D + 4, 0, UI_C_RED, LV_RADIUS_CIRCLE);
     lv_obj_set_style_border_width(s_glow, 2, 0);
     lv_obj_set_style_opa(s_glow, LV_OPA_TRANSP, 0);
     lv_obj_set_hidden(s_glow, true);
@@ -1066,7 +1208,8 @@ static void build_activity_panel(lv_obj_t *scr)
 static void build_tilt_panel(lv_obj_t *scr)
 {
     lv_obj_t *p = make_box(scr, UI_PANEL_RX, UI_PANEL_Y, UI_PANEL_W, UI_PANEL_H,
-                           UI_C_CARD, UI_C_LINE, 16);
+                           UI_C_CARD, UI_C_LINE, UI_PANEL_R);
+    add_elevation(p);
 
     /* 圆盘 + 十字准线 + 中心「水平区」参考圈：让球的位移有参照 */
     lv_obj_t *disc = make_box(p, (UI_PANEL_W - UI_BALL_D) / 2, UI_BALL_Y,
@@ -1097,8 +1240,17 @@ static void build_tilt_panel(lv_obj_t *scr)
         lv_obj_set_style_line_rounded(ln, true, 0);
     }
 
-    make_box(disc, cx - UI_LEVEL_D / 2, cx - UI_LEVEL_D / 2, UI_LEVEL_D, UI_LEVEL_D,
+    /* 30° / 0.5g 航姿罗盘参照圈 + 中心水平区参考圈 */
+    make_box(disc, cx - UI_PITCH_D / 2, cx - UI_PITCH_D / 2, UI_PITCH_D, UI_PITCH_D,
              0, UI_C_TRACK, LV_RADIUS_CIRCLE);
+    make_box(disc, cx - UI_LEVEL_D / 2, cx - UI_LEVEL_D / 2, UI_LEVEL_D, UI_LEVEL_D,
+             0, UI_C_MARK, LV_RADIUS_CIRCLE);
+
+    /* 罗盘 4 轴端点微刻度（顶底左右边缘） */
+    make_box(disc, cx, 1, 1, 3, UI_C_MARK, 0, 0);
+    make_box(disc, cx, UI_BALL_D - 4, 1, 3, UI_C_MARK, 0, 0);
+    make_box(disc, 1, cx, 3, 1, UI_C_MARK, 0, 0);
+    make_box(disc, UI_BALL_D - 4, cx, 3, 1, UI_C_MARK, 0, 0);
 
     s_bubble = make_box(disc, cx - UI_BUBBLE_D / 2, cx - UI_BUBBLE_D / 2,
                         UI_BUBBLE_D, UI_BUBBLE_D, UI_C_GREEN, 0, LV_RADIUS_CIRCLE);
@@ -1151,6 +1303,14 @@ static void build_axis_rows(lv_obj_t *scr)
                                        lv_color_hex(axis_color[i] & 0x7F7F7F), LV_PART_INDICATOR);
         lv_obj_set_style_bg_grad_dir(s_axis_bar[i], LV_GRAD_DIR_HOR, LV_PART_INDICATOR);
 
+        /* ±1g 物理基准刻度线（-1g 与 +1g 位置，即 ±50% 量程处） */
+        make_box(scr, UI_AXIS_BAR_X + UI_AXIS_BAR_W / 4,
+                 y + (UI_AXIS_ROW_H - UI_AXIS_BAR_H) / 2,
+                 1, UI_AXIS_BAR_H, UI_C_LINE, 0, 0);
+        make_box(scr, UI_AXIS_BAR_X + 3 * UI_AXIS_BAR_W / 4,
+                 y + (UI_AXIS_ROW_H - UI_AXIS_BAR_H) / 2,
+                 1, UI_AXIS_BAR_H, UI_C_LINE, 0, 0);
+
         /* 0 位中轴亮线：比轨道高一个像素，正负两边的刻度尺，始终压在最上层 */
         make_box(scr, UI_AXIS_BAR_X + UI_AXIS_BAR_W / 2,
                  y + (UI_AXIS_ROW_H - (UI_AXIS_BAR_H + 2)) / 2,
@@ -1172,16 +1332,21 @@ static void build_reply_card(lv_obj_t *scr)
                               UI_C_CARD_HI, UI_C_LINE, 14);
     lv_obj_set_style_bg_grad_color(card, lv_color_hex(UI_C_CARD), 0);
     lv_obj_set_style_bg_grad_dir(card, LV_GRAD_DIR_VER, 0);
+    add_elevation(card);
+    /* 卡片是三块里唯一**整块有渐变**的（上亮下暗），加一条顶面高光
+     * 正好落在渐变最亮的那端 —— "光从上来"的暗示就成立了。
+     * 两块主面板没有渐变，加了反而会让描边显糊，所以不给它们加。 */
+    add_sheen(card, UI_CARD_W);
 
     /* 左侧 AI 蓝色竖条：整条消息的语义锚点 */
-    make_box(card, 0, 12, UI_STRIPE_W, UI_CARD_H - 24, UI_C_BLUE, 0, 2);
+    s_ai_stripe = make_box(card, 0, 12, UI_STRIPE_W, UI_CARD_H - 24, UI_C_BLUE, 0, 2);
 
-    lv_obj_t *tag = make_box(card, UI_TAG_X, UI_TAG_Y, UI_TAG_W, UI_TAG_H, UI_C_BLUE, 0, 7);
-    lv_obj_set_style_bg_opa(tag, 48, 0);        /* 半透明徽标，不抢正文 */
-    lv_obj_t *tag_lbl = make_label(tag, 0, 0, UI_TAG_W, UI_TAG_H,
-                                   &lv_font_montserrat_14, UI_C_BLUE, LV_TEXT_ALIGN_CENTER);
-    lv_label_set_long_mode(tag_lbl, LV_LABEL_LONG_CLIP);
-    lv_label_set_text(tag_lbl, "AI");
+    s_ai_tag = make_box(card, UI_TAG_X, UI_TAG_Y, UI_TAG_W, UI_TAG_H, UI_C_BLUE, 0, 7);
+    lv_obj_set_style_bg_opa(s_ai_tag, 48, 0);        /* 半透明徽标，不抢正文 */
+    s_ai_tag_lbl = make_label(s_ai_tag, 0, 0, UI_TAG_W, UI_TAG_H,
+                              &lv_font_montserrat_14, UI_C_BLUE, LV_TEXT_ALIGN_CENTER);
+    lv_label_set_long_mode(s_ai_tag_lbl, LV_LABEL_LONG_CLIP);
+    lv_label_set_text(s_ai_tag_lbl, "AI");
 
     /* 生成中：转圈，与右侧分页指示器互斥 */
     s_spinner = lv_spinner_create(card);

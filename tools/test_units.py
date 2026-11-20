@@ -1,0 +1,945 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""纯函数单元测试（stdlib unittest，不需要装 pytest）。
+
+为什么单独有这个文件：
+    `tools/verify_server.py`（138 项）走的是**端到端**路线 —— 起真服务、发真 HTTP、
+    等真线程。它验的是"整条链路对不对"，代价是 2 分半，而且**边界用例很难覆盖**：
+    想验 `tilt_direction` 的 8 个方位、`parse_intent` 的 30 条话术，
+    要为此发几十次真实请求。
+
+    这些函数是纯的（无锁、无 IO、无全局状态），本来就该用毫秒级的断言覆盖。
+    本文件只测它们，所以：**秒级、可进每次提交的门禁、失败信息直接指到边界条件**。
+
+跑法：
+    python -m unittest discover -s tools -p "test_*.py" -v
+    # 或直接
+    python tools/test_units.py
+
+注意：导入 server.py 会执行模块级代码（定义 DASHBOARD_HTML 等），但**不会**启动服务
+（`main()` 在 `if __name__ == "__main__"` 后面）。所以导入是安全的。
+"""
+
+import importlib.util
+import io
+import math
+import os
+import sys
+import unittest
+import unittest.mock
+import urllib.error
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_SERVER_PY = os.path.join(os.path.dirname(_HERE), "server", "server.py")
+
+
+def _load_server():
+    spec = importlib.util.spec_from_file_location("rw1_server_under_test", _SERVER_PY)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+srv = _load_server()
+# 单测默认与真实 .env 隔离：仓库根目录可能真的有开发者配的 LLM key，
+# 不许它渗进断言（TestDotenvAndRetry 会自己显式切换这个开关）。
+srv._DOTENV_LOADED = True
+# 分类函数住在 `server/analysis.py`（2026-11-01 从 server.py 拆出）。
+# 这里**直接拿那个模块对象**，而不是 `import analysis` 再加载一遍 ——
+# server.py 在 import 时已经把它装进 sys.modules 了，所以
+# `sys.modules["analysis"]` 就是服务端真正在用的那一份（同一个函数对象）。
+# 顺带这也是一条断言：哪天 server.py 不再 import analysis，这里会立刻 KeyError。
+ana = sys.modules["analysis"]
+jlog = sys.modules["jsonl_log"]
+
+
+class TestClipUtf8(unittest.TestCase):
+    def test_short_text_unchanged(self):
+        self.assertEqual(srv.clip_utf8("你好", 100), "你好")
+
+    def test_never_splits_multibyte(self):
+        """按字节截断，但绝不能切出半个汉字 —— 切了就是乱码（板上 LVGL 显示问号）。"""
+        text = "中文" * 200
+        for limit in range(1, 40):
+            out = srv.clip_utf8(text, limit)
+            out.encode("utf-8")                      # 解不出来会抛，等于断言
+            self.assertLessEqual(len(out.encode("utf-8")), limit + len("…".encode("utf-8")))
+
+    def test_truncated_marked(self):
+        out = srv.clip_utf8("中" * 50, 30)
+        self.assertTrue(out.endswith("…"))
+
+
+class TestSafeName(unittest.TestCase):
+    def test_keeps_alnum_and_zh(self):
+        # isalnum() 对中文为真，所以中文设备名会被保留 —— 这是刻意的（目录名可读）
+        self.assertEqual(srv.safe_name("第三组-07"), "第三组-07")
+
+    def test_replaces_path_chars(self):
+        self.assertEqual(srv.safe_name("a/b c\\d"), "a_b_c_d")
+        self.assertNotIn("/", srv.safe_name("../../etc/passwd"))
+
+    def test_empty_falls_back(self):
+        self.assertEqual(srv.safe_name(""), "unknown")
+
+    def test_truncation_does_not_collide(self):
+        """前 41 字符相同的两个长名字必须拿到不同的目录名。
+
+        2026-10-12 的修复：无脑截断到 48 会让「第三组-07-xxxx…」这类同前缀名字
+        互相覆盖照片，而且看不出来。截断时追加 6 位短哈希。
+        """
+        prefix = "第三组-07-" + "x" * 40
+        a = srv.safe_name(prefix + "-AAA")
+        b = srv.safe_name(prefix + "-BBB")
+        self.assertNotEqual(a, b)
+        self.assertLessEqual(len(a), 48)
+        self.assertLessEqual(len(b), 48)
+
+
+class TestTiltDirection(unittest.TestCase):
+    """屏幕坐标系：+x 向右、+y 向下。8 个方位逐个钉死。"""
+
+    def test_eight_directions(self):
+        cases = {
+            (1.0, 0.0): "右",
+            (1.0, 1.0): "右下",
+            (0.0, 1.0): "下",
+            (-1.0, 1.0): "左下",
+            (-1.0, 0.0): "左",
+            (-1.0, -1.0): "左上",
+            (0.0, -1.0): "上",
+            (1.0, -1.0): "右上",
+        }
+        for (x, y), want in cases.items():
+            self.assertEqual(ana.tilt_direction(x, y), want, "向量 (%.1f, %.1f)" % (x, y))
+
+    def test_flat_returns_none(self):
+        self.assertIsNone(ana.tilt_direction(0.0, 0.0))
+        self.assertIsNone(ana.tilt_direction(0.1, 0.1))   # 阈值 0.25 以内算放平
+
+
+class TestDecimate(unittest.TestCase):
+    def test_caps_length(self):
+        seq = list(range(1000))
+        out = srv.decimate(seq, 240)
+        self.assertEqual(len(out), 240)
+        self.assertEqual(out[0], 0)
+
+    def test_short_sequence_passthrough(self):
+        seq = [1, 2, 3]
+        self.assertEqual(srv.decimate(seq, 240), [1, 2, 3])
+
+
+class TestQueryParam(unittest.TestCase):
+    def test_plain(self):
+        self.assertEqual(srv.query_param("a=1&b=2", "b"), "2")
+
+    def test_percent_encoded_utf8(self):
+        """前端用 encodeURIComponent，中文会变成 %E7%AC%AC…；必须按 UTF-8 还原。"""
+        self.assertEqual(srv.query_param("device=%E7%AC%AC%E4%B8%89%E7%BB%84-07", "device"),
+                         "第三组-07")
+
+    def test_plus_is_not_space(self):
+        # 用 unquote 而不是 unquote_plus：裸 '+' 要原样保留（设备名里可能有）
+        self.assertEqual(srv.query_param("device=a+b", "device"), "a+b")
+
+    def test_missing_returns_none(self):
+        self.assertIsNone(srv.query_param("a=1", "device"))
+        self.assertIsNone(srv.query_param("", "device"))
+
+
+class TestSanitizeParams(unittest.TestCase):
+    """外部输入一律不信：服务端夹一道，板端还会再夹一道。"""
+
+    def test_led_blink_clamped(self):
+        p = srv.sanitize_params("led_blink", {"n": 999, "on_ms": 1, "off_ms": 99999})
+        self.assertEqual(p["n"], srv.LED_MAX_BLINKS)
+        self.assertEqual(p["on_ms"], 20)
+        self.assertEqual(p["off_ms"], 5000)
+
+    def test_led_blink_pattern_whitelist(self):
+        self.assertEqual(srv.sanitize_params("led_blink", {"pattern": "alert"})["pattern"], "alert")
+        self.assertNotIn("pattern", srv.sanitize_params("led_blink", {"pattern": "rm -rf"}))
+
+    def test_set_orient_clamped(self):
+        self.assertEqual(srv.sanitize_params("set_orient", {"o": 99})["o"], 15)
+        self.assertEqual(srv.sanitize_params("set_orient", {"o": -3})["o"], 0)
+
+    def test_sd_rm_rejects_paths(self):
+        for bad in ("../x", "a/b", "a\\b", ""):
+            self.assertEqual(srv.sanitize_params("sd_rm", {"name": bad}), {}, "输入 %r" % bad)
+        self.assertEqual(srv.sanitize_params("sd_rm", {"name": "a.jpg"})["name"], "a.jpg")
+
+    def test_set_config_drops_empty_strings(self):
+        """空串必须丢掉：板端把"没传"当"不改"，传空串反而会被当成"清空"。"""
+        p = srv.sanitize_params("set_config", {"ssid": "   ", "url": "http://x", "period_ms": 10})
+        self.assertNotIn("ssid", p)
+        self.assertEqual(p["url"], "http://x")
+        self.assertEqual(p["period_ms"], 100)     # 下限 100（2026-10-30 从 50 提高）
+
+    def test_period_bounds(self):
+        """上报周期下限 100 ms 是硬约束，不是随手写的数字。
+
+        2026-10-30 从 50 提到 100：50 ms = 20 Hz 时每批只剩 5 个样本，
+        32 块板同时上报会把服务端的连接数打爆（TIME_WAIT 堆到几万）。
+        这条测试同时钉住上下界，避免有人"顺手"把下限调回去。
+        """
+        lo = srv.sanitize_params("set_config", {"period_ms": 0})["period_ms"]
+        hi = srv.sanitize_params("set_config", {"period_ms": 999999})["period_ms"]
+        self.assertEqual(lo, 100)
+        self.assertEqual(hi, 2000)
+
+    def test_cam_stream_fps_optional(self):
+        self.assertNotIn("fps", srv.sanitize_params("cam_stream", {"on": True}))
+        self.assertEqual(srv.sanitize_params("cam_stream", {"on": True, "fps": 99})["fps"],
+                         srv.CAM_STREAM_FPS_MAX)
+
+    def test_non_dict_params(self):
+        self.assertEqual(srv.sanitize_params("led_blink", None)["n"], 3)
+        self.assertEqual(srv.sanitize_params("led_blink", "junk")["n"], 3)
+
+
+class TestParseIntent(unittest.TestCase):
+    """自然语言 → 已有指令。规则是"宁可漏判、不可错判"。"""
+
+    def test_photo(self):
+        name, params, _ = srv.parse_intent("拍张照")
+        self.assertEqual(name, "cam_capture")
+
+    def test_dangerous_refused(self):
+        # 注意：匹配的是 NL_DANGEROUS 里写死的词组。口语化的「把卡格了」不在词表里
+        # （会落到大模型路径，只回话、不下发指令，所以没有执行风险，只是没被"指路"）。
+        for text in ("格式化一下卡", "格卡", "清空卡", "重启板子", "改一下 wifi 密码"):
+            got = srv.parse_intent(text)
+            self.assertIsNotNone(got, "应当识别为危险动作而不是放过去：%s" % text)
+            self.assertEqual(got[0], "__refuse__", text)
+
+    def test_stream_on_off(self):
+        self.assertEqual(srv.parse_intent("打开实时画面")[1], {"on": True})
+        self.assertEqual(srv.parse_intent("关掉实时画面")[1], {"on": False})
+
+    def test_led_blink_count(self):
+        name, params, _ = srv.parse_intent("闪三下")
+        self.assertEqual(name, "led_blink")
+        self.assertEqual(params["n"], 3)
+
+    def test_led_set(self):
+        self.assertEqual(srv.parse_intent("把灯关掉")[1], {"on": False})
+        self.assertEqual(srv.parse_intent("把灯点亮")[1], {"on": True})
+
+    def test_look_back_is_not_a_new_capture(self):
+        """「上次采集的数据」要走查询路径（保留旧时间），不能被当成新采集请求。"""
+        self.assertIsNone(srv.parse_intent("上次采集的数据是多少"))
+
+    def test_long_sentence_is_chat(self):
+        self.assertIsNone(srv.parse_intent("我" * (srv.NL_MAX_LEN + 1)))
+
+    def test_plain_question_is_none(self):
+        self.assertIsNone(srv.parse_intent("今天天气怎么样"))
+
+    def test_safe_commands_are_known(self):
+        """自然语言白名单里的名字必须都在 CMD_NAMES 里（否则永远下发不出去）。"""
+        for name in srv.NL_SAFE_COMMANDS:
+            self.assertIn(name, srv.CMD_NAMES, name)
+
+
+class TestSignalHelpers(unittest.TestCase):
+    def test_count_steps_finds_peaks(self):
+        """1 Hz 的正弦起伏，8 秒里应当数出约 8 步（局部极大值 + 0.3s 不应期）。
+
+        注意不能用方波：`count_steps` 找的是**严格局部极大值**（`m < 前` 或 `m < 后`
+        就跳过），平台期一个峰都数不出来 —— 这是刻意的，否则持续高幅运动会
+        被每个采样点都数成一步。
+        """
+        win, mags = [], []
+        for i in range(800):
+            t = i * 0.01
+            mag = 1.0 + 0.5 * math.sin(2 * math.pi * 1.0 * t)
+            win.append((t, 0.0, 0.0, mag))
+            mags.append(mag)
+        steps = ana.count_steps(win, mags, 1.0)      # 均值按 1.0 给，阈值 = 1.25
+        self.assertGreaterEqual(steps, 7)
+        self.assertLessEqual(steps, 9)
+
+    def test_count_steps_flat_is_zero(self):
+        win = [(i * 0.01, 0.0, 0.0, 1.0) for i in range(100)]
+        self.assertEqual(ana.count_steps(win, [1.0] * 100, 1.0), 0)
+
+    def test_freefall_run(self):
+        # FREEFALL_MIN_S(0.05) / dt(0.01) = 5 个样本才算数 —— 短于这个就是噪声
+        mags = [1.0, 0.2, 0.1, 0.15, 0.2, 0.1, 0.12, 1.0]     # 中间连续 6 个 < 0.35
+        self.assertEqual(ana.max_freefall_run(mags, 0.01), 6)
+        self.assertEqual(ana.max_freefall_run([1.0] * 10, 0.01), 0)
+        # 只有 3 个失重样本 → 不够长，判 0
+        self.assertEqual(ana.max_freefall_run([1.0, 0.2, 0.1, 0.15, 1.0], 0.01), 0)
+
+    def test_zero_cross_rate_frequency(self):
+        """5 Hz 的正弦，零穿越率应当算回 ~5 Hz。"""
+        dt = 0.01
+        mags = [1.0 + 0.5 * math.sin(2 * math.pi * 5.0 * i * dt) for i in range(200)]
+        zcr = ana.zero_cross_rate(mags, dt)
+        self.assertAlmostEqual(zcr, 5.0, delta=1.0)
+
+
+class TestAnalyze(unittest.TestCase):
+    def _fresh(self):
+        return srv.Device("unit-test")
+
+    def test_still_board_reports_level(self):
+        dev = self._fresh()
+        now = 1000.0
+        pts = [(0.0, 0.0, 1.0)] * 50
+        activity, _events = ana.analyze(dev, now, pts, 0.01)
+        self.assertIn("静置", activity)
+
+    def test_freefall_detected(self):
+        dev = self._fresh()
+        now = 2000.0
+        ana.analyze(dev, now - 0.5, [(0.0, 0.0, 1.0)] * 50, 0.01)
+        activity, events = ana.analyze(dev, now, [(0.0, 0.0, 0.05)] * 20, 0.01)
+        self.assertIn("跌落", activity)
+        self.assertTrue(any(k == "fall" for k, _ in events))
+
+    def test_samples_window_bounded(self):
+        dev = self._fresh()
+        for i in range(300):
+            ana.analyze(dev, 3000.0 + i * 0.01, [(0.0, 0.0, 1.0)] * 10, 0.01)
+        self.assertLessEqual(len(dev.samples), srv.MAX_WINDOW)
+
+
+class TestDeviceNameEncodingContract(unittest.TestCase):
+    """**跨端契约**：固件把设备名 percent-encode 后拼进 URL，服务端必须解回同一个 key。
+
+    这条钉的是 `device/main/transport.c` 的 `url_encode()` 与服务端 `query_param()`
+    必须互逆。任一侧改了规则（把空格当 '+'、改成不解码、或忘了转义就直接拼），
+    这里先红 —— 而不是等真机上"实时画面恒 404、同一块板裂成两台"再查半天。
+
+    背景（2026-10-30）：设备名是**用户在配网页手填**的，README 推荐的写法就是
+    「第三组-07」。裸 UTF-8 拼进请求行后，Python 的 http.server 按 latin-1 解，
+    于是同一块板在服务端变成 `ç¬¬ä¸ç»„-07` 这第二台设备。
+    """
+
+    RAW = "第三组-07"
+
+    @staticmethod
+    def _firmware_encode(text):
+        """与 transport.c 的 url_encode() 同一规则（RFC 3986 unreserved 之外 %XX）。"""
+        import urllib.parse
+        return urllib.parse.quote(text, safe="-_.~")
+
+    def test_encoded_round_trips_to_same_key(self):
+        enc = self._firmware_encode(self.RAW)
+        self.assertNotIn(self.RAW, enc)                      # 确实被编码了（全 ASCII）
+        enc.encode("ascii")                                  # 编码后必须是纯 ASCII
+        got = srv.clean_device_id(srv.query_param("device=" + enc, "device"))
+        self.assertEqual(got, srv.clean_device_id(self.RAW))
+
+    def test_raw_utf8_would_split_the_device(self):
+        """反证：不做编码时服务端拿到的是乱码 key —— 这就是 bug 本身。"""
+        mojibake = self.RAW.encode("utf-8").decode("latin-1")   # http.server 的解码方式
+        self.assertNotEqual(srv.clean_device_id(mojibake), srv.clean_device_id(self.RAW))
+
+    def test_ascii_name_is_stable(self):
+        """ASCII 设备名编码前后必须一致（单板调试用的 rw1-XXXX 不能被改坏）。"""
+        self.assertEqual(self._firmware_encode("rw1-07"), "rw1-07")
+
+
+@unittest.skipUnless(
+    hasattr(srv, "VALID_G_MAX"),
+    "非有限输入过滤尚未合入（见 feature/p0-hardening）；合入后本组自动生效")
+class TestNonFiniteInputs(unittest.TestCase):
+    """`NaN` / `Infinity` 必须被挡在入口，绝不能进到分析里。
+
+    背景（2026-10-30 复现）：`json.loads` 默认接受 `NaN` / `Infinity` 这两个
+    **非法 JSON 字面量**，`float()` 也照收。于是 `{"batch":[[NaN,NaN,NaN]]}`
+    （30 字节、无需鉴权）会：
+
+      1. 在 `analyze()` → `tilt_direction()` 的 `int(nan)` 抛 ValueError，
+         而且抛在响应头之前 —— 客户端只看到**连接被掐断**，不是 500；
+      2. NaN 已经进了 `dev.samples`，**接下来 8 秒每一帧正常数据**都在同一个
+         `int(nan)` 上再抛一次（窗口里还留着它）；
+      3. `/api/latest` 再把 NaN 序列化出去，浏览器 `JSON.parse` 抛错 → 整页停更。
+
+    固件侧早就有等价的一道（`transport.c` 的 `sanitize3`：任一轴越界整帧丢弃、
+    绝不填 0），服务端一直漏着。本组用例钉住"入口过滤"这个不变量。
+    """
+
+    def test_nan_batch_is_rejected(self):
+        pts = srv.Handler._parse_points({"batch": [[float("nan"), 0.0, 0.0]]})
+        self.assertEqual(pts, [])
+
+    def test_infinity_batch_is_rejected(self):
+        for bad in (float("inf"), float("-inf")):
+            pts = srv.Handler._parse_points({"batch": [[bad, 0.0, 1.0]]})
+            self.assertEqual(pts, [], "值 %r 应当被丢弃" % bad)
+
+    def test_out_of_range_is_rejected(self):
+        """1e300 会让网页曲线纵轴直接压成一条线，按坏帧丢弃。"""
+        self.assertEqual(srv.Handler._parse_points({"batch": [[1e300, 0.0, 0.0]]}), [])
+
+    def test_good_points_survive(self):
+        pts = srv.Handler._parse_points({"batch": [[0.1, -0.2, 0.98], [0.0, 0.0, 1.0]]})
+        self.assertEqual(len(pts), 2)
+        for p in pts:
+            self.assertTrue(all(math.isfinite(v) for v in p))
+
+    def test_clamp_int_rejects_non_finite(self):
+        """`int(float("inf"))` 抛 OverflowError，不在原来的 except 里 → 500 + traceback。"""
+        self.assertEqual(srv.clamp_int("inf", 1, 12, 3), 3)
+        self.assertEqual(srv.clamp_int("nan", 1, 12, 3), 3)
+        self.assertEqual(srv.clamp_int(float("inf"), 0, 15, 0), 0)
+        self.assertEqual(srv.clamp_int("7", 1, 12, 3), 7)      # 正常值不受影响
+
+
+class TestDashboardPage(unittest.TestCase):
+    """仪表盘页面从 `server/web/index.html` 读，不再内嵌在 Python 字符串里。
+
+    2026-10-30 拆出来的：2952 行 HTML/CSS/JS 住在三引号字符串里没有语法高亮、
+    没有 ESLint，还逼出"页面里禁止出现反斜杠"这条古怪规矩（`\\n` 会被 Python
+    先吃成真换行），改完样式还得重启服务端。
+
+    这两条钉住"文件是唯一来源"：谁要是把 HTML 又塞回 Python 字符串，
+    `test_file_is_the_source_of_truth` 立刻红。
+    """
+
+    def test_file_is_the_source_of_truth(self):
+        path = os.path.join(os.path.dirname(_SERVER_PY), "web", "index.html")
+        self.assertTrue(os.path.isfile(path), "缺 %s" % path)
+        with open(path, encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), srv.dashboard_html())
+
+    def test_page_looks_like_the_dashboard(self):
+        html = srv.dashboard_html()
+        self.assertIn("<!doctype html>", html)
+        self.assertIn('id="board3d"', html)          # 3D 姿态那块画布
+        self.assertIn("EventSource", html)           # SSE 客户端
+        self.assertGreater(len(html), 100000)
+
+    def test_missing_file_reports_readably(self):
+        """文件丢了要给人一句能读的话，而不是抛异常让页面白屏。"""
+        import tempfile
+        old = srv._WEB_DIR
+        srv._WEB_DIR = os.path.join(tempfile.gettempdir(), "rw1-no-such-web-dir")
+        try:
+            html = srv.dashboard_html()
+        finally:
+            srv._WEB_DIR = old
+        self.assertIn("仪表盘文件缺失", html)
+
+
+class TestModuleSplit(unittest.TestCase):
+    """钉住 2026-11-01 的拆分边界（analysis / jsonl_log 搬出 server.py）。
+
+    为什么值得有这几条：拆分的**全部价值**在于"这两个模块不依赖服务端"。
+    一旦有人图省事在里面写 `from server import LOCK` 或把逻辑抄回 server.py，
+    文件又会慢慢长回原样，而所有功能测试**照样全绿** —— 只有这类结构性断言能拦住。
+    """
+
+    def test_analysis_is_the_same_object_server_uses(self):
+        """server.analyze 必须**就是** analysis.analyze，不是复制的一份。"""
+        self.assertIs(srv.analyze, ana.analyze)
+        self.assertIs(srv.tilt_direction, ana.tilt_direction)
+        self.assertEqual(os.path.abspath(ana.__file__),
+                         os.path.join(os.path.dirname(_HERE), "server", "analysis.py"))
+
+    def test_analysis_holds_no_server_state(self):
+        """analysis 里不该出现任何服务端全局状态 —— 它必须能单独 import。"""
+        for name in ("LOCK", "DEVICES", "LOGGER", "SHOTS_DIR", "AUDIO_DIR",
+                     "FRAMES", "API_TOKEN", "Handler", "Device"):
+            self.assertFalse(hasattr(ana, name),
+                             "analysis 里出现了服务端状态 %s —— 它就不再是叶子模块了" % name)
+
+    def test_analysis_does_not_import_server(self):
+        """源码层面也不许反向 import（那会变成循环依赖，按路径加载时直接炸）。"""
+        src = open(ana.__file__, encoding="utf-8").read()
+        for bad in ("import server", "from server import"):
+            self.assertNotIn(bad, src, "analysis.py 反向 import 了服务端")
+
+    def test_jsonl_logger_is_self_contained(self):
+        """JsonlLogger 同样不许碰服务端状态（它的依赖数本来就是 0）。"""
+        import jsonl_log
+        self.assertIs(srv.JsonlLogger, jsonl_log.JsonlLogger)
+        for name in ("LOCK", "DEVICES", "LOGGER", "Handler"):
+            self.assertFalse(hasattr(jsonl_log, name))
+
+    def test_thresholds_live_in_analysis_only(self):
+        """阈值只能有一份。server.py 里再定义一次 = 两份慢慢走偏。"""
+        for name in ("STEP_MIN_G", "STEP_REFRACTORY_S", "MOTION_STD", "SHAKE_ZCR",
+                     "WALK_ZCR_MIN", "SHAKE_MIN_GAP_S", "FREEFALL_G", "FREEFALL_MIN_S"):
+            self.assertFalse(hasattr(srv, name), "server.py 里又定义了 %s" % name)
+            self.assertTrue(hasattr(ana, name), "analysis.py 里缺 %s" % name)
+
+
+class TestDiskEstimate(unittest.TestCase):
+    """落盘量估算（启动横幅和 README 的数字都来自这里）。
+
+    为什么值得测：这两个数老师会当真 —— 决定数据目录放 C 盘还是 U 盘。
+    2026-11-01 之前 README 写的是"约 15–20 MB/天"，实测一个班是 170 MB/天，
+    **差了十倍**，而且没人会发现（没有断言、也没有人真跑满一天）。
+    """
+
+    def _one_record(self):
+        """用真实的 JsonlLogger 写一条遥测，读回来量字节数。"""
+        import shutil
+        import tempfile
+        d = tempfile.mkdtemp()
+        try:
+            lg = jlog.JsonlLogger(d, retain_days=0)
+            # 模拟板端：2Hz 上报、每批 50 个 100Hz 样本、波形降到 10Hz
+            lg.telemetry(1000.0, "class-01", "SC7A20",
+                         [(0.123, 0.456, 0.987)] * 50, 0.01)
+            lg.close()
+            name = [f for f in os.listdir(d) if f.startswith("telemetry-")][0]
+            with open(os.path.join(d, name), "rb") as fh:
+                return fh.read().splitlines()[0]
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_record_size_anchor_matches_reality(self):
+        """锚点必须和真实记录对得上 —— 改了 telemetry() 的字段要一起改锚点。"""
+        line = self._one_record()
+        self.assertLess(abs(len(line) - jlog.RECORD_BYTES_AT_10HZ), 30,
+                        "遥测记录 %d B，与锚点 %d B 差太多；改了记录格式就同步改 "
+                        "RECORD_BYTES_AT_10HZ / PER_BOARD_MB_PER_HOUR_AT_10HZ"
+                        % (len(line), jlog.RECORD_BYTES_AT_10HZ))
+
+    def test_record_has_the_documented_fields(self):
+        """记录里该有的字段一个都不能少（少了就是回放工具读不出来）。"""
+        import json
+        rec = json.loads(self._one_record().decode("utf-8"))
+        for k in ("k", "ts", "dev", "src", "hz", "s"):
+            self.assertIn(k, rec, "遥测记录缺字段 %s" % k)
+        self.assertEqual(rec["k"], "t")
+        self.assertEqual(len(rec["s"]), 5, "50 个样本降到 10Hz 应当是 5 个")
+
+    def test_class_day_is_hundreds_of_megabytes(self):
+        """一个班 8 小时是**百 MB 量级** —— 这条钉的就是 README 曾经写错的那个数。"""
+        mb = jlog.estimate_mb(20, 8, 10.0)
+        self.assertGreater(mb, 100, "20 板 8 小时只有 %.0f MB？和实测 170 MB 差太远" % mb)
+        self.assertLess(mb, 300, "20 板 8 小时涨到 %.0f MB？先确认是不是记录变胖了" % mb)
+
+    def test_estimate_scales_with_hz_and_boards(self):
+        base = jlog.estimate_mb(20, 8, 10.0)
+        self.assertAlmostEqual(jlog.estimate_mb(20, 8, 20.0), base * 2, places=6)
+        self.assertAlmostEqual(jlog.estimate_mb(10, 8, 10.0), base / 2, places=6)
+        self.assertAlmostEqual(jlog.estimate_mb(20, 16, 10.0), base * 2, places=6)
+
+    def test_events_only_is_much_smaller(self):
+        full = jlog.estimate_mb(20, 8, 10.0)
+        only_ev = jlog.estimate_mb(20, 8, 10.0, log_telemetry=False)
+        self.assertLess(only_ev, full * 0.2, "只落事件应当远小于带波形")
+
+class TestRateWindow(unittest.TestCase):
+    """滑动窗口限流器（录音全局预算用的就是它）。
+
+    这类代码的坑都在**边界**上：窗口滑动的一瞬间、恰好到顶、被拒的请求要不要
+    占额度。所以逐个钉住，而不是只测"大概能用"。
+    """
+
+    def test_allows_up_to_n(self):
+        w = srv.RateWindow(3, 60.0)
+        self.assertEqual([w.allow(100.0 + i) for i in range(4)],
+                         [True, True, True, False])
+
+    def test_rejected_requests_do_not_consume_budget(self):
+        """被拒的不占额度 —— 否则"连发 100 次"会把窗口填满，后来的正常请求一起死。"""
+        w = srv.RateWindow(2, 60.0)
+        self.assertTrue(w.allow(100.0))
+        self.assertTrue(w.allow(101.0))
+        for i in range(20):
+            self.assertFalse(w.allow(102.0 + i * 0.1))
+        # 窗口滑过之后，仍然只放行 2 次（被拒的 20 次没有积攒额度）
+        self.assertTrue(w.allow(161.0))
+        self.assertTrue(w.allow(162.0))
+        self.assertFalse(w.allow(163.0))
+
+    def test_window_slides(self):
+        w = srv.RateWindow(1, 10.0)
+        self.assertTrue(w.allow(0.0))
+        self.assertFalse(w.allow(9.9))     # 还在窗口里
+        self.assertTrue(w.allow(10.1))     # 滑出去了
+
+    def test_boundary_is_strictly_greater(self):
+        """正好等于窗口宽度时**仍算在窗口内**（用 `>` 而不是 `>=`），
+        这样"每 60 秒一次"的配置不会因为浮点抖动多放过一次。"""
+        w = srv.RateWindow(1, 10.0)
+        self.assertTrue(w.allow(0.0))
+        self.assertFalse(w.allow(10.0))
+        self.assertTrue(w.allow(10.0000001))
+
+    def test_reset(self):
+        w = srv.RateWindow(1, 60.0)
+        self.assertTrue(w.allow(1.0))
+        self.assertFalse(w.allow(2.0))
+        w.reset()
+        self.assertTrue(w.allow(3.0))
+
+    def test_n_and_window_are_sane(self):
+        """n < 1 会被夹到 1（否则配置成 0 就永远拒绝，看着像"服务坏了"）。"""
+        self.assertEqual(srv.RateWindow(0, 60).n, 1)
+        self.assertEqual(srv.RateWindow(-5, 60).n, 1)
+
+
+class TestAudioLastBound(unittest.TestCase):
+    """`AUDIO_LAST` 这张表必须**自己**有界。
+
+    键是 `?device=` 这个外部输入，"设备就那么几块"不是保证。历史实现写的是
+    "长度超 256 才清一遍、且只清 60 秒前的"—— 一串新设备名在 60 秒内轮流上场时，
+    一条都清不掉，表跟着名字数量涨（实测 40 秒 2000 个名字 → 2000 条）。
+
+    这里复刻的是 `/api/audio` 里那段清理逻辑（HTTP 层跑不到单测），
+    所以**改那边必须同步改这里**；两边一起错的话，下面的 `test_prune_keeps_recent`
+    会因为"按时间清"这条硬约束红掉。
+    """
+
+    @staticmethod
+    def _prune(aud, now, max_n=None):
+        max_n = srv.AUDIO_LAST_MAX if max_n is None else max_n
+        if len(aud) > max_n:
+            for k in [k for k, t in aud.items() if now - t > 60.0]:
+                aud.pop(k, None)
+        if len(aud) > max_n:
+            for k in sorted(aud, key=aud.get)[:len(aud) - max_n]:
+                aud.pop(k, None)
+
+    def test_bound_holds_under_name_flood(self):
+        """2000 个不同名字轮流来，表不许涨过上限。
+
+        （旧逻辑下这条是红的：这些名字全在 60 秒内，过期清理一条也删不掉。）
+        """
+        aud, now = {}, 1000.0
+        for i in range(2000):
+            aud["dev-%d" % i] = now
+            self._prune(aud, now)
+            now += 0.02          # 40 秒内发完 2000 个名字
+        self.assertLessEqual(len(aud), srv.AUDIO_LAST_MAX,
+                             "表涨到 %d 条（上限 %d）" % (len(aud), srv.AUDIO_LAST_MAX))
+
+    def test_prune_keeps_recent(self):
+        """丢的是**最旧**的：留下的必须是最近记的那批，冷却判定才不会形同虚设。"""
+        aud = {"d%d" % i: 1000.0 + i for i in range(10)}
+        self._prune(aud, 1009.0, max_n=3)
+        self.assertEqual(sorted(aud), ["d7", "d8", "d9"])
+
+    def test_expired_entries_are_dropped_first(self):
+        """过期的先走 —— 不需要动用 LRU 就近 60 秒内的记录。"""
+        aud = {"old-1": 900.0, "old-2": 901.0,
+               "new-1": 1000.0, "new-2": 1001.0}
+        self._prune(aud, 1001.0, max_n=4)      # 长度 4 不超上限 → 什么都不做
+        self.assertEqual(len(aud), 4)
+        aud["new-3"] = 1001.5
+        self._prune(aud, 1001.5, max_n=4)      # 超了 → 两条过期的先走
+        self.assertEqual(sorted(aud), ["new-1", "new-2", "new-3"])
+
+    def test_normal_traffic_never_hits_the_bound(self):
+        """正常一分钟 120 段（全局预算上限）根本碰不到这个兜底。
+
+        这条用来防"把上限调得太小、把真板子的冷却悄悄关掉"。
+        """
+        self.assertGreater(srv.AUDIO_LAST_MAX, srv.AUDIO_MAX_PER_MIN * 2)
+
+
+class TestAudioSaveDirCap(unittest.TestCase):
+    """录音留档的**设备目录数**必须封顶（2026-11-02 修复）。
+
+    照片那条路（`_shot_save`）一直有 `SHOT_MAX_DEVICES`，录音这里漏着：
+    `/api/audio` 不需要密钥、设备名又是外部输入，全局预算挡得住钱、
+    挡不住"每段换一个新名字"—— 实测 70 个名字 → 70 个目录，按 512 KB/段
+    算就是每小时 GB 级的新目录。
+
+    与 `TestAudioLastBound` 不同，这里**直接调 Handler 方法**（不复制逻辑）：
+    `_audio_save` 只依赖 `AUDIO_DIR` 这个模块全局和它自己的静态 helper，
+    用临时目录顶替后就能在单测里跑到那条闸门。
+    """
+
+    class _Dev:
+        def __init__(self, did):
+            self.id = did
+
+    def setUp(self):
+        import tempfile
+        self._td = tempfile.TemporaryDirectory()
+        self._old = srv.AUDIO_DIR
+        srv.AUDIO_DIR = self._td.name
+
+    def tearDown(self):
+        srv.AUDIO_DIR = self._old
+        self._td.cleanup()
+
+    def _fill_to_cap(self):
+        for i in range(srv.AUDIO_MAX_DEVICES):
+            os.makedirs(os.path.join(self._td.name, "d%02d" % i))
+
+    def test_new_device_refused_at_cap(self):
+        """到顶之后，新设备名不再建目录（返回 None，识别与回复不受影响）。"""
+        self._fill_to_cap()
+        out = srv.Handler._audio_save(srv.Handler, self._Dev("fresh-name"), b"\x01\x02" * 64)
+        self.assertIsNone(out)
+        self.assertFalse(os.path.exists(os.path.join(self._td.name, "fresh-name")))
+
+    def test_known_device_still_saved_at_cap(self):
+        """到顶之后，已经在册的设备照常写 —— 闸门挡的是"新名字"，不是老用户。"""
+        self._fill_to_cap()
+        out = srv.Handler._audio_save(srv.Handler, self._Dev("d00"), b"\x01\x02" * 64)
+        self.assertTrue(out, "在册设备应当照常留档")
+        wavs = [f for f in os.listdir(os.path.join(self._td.name, "d00"))
+                if f.endswith(".wav")]
+        self.assertEqual(len(wavs), 1)
+
+    def test_below_cap_saves_normally(self):
+        """没到顶时行为与修复前一字不差（第一个目录照建）。"""
+        out = srv.Handler._audio_save(srv.Handler, self._Dev("first"), b"\x01\x02" * 64)
+        self.assertTrue(out)
+        self.assertTrue(os.path.isdir(os.path.join(self._td.name, "first")))
+
+
+class TestRuleAiReplyEventKind(unittest.TestCase):
+    """配了大模型但调用失败、回退规则 AI 时，回复事件的类型必须是 info。
+
+    2026-11-02 修复：原来记的是 warn —— 但 warn 该留给真告警（识别失败 /
+    大模型调用失败），一条**正常送达的回复**记成 warn，事件流里全是不存在的
+    警告。顺带的实情：前端 CSS 只有 .k-info 没有 .k-warn，warn 事件的
+    圆点一直是无色的。
+
+    直调 `_llm_worker`（它是普通函数，不在 HTTP 层也能跑）：不配 LLM key
+    时 ask_llm 返回 None，正好就是"调用失败回退规则 AI"的那条路径。
+    """
+
+    def test_fallback_reply_records_info_not_warn(self):
+        old = os.environ.pop("RW1_LLM_API_KEY", None)   # 强制走"无 key"分支
+        try:
+            dev = srv.Device("unit-ruleai")
+            srv._llm_worker(dev, "现在怎么样？", dev.st["ai_cancel"])
+        finally:
+            if old is not None:
+                os.environ["RW1_LLM_API_KEY"] = old
+        kinds = [e["kind"] for e in dev.events]
+        self.assertIn("info", kinds, "实际事件类型: %s" % kinds)
+        self.assertNotIn("warn", kinds, "规则 AI 的正常回复不该记成 warn: %s" % kinds)
+        text = next(e["text"] for e in dev.events if e["kind"] == "info")
+        self.assertIn("规则AI回复", text, "实际: %s" % text)
+
+
+class TestLlmExtractText(unittest.TestCase):
+    """OpenAI 兼容响应的取正文：标准结构之外的变体要能容忍。
+
+    实测（2026-11-03，qwen3.8-27b @ new-api 网关）：标准 choices[0].message.content，
+    另带 reasoning_content（思考草稿，**不许**冒充正文）。
+    """
+
+    def test_standard_message_content(self):
+        data = {"choices": [{"message": {"role": "assistant", "content": "\n\n2"},
+                               "finish_reason": "stop"}]}
+        self.assertEqual(srv._llm_extract_text(data), "2")
+
+    def test_reasoning_content_is_not_used_as_answer(self):
+        """content 为空时宁缺毋滥：reasoning_content 是草稿，不是给用户看的。"""
+        data = {"choices": [{"message": {"role": "assistant", "content": "",
+                                         "reasoning_content": "想了一堆"}}]}
+        self.assertIsNone(srv._llm_extract_text(data))
+
+    def test_legacy_text_variant(self):
+        data = {"choices": [{"text": " 答案 "}]}
+        self.assertEqual(srv._llm_extract_text(data), "答案")
+
+    def test_top_level_variants(self):
+        for key in ("content", "reply", "text", "output", "answer"):
+            self.assertEqual(srv._llm_extract_text({key: " hi "}), "hi", key)
+
+    def test_garbage_returns_none(self):
+        for bad in ({}, {"choices": []}, {"choices": [{}]}, "not a dict",
+                    {"choices": [{"message": {}}]}, None):
+            self.assertIsNone(srv._llm_extract_text(bad), repr(bad))
+
+
+class TestLlmErrorText(unittest.TestCase):
+    """失败原因必须翻成可读的一句中文（且不泄露密钥）。"""
+
+    def _http_error(self, code):
+        return urllib.error.HTTPError("http://x", code, "x", {}, io.BytesIO(b""))
+
+    def test_http_categories(self):
+        self.assertIn("401", srv._llm_error_text(self._http_error(401)))
+        self.assertIn("403", srv._llm_error_text(self._http_error(403)))
+        self.assertIn("404", srv._llm_error_text(self._http_error(404)))
+        self.assertIn("429", srv._llm_error_text(self._http_error(429)))
+        self.assertIn("503", srv._llm_error_text(self._http_error(503)))
+
+    def test_timeout_and_dns(self):
+        self.assertEqual(srv._llm_error_text(TimeoutError()), "请求超时")
+        e = OSError("[Errno 11001] getaddrinfo failed")
+        self.assertEqual(srv._llm_error_text(e), "DNS 解析失败")
+
+    def test_connection_falls_back(self):
+        self.assertEqual(srv._llm_error_text(ConnectionResetError()), "连接失败")
+
+
+class TestDotenvAndRetry(unittest.TestCase):
+    """.env 加载纪律 + ask_llm 的重试与降级。"""
+
+    def test_dotenv_only_fills_missing_rw1(self):
+        import tempfile
+        d = tempfile.mkdtemp()
+        env_path = os.path.join(d, ".env")
+        with open(env_path, "w", encoding="utf-8") as fh:
+            fh.write("RW1_TEST_ABC=from_env\nOTHER_X=no\nRW1_TEST_ABC2= \"q\" \n# 注释\n")
+        old_loaded = srv._DOTENV_LOADED
+        srv._DOTENV_LOADED = False
+        try:
+            os.environ.pop("RW1_TEST_ABC", None)
+            os.environ.pop("RW1_TEST_ABC2", None)
+            with unittest.mock.patch.object(srv.os.path, "join",
+                                            return_value=env_path):
+                srv._load_dotenv()
+            self.assertEqual(os.environ.get("RW1_TEST_ABC"), "from_env")
+            self.assertEqual(os.environ.get("RW1_TEST_ABC2"), "q")
+            self.assertNotIn("OTHER_X", os.environ)
+            # 已存在的值不被覆盖
+            os.environ["RW1_TEST_ABC"] = "keep"
+            srv._DOTENV_LOADED = False
+            with unittest.mock.patch.object(srv.os.path, "join",
+                                            return_value=env_path):
+                srv._load_dotenv()
+            self.assertEqual(os.environ["RW1_TEST_ABC"], "keep")
+        finally:
+            srv._DOTENV_LOADED = old_loaded
+            os.environ.pop("RW1_TEST_ABC", None)
+            os.environ.pop("RW1_TEST_ABC2", None)
+
+    def test_retry_then_success(self):
+        """前两次失败（连接层瞬时故障）、第三次成功 → 必须返回正文。"""
+        calls = {"n": 0}
+
+        class FakeResp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                return b'{"choices":[{"message":{"content":" ok "}}]}'
+
+        def fake_urlopen(req, timeout=None):
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise ConnectionResetError("flaky")
+            return FakeResp()
+
+        envs = {"RW1_LLM_API_KEY": "k", "RW1_LLM_BASE_URL": "http://x",
+                "RW1_LLM_MODEL": "m", "RW1_LLM_RETRIES": "2"}
+        with unittest.mock.patch.dict(os.environ, envs), \
+             unittest.mock.patch.object(srv.urllib.request, "urlopen", fake_urlopen), \
+             unittest.mock.patch.object(srv.time, "sleep", lambda s: None):
+            srv._DOTENV_LOADED = True          # 别让真 .env 干扰这条用例
+            dev = srv.Device("unit-retry")
+            out = srv.ask_llm(dev, "问")
+        self.assertEqual(out, "ok")
+        self.assertEqual(calls["n"], 3)
+
+    def test_http401_no_retry_and_readable_warn(self):
+        """401 是配置错误：不许重试，事件流要给可读原因。"""
+        calls = {"n": 0}
+
+        def fake_urlopen(req, timeout=None):
+            calls["n"] += 1
+            raise urllib.error.HTTPError("http://x", 401, "x", {}, io.BytesIO(b""))
+
+        envs = {"RW1_LLM_API_KEY": "bad", "RW1_LLM_BASE_URL": "http://x",
+                "RW1_LLM_MODEL": "m", "RW1_LLM_RETRIES": "2"}
+        with unittest.mock.patch.dict(os.environ, envs), \
+             unittest.mock.patch.object(srv.urllib.request, "urlopen", fake_urlopen), \
+             unittest.mock.patch.object(srv.time, "sleep", lambda s: None):
+            srv._DOTENV_LOADED = True
+            dev = srv.Device("unit-401")
+            out = srv.ask_llm(dev, "问")
+        self.assertIsNone(out)
+        self.assertEqual(calls["n"], 1, "401 重试了 %d 次" % (calls["n"] - 1))
+        warns = [e["text"] for e in dev.events if e["kind"] == "warn"]
+        self.assertTrue(any("401" in w and "本地AI" in w for w in warns),
+                        "实际事件: %s" % warns)
+
+    def test_http429_is_retried(self):
+        calls = {"n": 0}
+
+        def fake_urlopen(req, timeout=None):
+            calls["n"] += 1
+            raise urllib.error.HTTPError("http://x", 429, "x", {}, io.BytesIO(b""))
+
+        envs = {"RW1_LLM_API_KEY": "k", "RW1_LLM_BASE_URL": "http://x",
+                "RW1_LLM_MODEL": "m", "RW1_LLM_RETRIES": "2"}
+        with unittest.mock.patch.dict(os.environ, envs), \
+             unittest.mock.patch.object(srv.urllib.request, "urlopen", fake_urlopen), \
+             unittest.mock.patch.object(srv.time, "sleep", lambda s: None):
+            srv._DOTENV_LOADED = True
+            dev = srv.Device("unit-429")
+            srv.ask_llm(dev, "问")
+        self.assertEqual(calls["n"], 3)
+
+    def test_board_timeout_param_reaches_urlopen(self):
+        """板端提问的收紧上限（LLM_BOARD_TIMEOUT / for_board=True）必须传到 urlopen，
+        超时时回退 None 并给出「请求超时」的可读原因。"""
+        seen = {"timeout": None}
+
+        def fake_urlopen(req, timeout=None):
+            seen["timeout"] = timeout
+            raise TimeoutError("timed out")
+
+        envs = {"RW1_LLM_API_KEY": "k", "RW1_LLM_BASE_URL": "http://x",
+                "RW1_LLM_MODEL": "m", "RW1_LLM_RETRIES": "0"}
+        with unittest.mock.patch.dict(os.environ, envs), \
+             unittest.mock.patch.object(srv.urllib.request, "urlopen", fake_urlopen):
+            srv._DOTENV_LOADED = True
+            dev = srv.Device("unit-bto")
+            out = srv.ask_llm(dev, "问", for_board=True)
+        self.assertIsNone(out)
+        self.assertEqual(seen["timeout"], srv.LLM_BOARD_TIMEOUT,
+                         "板端上限没传到 urlopen: %s" % seen["timeout"])
+        warns = [e["text"] for e in dev.events if e["kind"] == "warn"]
+        self.assertTrue(any("请求超时" in w for w in warns), "实际事件: %s" % warns)
+
+    def test_default_timeout_unchanged_without_param(self):
+        """不传 timeout/for_board 时仍用全局 LLM_TIMEOUT（网页提问路径）。"""
+        seen = {"timeout": None}
+
+        def fake_urlopen(req, timeout=None):
+            seen["timeout"] = timeout
+            raise TimeoutError("timed out")
+
+        envs = {"RW1_LLM_API_KEY": "k", "RW1_LLM_BASE_URL": "http://x",
+                "RW1_LLM_MODEL": "m", "RW1_LLM_RETRIES": "0"}
+        with unittest.mock.patch.dict(os.environ, envs), \
+             unittest.mock.patch.object(srv.urllib.request, "urlopen", fake_urlopen):
+            srv._DOTENV_LOADED = True
+            dev = srv.Device("unit-defto")
+            srv.ask_llm(dev, "问")
+        self.assertEqual(seen["timeout"], float(envs.get("RW1_LLM_TIMEOUT",
+                                                          srv.LLM_TIMEOUT)))
+
+
+class TestFileWhitelist(unittest.TestCase):
+    """文件管理名称/设备/扩展名白名单边界（纯函数）。"""
+
+    def test_file_safe_name_blocks_traversal_and_reserved(self):
+        for bad in ("", " ", ".", "..", "...", "../a.txt", "a/b.txt", "a\\b.txt",
+                    "a:stream", "nul", "CON.txt", "com1.log", "x\x00y.txt",
+                    "a\nb.txt", "x" * 97):
+            self.assertIsNone(srv.file_safe_name(bad), repr(bad))
+        self.assertEqual(srv.file_safe_name("遥测-01.jsonl"), "遥测-01.jsonl")
+
+    def test_file_device_dir_rejects_empty_and_dots(self):
+        for bad in ("", "   ", ".", ".."):
+            self.assertIsNone(srv.file_device_dir(bad), repr(bad))
+        self.assertEqual(srv.file_device_dir("第三组-07"), "第三组-07")
+
+    def test_file_ext_ok(self):
+        self.assertTrue(srv.file_ext_ok("shots", "A.JPG"))
+        self.assertTrue(srv.file_ext_ok("audio", "v.wav"))
+        self.assertTrue(srv.file_ext_ok("logs", "events.jsonl"))
+        self.assertFalse(srv.file_ext_ok("shots", "evil.exe"))
+        self.assertFalse(srv.file_ext_ok("logs", "photo.jpg"))
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

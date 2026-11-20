@@ -35,7 +35,7 @@ import os
 import re
 import sys
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -149,6 +149,36 @@ def circle(draw, cx, cy, r, fill=None, outline=None, width=1):
     draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=fill, outline=outline, width=width)
 
 
+def shadow(img, x, y, w, h, radius=8, blur=6, dy=4, alpha=70):
+    """LVGL 的 shadow_width / shadow_ofs_y 语义：在控件下方铺一团模糊的黑。
+
+    与 ui.c 的 add_elevation() 一一对应 —— 深色界面靠"更黑"分层，
+    不是靠把描边调亮。必须在画控件**之前**调（阴影垫在底下），
+    返回新的 ImageDraw（因为 alpha 合成换掉了像素缓冲）。
+    """
+    pad = blur * 2 + 4
+    lay = Image.new("RGBA", (w + pad * 2, h + pad * 2), (0, 0, 0, 0))
+    ImageDraw.Draw(lay).rounded_rectangle(
+        [pad, pad + dy, pad + w - 1, pad + h - 1 + dy],
+        radius=radius, fill=(0, 0, 0, alpha))
+    lay = lay.filter(ImageFilter.GaussianBlur(blur))
+    base = img.convert("RGBA")
+    base.alpha_composite(lay, (int(x) - pad, int(y) - pad))
+    img.paste(base.convert("RGB"), (0, 0))
+    return ImageDraw.Draw(img)
+
+
+def sheen(img, x, y, w, base, alpha=24):
+    """顶面 1px 内高光（对应 ui.c 的 add_sheen()）：一条很淡的白线。
+    `base` 是高光底下那层的颜色（卡顶 = 渐变上端 CARD_HI）——
+    预览画布是 RGB 的不吃 alpha，所以这里直接把混合结果算出来画上去。
+    只在深色底上看得见，和板端一样只给 AI 卡片这一处用。"""
+    c = tuple(int(v + (255 - v) * alpha / 255) for v in base)
+    d = ImageDraw.Draw(img)
+    d.line([(int(x) + 1, int(y)), (int(x) + int(w) - 2, int(y))], fill=c, width=1)
+    return d
+
+
 def arc(draw, cx, cy, r, start_deg, end_deg, color, width):
     """PIL 与 LVGL 的角度定义一致：0° 在 3 点钟方向，顺时针增大。"""
     draw.arc([cx - r, cy - r, cx + r, cy + r], start=start_deg, end=end_deg,
@@ -158,6 +188,23 @@ def arc(draw, cx, cy, r, start_deg, end_deg, color, width):
 def text(draw, x, y, w, h, s, font, color, align="left", line_gap=0):
     """在 (x,y,w,h) 的框里画文字；垂直居中，水平按 align。返回占用的行数。"""
     lines = s.split("\n")
+    if len(lines) == 1:
+        line = lines[0]
+        tw = draw.textlength(line, font=font)
+        if align == "center":
+            tx = x + (w - tw) / 2
+        elif align == "right":
+            tx = x + w - tw
+        else:
+            tx = x
+        try:
+            bb = draw.textbbox((0, 0), line, font=font)
+            ty = y + (h - (bb[3] - bb[1])) / 2 - bb[1]
+        except Exception:
+            ty = y + max(0, (h - font.size) // 2)
+        draw.text((tx, ty), line, font=font, fill=color)
+        return 1
+
     lh = font.size + line_gap
     total = lh * len(lines)
     ty = y + max(0, (h - total) // 2)
@@ -318,15 +365,19 @@ class Renderer:
 
         # ---------------- 左面板：活动环 ----------------
         px, py = e["UI_PANEL_LX"], e["UI_PANEL_Y"]
+        # 阴影先垫底（对应板端 add_elevation），再画面板本体
+        d = shadow(img, px, py, e["UI_PANEL_W"], e["UI_PANEL_H"], radius=e["UI_PANEL_R"])
         # 边框随活动色微染（板端 border_opa=80/255 ≈ 31% 活动色与 LINE 混合）
         edge = tuple(int(C["LINE"][i] + (act_c[i] - C["LINE"][i]) * 80 / 255) for i in range(3))
         box(d, px, py, e["UI_PANEL_W"], e["UI_PANEL_H"], fill=C["CARD"],
-            outline=edge, radius=16)
+            outline=edge, radius=e["UI_PANEL_R"])
 
         if kind == 5:      # 跌落：环外呼吸红光（预览图取呼吸中段的不透明度）
-            gd = e["UI_RING_D"] + 14
+            # 与 ui.c 的 build_activity_panel() 保持同一套算法：
+            # 直径 = RING_D+4、y = RING_Y-2（贴着面板内沿，不被裁）
+            gd = e["UI_RING_D"] + 4
             gx = px + (e["UI_PANEL_W"] - gd) // 2
-            gy = py + e["UI_RING_Y"] - 7
+            gy = py + e["UI_RING_Y"] - 2
             ov = Image.new("RGBA", img.size, (0, 0, 0, 0))
             ImageDraw.Draw(ov).ellipse([gx, gy, gx + gd - 1, gy + gd - 1],
                                        outline=act_c + (150,), width=2)
@@ -359,8 +410,9 @@ class Renderer:
 
         # ---------------- 右面板：姿态球 ----------------
         px = e["UI_PANEL_RX"]
+        d = shadow(img, px, py, e["UI_PANEL_W"], e["UI_PANEL_H"], radius=e["UI_PANEL_R"])
         box(d, px, py, e["UI_PANEL_W"], e["UI_PANEL_H"], fill=C["CARD"],
-            outline=C["LINE"], radius=16)
+            outline=C["LINE"], radius=e["UI_PANEL_R"])
 
         bd = e["UI_BALL_D"]
         bx0 = px + (e["UI_PANEL_W"] - bd) // 2
@@ -376,7 +428,14 @@ class Renderer:
                fill=C["MARK"], width=1)
         d.line([(bcx - diag, bcy + diag), (bcx + diag, bcy - diag)],
                fill=C["MARK"], width=1)
-        circle(d, bcx, bcy, e["UI_LEVEL_D"] // 2, outline=C["TRACK"])
+        # 航姿罗盘参照圈：中圈 30° + 内圈水平区
+        circle(d, bcx, bcy, e.get("UI_PITCH_D", 46) // 2, outline=C["TRACK"])
+        circle(d, bcx, bcy, e["UI_LEVEL_D"] // 2, outline=C["MARK"])
+        # 罗盘 4 轴端点微刻度
+        d.line([(bcx, by0), (bcx, by0 + 3)], fill=C["MARK"])
+        d.line([(bcx, by0 + bd - 4), (bcx, by0 + bd - 1)], fill=C["MARK"])
+        d.line([(bx0, bcy), (bx0 + 3, bcy)], fill=C["MARK"])
+        d.line([(bx0 + bd - 4, bcy), (bx0 + bd - 1, bcy)], fill=C["MARK"])
 
         ox = int(max(-1.0, min(1.0, st["x"])) * e["UI_BUBBLE_MAX"])
         oy = int(max(-1.0, min(1.0, st["y"])) * e["UI_BUBBLE_MAX"])
@@ -421,26 +480,30 @@ class Renderer:
             ry = e["UI_AXIS_Y"] + i * (e["UI_AXIS_ROW_H"] + e["UI_AXIS_GAP"])
             ac = [C["AXIS_X"], C["AXIS_Y"], C["AXIS_Z"]][i]
             text(d, e["UI_AXIS_LBL_X"], ry, e["UI_AXIS_LBL_W"], e["UI_AXIS_ROW_H"],
-                 name, self.num[14], ac, "left")
+                 name, self.num[12], ac, "left")
             byy = ry + (e["UI_AXIS_ROW_H"] - e["UI_AXIS_BAR_H"]) // 2
-            box(d, e["UI_AXIS_BAR_X"], byy, e["UI_AXIS_BAR_W"], e["UI_AXIS_BAR_H"],
-                fill=C["TRACK"], radius=e["UI_AXIS_BAR_H"] // 2)
+            bx = e["UI_AXIS_BAR_X"]
+            bw = e["UI_AXIS_BAR_W"]
+            bh = e["UI_AXIS_BAR_H"]
+            box(d, bx, byy, bw, bh, fill=C["TRACK"], radius=bh // 2)
+            # ±1g 物理基准刻度线（-1g 与 +1g 位置，即 ±50% 处）
+            d.line([(bx + bw // 4, byy), (bx + bw // 4, byy + bh - 1)], fill=C["LINE"])
+            d.line([(bx + 3 * bw // 4, byy), (bx + 3 * bw // 4, byy + bh - 1)], fill=C["LINE"])
             frac = max(-1.0, min(1.0, val / 2.0))
             if abs(frac) > 0.02:
-                half_w = e["UI_AXIS_BAR_W"] / 2 * abs(frac)
-                x0 = e["UI_AXIS_BAR_X"] + (e["UI_AXIS_BAR_W"] / 2 if frac >= 0
-                                           else e["UI_AXIS_BAR_W"] / 2 - half_w)
-                box(d, x0, byy, half_w, e["UI_AXIS_BAR_H"], fill=ac,
-                    radius=e["UI_AXIS_BAR_H"] // 2)
+                half_w = bw / 2 * abs(frac)
+                x0 = bx + (bw / 2 if frac >= 0 else bw / 2 - half_w)
+                box(d, x0, byy, half_w, bh, fill=ac, radius=bh // 2)
             # 0 位中轴亮线（比轨道高 1px，最后画，压在最上层）
-            box(d, e["UI_AXIS_BAR_X"] + e["UI_AXIS_BAR_W"] // 2,
-                ry + (e["UI_AXIS_ROW_H"] - (e["UI_AXIS_BAR_H"] + 2)) // 2,
-                1, e["UI_AXIS_BAR_H"] + 2, fill=C["MARK"], radius=0)
+            box(d, bx + bw // 2,
+                ry + (e["UI_AXIS_ROW_H"] - (bh + 2)) // 2,
+                1, bh + 2, fill=C["MARK"], radius=0)
             text(d, e["UI_AXIS_VAL_X"], ry, e["UI_AXIS_VAL_W"], e["UI_AXIS_ROW_H"],
-                 "%+.2f" % val, self.num[14], ac, "right")
+                 "%+.2f" % val, self.num[12], ac, "right")
 
         # ---------------- AI 回复卡片 ----------------
         cy0 = e["UI_CARD_Y"]
+        d = shadow(img, e["UI_CARD_X"], cy0, e["UI_CARD_W"], e["UI_CARD_H"], radius=14)
         box(d, e["UI_CARD_X"], cy0, e["UI_CARD_W"], e["UI_CARD_H"], fill=C["CARD"],
             outline=C["LINE"], radius=14)
         # 卡片顶部那道渐亮，用几行淡色叠出来
@@ -449,19 +512,23 @@ class Renderer:
             d.line([(e["UI_CARD_X"] + 1, cy0 + 1 + i),
                     (e["UI_CARD_X"] + e["UI_CARD_W"] - 2, cy0 + 1 + i)],
                    fill=tuple(min(255, C["CARD"][k] + a) for k in range(3)))
+        # 顶面 1px 内高光（对应板端 add_sheen），压在渐变最亮的那一端
+        d = sheen(img, e["UI_CARD_X"], cy0 + 1, e["UI_CARD_W"],
+                  tuple(min(255, C["CARD"][k] + 14) for k in range(3)))
 
-        # 左侧 AI 蓝竖条（在渐变叠色之后画，避免被盖）
+        # 左侧 AI 竖条：生成中或真回复用琥珀，未提问用蓝
+        ai_accent = C["AMBER"] if (st.get("pending") or st.get("reply")) else C["BLUE"]
         box(d, e["UI_CARD_X"], cy0 + 12, e["UI_STRIPE_W"], e["UI_CARD_H"] - 24,
-            fill=C["BLUE"], radius=2)
+            fill=ai_accent, radius=2)
 
-        tag_bg = tuple(int(C["CARD"][k] + (C["BLUE"][k] - C["CARD"][k]) * 48 / 255)
+        tag_bg = tuple(int(C["CARD"][k] + (ai_accent[k] - C["CARD"][k]) * 48 / 255)
                        for k in range(3))
         box(d, e["UI_TAG_X"], cy0 + e["UI_TAG_Y"], e["UI_TAG_W"], e["UI_TAG_H"],
             fill=tag_bg, radius=7)
         text(d, e["UI_TAG_X"], cy0 + e["UI_TAG_Y"], e["UI_TAG_W"], e["UI_TAG_H"],
-             "AI", self.num[14], C["BLUE"], "center")
+             "AI", self.num[14], ai_accent, "center")
 
-        body = st["reply"] if st["reply"] else "按 BOOT 键向电脑服务器的 AI 提问"
+        body = st["reply"] if st["reply"] else "单击 BOOT 提问 · 三击说话"
         _, total = reply_page(body, 0, e["UI_REPLY_COLS"])
 
         if st["pending"]:
@@ -612,7 +679,7 @@ def selfcheck(env, r: "Renderer") -> list[str]:
     probe = Image.new("RGB", (8, 8))
     pd = ImageDraw.Draw(probe)
     for st in states():
-        body = st["reply"] if st["reply"] else "按 BOOT 键向电脑服务器的 AI 提问"
+        body = st["reply"] if st["reply"] else "单击 BOOT 提问 · 三击说话"
         page, total = reply_page(body, 0, env["UI_REPLY_COLS"])
         shown = fit_text(pd, page, r.cjk[14], env["UI_REPLY_W"], max_lines=2)
         lines = shown.split("\n")

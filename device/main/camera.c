@@ -540,9 +540,15 @@ esp_err_t camera_post_frame(const char *base_url, const char *device, bool save)
     }
 
     /* 拼 URL：`<base>/api/frame?device=<dev>[&save=1]`。
-     * device 由网页/服务器校验，这里只做长度限制，不做 URL 转义
-     * （设备名来自 NVS，是我们自己写进去的，不含特殊字符）。 */
-    char url[192];
+     *
+     * ⚠️ `device` 由调用方（transport.c）**先做 URL 百分号编码**再传进来，
+     * 本函数直接拼、不再转义。原来这里的注释写的是"设备名来自 NVS，不含特殊字符"，
+     * 那是错的：设备名是用户在配网页手填的，课堂里最常见的就是「第三组-07」。
+     * 原始 UTF-8 直接进请求行会被 Python 的 http.server 按 latin-1 解成乱码，
+     * 于是同一块板的画面挂到一台幽灵设备上（实时画面永远 404）。
+     *
+     * 缓冲 256：128(地址) + 18(路径) + 72(编码后设备名最长) + 7("&save=1") < 225。 */
+    char url[256];
     snprintf(url, sizeof(url), "%s/api/frame?device=%s%s",
              base_url, (device && device[0]) ? device : "-", save ? "&save=1" : "");
 

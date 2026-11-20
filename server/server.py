@@ -29,32 +29,95 @@ AI 交互课 · PC 服务器（无需 VPS，自己的电脑即服务器）
 """
 
 import argparse
-import datetime
+import hashlib
+import hmac
 import io
 import json
 import math
 import os
-import queue
 import re
+import signal
 import socket
 import struct
 import sys
 import threading
 import time
+import urllib.error
 import urllib.request
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import unquote
+from urllib.parse import quote, unquote, urlsplit
+
+# --------------------------------------------------------------------------
+# 同目录的两个模块（2026-11-01 从本文件拆出：analysis / jsonl_log）
+#
+# ⚠️ **必须先把本文件所在目录放进 sys.path。** 本文件有两条加载路径：
+#   1. `python server/server.py` —— 此时脚本目录自动在 sys.path[0]，没问题；
+#   2. `tools/test_units.py` / `verify_server.py` 用 importlib **按路径**加载
+#      —— 此时 sys.path 里没有 server/，只写 `import analysis` 会 ImportError。
+# 放在这里而不是文件更靠前的位置，是因为下面的 `MAX_WINDOW` 马上要用
+# `analysis.WINDOW_S`（窗口秒数 → deque 容量），必须在它之前完成导入。
+#
+# 为什么拆：依赖图量出来的结果是这两个模块**不碰任何模块级可变状态**
+# （JsonlLogger 的传递依赖是 0 个），把它们留在 2627 行的文件里只有坏处。
+# --------------------------------------------------------------------------
+_SERVER_DIR = os.path.dirname(os.path.abspath(__file__))
+if _SERVER_DIR not in sys.path:
+    sys.path.insert(0, _SERVER_DIR)
+
+from analysis import ACTIVITY_IDLE, WINDOW_S, analyze, tilt_direction  # noqa: E402
+from jsonl_log import JsonlLogger, estimate_mb  # noqa: E402
 
 # --------------------------------------------------------------------------
 # 可调参数
 # --------------------------------------------------------------------------
-MAX_WINDOW = 1200         # 滑动窗口样本数（板端 100Hz 上报时 ≈ 12 秒）
-WINDOW_S = 8.0            # 统计/计步/曲线用的时间窗（秒）
-MOTION_WINDOW_S = 0.6     # 瞬时运动分类（晃动/跌落）用的短窗（秒）
+# 统计/计步/曲线用的时间窗 `WINDOW_S` 与瞬时短窗 `MOTION_WINDOW_S`
+# 已经搬到 `server/analysis.py`（它们只被那边的分类函数用）。
+# 本文件在顶部 import 了 `WINDOW_S`，所以下面这行照样成立。
+# 滑动窗口样本数。**上限必须按"服务端愿意信任的最快采样率"算，不是按标称值算。**
+# 窗口本身是按时间过滤的（`now - ts <= WINDOW_S`），deque 只是它的容量上限：
+#   - 标称 100 Hz × 8 s = 800；
+#   - 但 dt 是**推断**出来的，DT_TRUST_MIN=8 ms 也在可信区间内（125 Hz），
+#     那种情况下 8 秒里有 1000 个样本 —— 容量给 800 就会把窗口悄悄截成 6.4 秒，
+#     而 `ai_summary()` 的文案仍写"最近 8 秒内约计步 N 次"，计步会系统性偏低。
+# 所以取 1000 + 64 的余量。代价是每批多遍历两百来个样本（实测 analyze
+# 8.15 ms@1200 → 约 7.1 ms@1064，仍比原来省 13%）—— 正确性优先于这点收益。
+# 真正的根治是"按时间索引 + 追加时缓存 |a|"，留待下一批。
+MAX_WINDOW = int(WINDOW_S / 0.008) + 64      # = 1064
 
 DEVICE_TIMEOUT = 5.0      # 超过该秒数没有新遥测则视为离线
 LLM_TIMEOUT = 25.0        # 大模型请求超时（后台线程里等，不影响板端）
+# 板端提问（BOOT 单击/语音）单独收紧的等待上限：实测带 reasoning 的模型
+# 正文要等 10s+，板端孩子等不了那么久 —— 超时回退本地规则 AI 并在事件流
+# 注明「请求超时」，网页提问仍走 LLM_TIMEOUT（人坐在屏幕前，等得起）。
+LLM_BOARD_TIMEOUT = float(os.environ.get("RW1_LLM_BOARD_TIMEOUT", "10"))
+# 出站请求的 User-Agent。**不能留 urllib 默认值**（Python-urllib/x.y）：
+# 实测（2026-11-03）上游的 Cloudflare 按浏览器签名封禁，默认 UA 直接吃
+# HTTP 403 "error code: 1010"，换成任何显式 UA 立刻 200。服务端自己的
+# server_version 是 RW1/1.1，出站就用同一个标识，对端日志里也好认。
+LLM_USER_AGENT = "RW1/1.1"
+# 同时打大模型的请求上限。一个班 20 块板可能同时提问，没有上限时 20 个线程
+# 一起砸过去，对方一限流就**全部**超时 —— 课堂里表现为"全班的 AI 同时傻了"，
+# 且每个人都要干等 LLM_TIMEOUT 秒。语义：最多 N 个在飞，其余在信号量上排队；
+# 排队超过 LLM_QUEUE_TIMEOUT 就明说"人太多，稍后再试"并回退本地 AI，
+# 不装死、也不无限占着线程。
+LLM_MAX_CONCURRENT = int(os.environ.get("RW1_LLM_MAX_CONCURRENT", "4"))
+LLM_QUEUE_TIMEOUT = float(os.environ.get("RW1_LLM_QUEUE_TIMEOUT", "30"))
+_LLM_SEM = threading.BoundedSemaphore(max(1, LLM_MAX_CONCURRENT))
+
+# ---- 访问密钥（可选，默认关）------------------------------------------------
+# 威胁模型：教室里任何连上同一 WiFi 的人。破坏性动作（格式化 SD、删照片）与
+# 花钱的动作（问大模型）**只能从网页来** —— 板子只会上报遥测/帧/音频，
+# 命令永远是服务端**下发**给板子的。所以门这几个网页写入口**不需要动固件**，
+# 老固件照常上报（后向兼容的关键证据：无密钥环境下整套回归全绿）。
+# 不配 RW1_API_TOKEN = 完全关闭，行为与以前逐字节相同。
+# 配了则下面这些接口要求 `X-RW1-Token` 请求头（或 `?token=` 查询参数）。
+API_TOKEN = os.environ.get("RW1_API_TOKEN", "").strip()
+WEB_WRITE_PATHS = ("/api/command", "/api/ask", "/api/ask/cancel", "/api/shots/delete",
+                   "/api/files/delete", "/api/files/upload")
+# 写入口的同源校验（CSRF）总开关。默认开启；只有在反向代理会改写 Host
+# 导致误判时才需要设 RW1_ALLOW_CROSS_ORIGIN=1 关掉。详见 Handler._origin_ok。
+ALLOW_CROSS_ORIGIN = os.environ.get("RW1_ALLOW_CROSS_ORIGIN", "").strip() == "1"
 
 # ---- 语音（第 4 周：按键说话 → 识别 → 大模型 → 屏显回复）---------------------
 # 识别两条路**自动选**：配了云端 key 走云端，没配就用本地 whisper；
@@ -64,20 +127,53 @@ AUDIO_MAX_BYTES = 512 * 1024   # 单次上传上限（3 s @16 kHz/16 bit 单声�
 AUDIO_RATE = 16000             # 板端录音采样率；云端与本地都按这个解
 AUDIO_DIR = None               # 录音留档目录（main() 里按 --data-dir 设）
 AUDIO_KEEP = 50                # 每台设备最多留多少条录音
+# 录音留档的**设备目录数上限**。照片那条路（_shot_save）早就有 SHOT_MAX_DEVICES，
+# 录音这里却一直漏着（2026-11-02 审查发现的）：/api/audio 不需要密钥、设备名又是
+# 外部输入 —— 全局预算 120 段/分钟挡得住钱，挡不住"每段都换一个新名字"：
+# 120 × 512 KB ≈ 每小时 3.5 GB 的新目录，一节课就能把数据盘灌满。
+# 与照片同一档：64 个目录 × 每台 50 条 = 磁盘开销有界；正常一个班远用不到。
+AUDIO_MAX_DEVICES = 64
+# 同一台板两次录音之间的最小间隔。`/api/audio` 是**唯一一个"一被调用就花钱"**
+# 的未鉴权入口（云端 ASR + 一次大模型），而它按设计不能加 token（老固件不带头）。
+# 所以在这里做一道限流：连续刷只会把间隔拉长，不会每次都能触发一次付费调用。
+# 顺带也挡掉"按键抖动导致连发两段录音"这种误触。
+AUDIO_MIN_GAP_S = 1.5
+AUDIO_LAST = {}                # device -> 上次受理的时刻（内部限流用，不进快照）
+# `AUDIO_LAST` 的键是**外部输入**（`?device=`），所以它不能靠"设备就那么几块"来保证有界。
+# 每设备冷却只在放行的请求上记一笔，正常一分钟最多 `AUDIO_MAX_PER_MIN` 条、60 秒后自然过期；
+# 但历史实现写的是"长度超 256 才清一遍、且只清 60 秒前的"—— 一串**新设备名**每秒来几发，
+# 60 秒内的条目一条都清不掉，表就跟着名字数量涨（实测 40 秒 2000 个名字 → 2000 条）。
+# 现在改成两道：过期就清；清完还超 `AUDIO_LAST_MAX` 就丢最旧的（近似 LRU）。
+# 丢最旧的代价只是"那台设备的下一次录音少挡一次冷却"，不涉及钱 —— 钱由全局预算管。
+AUDIO_LAST_MAX = 512
+# 全服务器每分钟最多受理多少段录音。**这是"花钱接口"的最后一道闸**：
+# `/api/audio` 是唯一一个"一被调用就产生 ASR + 一次大模型费用"的未鉴权入口
+# （按设计不能要求 token —— 老固件没有密钥可带）。
+# 每设备 1.5 s 的冷却挡不住"换设备名"，所以再加一道**全局**预算：
+# 即使有人伪造 20 个设备名同时刷，费用也被压在 120 段/分钟以内，而且
+# 超限会打到控制台（老师能看见"有人在刷语音"）。
+# 120 的依据：一个班 20 块板，正常演示每分钟几十次；120 留了一倍余量。
+# 想要更严可以设 RW1_AUDIO_MAX_PER_MIN（verify_server 的预算用例用它压到 1）。
+# ⚠️ 限流器实例 `AUDIO_BUDGET` 定义在 `RateWindow` 类之后（类还没定义时不能实例化）。
+AUDIO_MAX_PER_MIN = int(os.environ.get("RW1_AUDIO_MAX_PER_MIN", "120") or 120)
 ASR_TIMEOUT = 30.0             # 云端识别超时（后台线程里等，不阻塞板端）
 VOICE_TEXT_MAX = 200           # 识别出的文字长度上限（与 ask 的 q 一致）
 CHAT_HISTORY = 6               # 多轮上下文保留的问答轮数（澄清类追问要用）
 
 MAX_BATCH = 400           # 单次 POST 最多接受的样本数（防止畸形/恶意负载）
-BOARD_REPLY_MAX = 512     # 回传板端的回复字节上限（UTF-8 安全截断）
+VALID_G_MAX = 16.0        # 单轴可信上限（g）。固件 sanitize3 是 ±8g，这里留一倍余量；
+                          # 超出的一律当坏帧丢弃，见 Handler._parse_points
+# 回传板端的回复字节上限（UTF-8 安全截断）。
+# **必须小于固件 TRANSPORT_REPLY_LEN（512）**：clip_utf8 截断后还会追加一个「…」，
+# 若这里写 512，板端 512 字节的 utf8_strlcpy 会把省略号连同最后一两个字一起切掉 ——
+# 超长回复就失去了"被截断过"的标注。留 32 字节余量（480 + 3 < 512）。
+BOARD_REPLY_MAX = 480
 
 # 仪表盘自托管字体白名单（详见 Handler._send_vendor_font）。字体名来自 URL，
 # 所以不放正则、只放**逐字写死**的文件名 —— 这是最难被绕过的白名单。
 FONT_FILES = ("sora-400.woff2", "sora-600.woff2", "sora-700.woff2", "sora-800.woff2",
               "plexmono-400.woff2", "plexmono-500.woff2", "plexmono-600.woff2")
 
-STEP_MIN_G = 0.25         # 计步：高出窗口均值的幅度阈值（g）
-STEP_REFRACTORY_S = 0.30  # 计步：两步之间的最小间隔（秒）
 DT_NOMINAL = 0.01         # 标称采样间隔（对应板端 CONFIG_RW1_SAMPLE_PERIOD_MS=10）
 DT_TRUST_MAX = 0.05       # 超过这个推断间隔就认为该帧晚到了、时间轴不可信
 # 下界：dt_est = 两批到达间隔 / 本批样本数，**批越小这个推算越不可信**。
@@ -85,19 +181,23 @@ DT_TRUST_MAX = 0.05       # 超过这个推断间隔就认为该帧晚到了、�
 # (间隔 / 样本数) 能掉到几毫秒 —— sample_hz 直接飘到 311（板子标称才 100）。
 # 它是网页上直接显示的字段，飘高会误导人，所以两头都要钳。
 DT_TRUST_MIN = 0.008      # 8 ms → 125 Hz，给标称的 100 Hz 留 25% 余量
-MOTION_STD = 0.06         # "算得上在动"的短窗标准差阈值（g）
-SHAKE_ZCR = 3.5           # 晃动判定：|a| 起伏频率高于该值（Hz）。步行 1.5~2.5Hz，
-                          # 晃动 3~8Hz —— 只靠幅度分不开两者（走路也有 0.5g 起伏），
-                          # 必须靠频率。
-WALK_ZCR_MIN = 1.2        # 步行判定：起伏频率下限（Hz）
-SHAKE_MIN_GAP_S = 0.6     # 晃动事件的最小间隔（秒），避免一次晃动记成多次
-FREEFALL_G = 0.35         # 失重判定：合加速度阈值（g）
-FREEFALL_MIN_S = 0.05     # 失重判定：至少持续这么久才算疑似跌落（秒）
+# 计步 / 晃动 / 跌落的判定阈值（STEP_* / MOTION_STD / SHAKE_* / WALK_ZCR_MIN /
+# FREEFALL_*）全部搬到 `server/analysis.py` 了 —— 它们是那边的判据参数，
+# 改阈值去那个文件，别在这里加。
 
 # ---- 远程命令（第 2 周：Web 下发「采集一次」，按 request_id 反馈结果）----
 # 第 3 周在此基础上加了两个「物理反馈」指令：led_blink / led_set —— 板载 LED 在 GPIO3。
 CMD_TIMEOUT_S = 10.0      # 命令下发后多久没收到结果就判超时
 CMD_MAX_HISTORY = 20      # 保留最近多少条命令供网页显示
+# SSE 每帧真正发出去的条数。**必须与前端渲染上限一致**（renderEvents 的
+# `slice(0,40)`、renderCmds 的前 8 条）—— 多发的字节到浏览器就被 DOM 丢掉了。
+# 保留的历史仍然在 dev.events / dev.commands 里（各 200/20 条），
+# /api/events 与 /api/commands 要全量时能拿到。
+SSE_EVENTS_MAX = 40
+SSE_COMMANDS_MAX = 8
+# /api/latest 每帧带多少个曲线点。画布 CSS 宽约 240 px，120 点已经超过可分辨
+# 像素数；240 点时多出来的一半在 drawChart 里落到同一列像素上，是纯字节。
+CURVE_POINTS = 120
 CMD_NAMES = ("capture_once", "led_blink", "led_set", "set_orient",
              "set_config", "sd_format", "sd_ls", "sd_rm",
              "cam_capture", "cam_stream")   # 白名单（不认的名字直接 400）
@@ -117,7 +217,8 @@ CAM_STREAM_FPS_MAX = 10
 # 详见 device/main/camera.c 里 CAM_JPEG_QUALITY_* 的注释与手册 T56。
 FALL_AUTO_ALERT = True    # 判定跌落时自动下发 LED 告警（远端物理反馈）
 
-ACTIVITY_IDLE = "等待数据…"
+# `ACTIVITY_IDLE`（"等待数据…"）在 server/analysis.py 定义，本文件顶部已 import ——
+# 它是**分类器的输出词汇**，归那边管；`Device` 只是拿它当初始值。
 
 # --------------------------------------------------------------------------
 # 全局状态
@@ -210,14 +311,32 @@ LOGGER = None                              # 由 main() 注入的 JsonlLogger
 # **板子 POST 帧上来、网页再从这里取** —— 不是网页直连板子。
 FRAMES = {}                # device -> {"jpeg": bytes, "ts": float, "n": int}
 FRAME_MAX_BYTES = 400 * 1024   # 单帧上限，超了直接丢（防止有人拿它塞垃圾）
+# `FRAMES` 的**基数上限**。`MAX_DEVICES` 只管 `DEVICES`（遥测注册的那张表），
+# 管不到这里：任何人不带密钥、拿 400 KB 的帧乘以无限的设备名就能把内存灌满
+# （旧代码：`FRAMES[dev] = {...}` 永不淘汰）。按 ts 淘汰最旧的那台，
+# 64 台 × 400 KB ≈ 25 MB 封顶，课堂上够用。
+FRAME_MAX_DEVICES = 64
 SHOTS_DIR = None           # 拍照留档目录（main() 里按 --data-dir 设）
 SHOT_MAX = 200             # 每台设备最多留多少张（免得把磁盘塞满）
+# 照片目录的**设备数上限**：每台设备 200 张，但设备名是外部输入，
+# 64 个目录 × 200 张 ≈ 磁盘可控。超了就不存（返回 None，板端只当没留档）。
+SHOT_MAX_DEVICES = 64
 
 
 def safe_name(s):
-    """把设备名变成安全的目录/文件名：只留字母数字和 - _ .，其余换成 _。"""
+    """把设备名变成安全的目录/文件名：只留字母数字和 - _ .，其余换成 _。
+
+    ⚠️ 无脑截断到 48 字符会**撞名**：前 48 字符相同的两台板（课堂上最常见的
+    「第三组-07-xxxx…」式命名）会拿到同一个文件名，照片/记录互相覆盖且看不出来。
+    2026-10-12 修：截断发生时追加一个 6 位短哈希（源字符串 md5 前 6 位）——
+    总长仍是 48，但不同全名几乎不可能撞到同一个短哈希。只有"被截断"才付这个
+    代价，普通短名字的输出与以前逐字节一致。
+    """
     keep = "".join(c if (c.isalnum() or c in "-_.") else "_" for c in str(s))
-    return (keep[:48] or "unknown")
+    if len(keep) > 48:
+        digest = hashlib.md5(str(s).encode("utf-8")).hexdigest()[:6]
+        keep = keep[:41] + "_" + digest          # 41 + 1 + 6 = 48，总长不变
+    return keep or "unknown"
 
 
 def clean_device_id(raw):
@@ -236,6 +355,112 @@ def clean_device_id(raw):
     s = "".join(ch for ch in s if ch.isprintable())
     s = " ".join(s.split())[:DEVICE_ID_MAX]
     return s or DEFAULT_DEVICE
+
+
+# ==========================================================================
+# 仪表盘「文件管理」（2026-11-04）
+# --------------------------------------------------------------------------
+# 只暴露三类**由本项目自己写出来的**目录，绝不接受任意路径：
+#   shots → SHOTS_DIR/<设备>/    （板端拍照留档）
+#   audio → AUDIO_DIR/<设备>/    （语音链路的录音留档）
+#   logs  → 数据目录根（JsonlLogger 的 telemetry-*.jsonl / events-*.jsonl）
+# 文件名走**白名单 + 拒绝**（不改写成别的名字），设备名复用 safe_name，
+# 最后再做一次"解析后的绝对路径必须落在 base 里"的夹紧 —— 三道都过才算合法。
+# ==========================================================================
+FILE_CATS = {"shots": "照片", "audio": "录音", "logs": "日志"}
+FILE_MAX_BYTES = 8 * 1024 * 1024          # 上传上限（照片/录音都远小于它）
+FILE_PREVIEW_DEFAULT = 64 * 1024          # 预览默认读多少字节
+FILE_PREVIEW_MAX = 256 * 1024             # 预览最多允许多少字节（客户端也夹）
+FILE_LIST_MAX = 500                       # 单个分类最多列多少条
+FILE_NAME_MAX = 96
+FILE_EXTS = {
+    "shots": (".jpg", ".jpeg", ".png"),
+    "audio": (".wav",),
+    "logs": (".jsonl", ".log", ".txt"),
+}
+TEXT_EXTS = (".jsonl", ".log", ".txt", ".json", ".csv", ".md")
+FILE_CTYPES = {
+    ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
+    ".wav": "audio/wav",
+    ".jsonl": "application/x-ndjson", ".json": "application/json",
+    ".log": "text/plain; charset=utf-8", ".txt": "text/plain; charset=utf-8",
+    ".csv": "text/csv; charset=utf-8", ".md": "text/plain; charset=utf-8",
+}
+# Windows 上这些名字会被当成设备/保留名（NUL/CON/COM1…），写进去行为不可预期。
+_WIN_RESERVED = {"con", "prn", "aux", "nul"}
+_WIN_RESERVED |= {"com%d" % i for i in range(1, 10)}
+_WIN_RESERVED |= {"lpt%d" % i for i in range(1, 10)}
+
+
+def file_cat_dir(cat):
+    """分类 → 根目录；未知分类/未初始化返回 None。"""
+    if cat == "shots":
+        return SHOTS_DIR
+    if cat == "audio":
+        return AUDIO_DIR
+    if cat == "logs":
+        return LOGGER.root if LOGGER is not None else None
+    return None
+
+
+def file_device_dir(device):
+    """设备名 → 安全的目录名。空设备名**拒绝**（否则 clean_device_id 会兜成默认设备，
+    删别人的文件时这是最不该出现的"好心"）。"""
+    raw = device.strip() if isinstance(device, str) else ""
+    if not raw:
+        return None
+    sd = safe_name(clean_device_id(raw))
+    if sd in (".", "..") or not sd.strip("."):
+        return None
+    return sd
+
+
+def file_safe_name(name):
+    """文件名白名单。不安全一律返回 None（**不替用户改名**，免得"以为是删除/上传成功了"）。"""
+    if not isinstance(name, str):
+        return None
+    s = name.strip()
+    if not s or len(s) > FILE_NAME_MAX:
+        return None
+    if s in (".", "..") or not s.strip("."):
+        return None
+    if any(ch in s for ch in ("/", "\\", ":", "\x00", "\r", "\n")):
+        return None
+    if any(ord(c) < 32 for c in s):
+        return None
+    if s.split(".")[0].lower() in _WIN_RESERVED:
+        return None
+    return s
+
+
+def file_ext_ok(cat, name):
+    exts = FILE_EXTS.get(cat) or ()
+    return name.lower().endswith(exts)
+
+
+def file_path(cat, device, name):
+    """分类+设备+文件名 → 绝对路径。三道校验全过才返回，否则 None。"""
+    base = file_cat_dir(cat)
+    if not base:
+        return None
+    fname = file_safe_name(name)
+    if not fname:
+        return None
+    if cat == "logs":
+        folder = base
+    else:
+        sd = file_device_dir(device)
+        if not sd:
+            return None
+        folder = os.path.join(base, sd)
+    full = os.path.abspath(os.path.join(folder, fname))
+    root = os.path.abspath(base)
+    # normcase：Windows 路径大小写不敏感，必须按同一口径比较，否则
+    # `SHOTS%2F..%2Fsecrets.txt` 这种大小写变形会绕过前缀判断。
+    nfull, nroot = os.path.normcase(full), os.path.normcase(root)
+    if nfull != nroot and not nfull.startswith(nroot + os.sep):
+        return None
+    return full
 
 
 def get_device(did):
@@ -270,14 +495,29 @@ def pick_device(did=None):
     live = [d for d in DEVICES.values() if d.st["last_post"] > 0.0]
     if live:
         return max(live, key=lambda d: d.st["last_post"])
-    return DEVICES[DEFAULT_DEVICE]
+    # 兜底设备可能**已经被 LRU 淘汰掉**：`"-"` 的 last_post 恒为 0，是
+    # `get_device()` 淘汰时最优先的受害者。而 `pick_device()` 又被
+    # `/api/audio`（它不写 last_post）之类的路径调用，于是存在这个序列：
+    # 33 个不同设备名的 audio 上报 → `"-"` 被淘汰 → 这里 KeyError → 500。
+    # 用 setdefault 重造一台即可（它就是"老固件的默认桶"，重建无副作用）。
+    return DEVICES.setdefault(DEFAULT_DEVICE, Device(DEFAULT_DEVICE))
 
 
-def snapshot(dev):
-    """一台设备的完整快照。**调用方必须已持有 LOCK。**"""
+def snapshot(dev, with_events=True, with_commands=True):
+    """一台设备的完整快照。**调用方必须已持有 LOCK。**
+
+    `with_events` / `with_commands` 让调用方只取**这一通道真正负责**的部分：
+    `/api/latest`（网页 10Hz 轮询）只要活状态与曲线样本，事件流和命令历史
+    是 SSE 的独通道（每 500ms 一帧）。10Hz 全量轮询在锁内序列化 ~25KB 的
+    events+commands，跟 20 块板的上报抢同一把 LOCK —— 课堂场景下这是实打实
+    的 contention。⚠️ 前端因此**不许**从 /api/latest 推导事件/命令状态
+    （renderEvents/renderCmds 对缺失字段直接跳过，不清空、不画空态）。
+    """
     snap = dict(dev.st)
-    snap["events"] = list(dev.events)
-    snap["commands"] = commands_snapshot(dev)
+    if with_events:
+        snap["events"] = list(dev.events)
+    if with_commands:
+        snap["commands"] = commands_snapshot(dev)
     return snap
 
 
@@ -345,6 +585,46 @@ def clip_utf8(text, limit):
     return "…"
 
 
+class RateWindow:
+    """滑动窗口限流器：最近 `window_s` 秒内最多 `n` 次。**调用方负责加锁。**
+
+    为什么单独抽出来：
+      1. 全项目已经有两处限流（每设备录音冷却、全服务器录音预算），各写一份
+         deque 逻辑必然慢慢走偏；
+      2. 它是**纯逻辑、零依赖**的 —— 可以直接进 `tools/test_units.py` 的单测，
+         而那边的单测跑不到 HTTP（没有真服务器）；
+      3. 边界条件（窗口滑动、恰好到顶、跨窗口）最容易写错，值得有独立用例。
+
+    语义细节：`allow()` 只在**放行**时才记一次。被拒的请求不占额度，
+    所以"连发 100 次"不会把窗口填满、也不会把后来的正常请求一起挡死。
+    """
+
+    __slots__ = ("n", "window_s", "_hits")
+
+    def __init__(self, n, window_s):
+        self.n = max(1, int(n))
+        self.window_s = float(window_s)
+        self._hits = deque()
+
+    def allow(self, now):
+        """登记一次（若允许）。返回 True = 放行，False = 超限。"""
+        while self._hits and now - self._hits[0] > self.window_s:
+            self._hits.popleft()
+        if len(self._hits) >= self.n:
+            return False
+        self._hits.append(now)
+        return True
+
+    def reset(self):
+        """清空（测试用；也便于运行时改配置后立即生效）。"""
+        self._hits.clear()
+
+
+# 全服务器录音预算（见 AUDIO_MAX_PER_MIN 的注释）。放在类定义**之后**。
+AUDIO_BUDGET = RateWindow(AUDIO_MAX_PER_MIN, 60.0)
+AUDIO_BUDGET_NOTICE_AT = [0.0]     # 上次打印"超限"的时刻（用 list 当可变盒）
+
+
 # --------------------------------------------------------------------------
 # 远程命令：Web 下发 → 板端执行 → 按 request_id 回传结果
 #
@@ -353,12 +633,20 @@ def clip_utf8(text, limit):
 # 一次往返 = 2 个遥测周期（默认 1 秒），网页上能看到 queued → sent → done 全过程。
 # --------------------------------------------------------------------------
 def clamp_int(value, lo, hi, dflt):
-    """把外部传来的数字夹进 [lo, hi]；不是数字就用默认值。"""
+    """把外部传来的数字夹进 [lo, hi]；不是数字就用默认值。
+
+    ⚠️ `NaN` / `inf` 必须在这里挡掉：`int(float("inf"))` 抛 OverflowError，
+    `int(float("nan"))` 抛 ValueError —— 两者都不在原来的 `except` 里，
+    于是网页传个 `"inf"`（或者 JSON 里直接写 Infinity）就是一个 500 + 一段
+    traceback。而 `float()` 本身是**接受**这两个字面量的，所以必须显式判有限性。
+    """
     try:
-        v = int(float(value))
+        v = float(value)
     except (TypeError, ValueError):
         return dflt
-    return max(lo, min(hi, v))
+    if not math.isfinite(v):
+        return dflt
+    return max(lo, min(hi, int(v)))
 
 
 def sanitize_params(name, params):
@@ -423,8 +711,13 @@ def sanitize_params(name, params):
                 if v:
                     out[key] = v[:lim]
         if "period_ms" in p:
-            # 下限 50ms = 20Hz（板端夹同样的范围，两边保持一致）
-            out["period_ms"] = clamp_int(p.get("period_ms"), 50, 2000, 500)
+            # 下限 100ms = 10Hz（与板端 transport.c 的 run_set_config 夹同一范围）。
+            # **曾经放到 50ms（20Hz），是个陷阱**：每批只剩 5 个样本，"批量上报"
+            # 的设计红利消失；而 32 块板 × 20 POST/s = 640 连接/秒，配上
+            # `Connection: close`（服务端先关）会在服务端侧堆出数万个 TIME_WAIT。
+            # 三处（网页选择器 / 这里 / 固件）必须一起改，否则会出现"网页选了
+            # 100 但板端还是 50"这种对不上的静默偏差。
+            out["period_ms"] = clamp_int(p.get("period_ms"), 100, 2000, 500)
         return out
     return {}
 
@@ -597,272 +890,46 @@ def expire_commands():
 
 
 def commands_snapshot(dev):
-    """按时间倒序返回该设备最近若干条命令的副本（**调用方必须已持有 LOCK**）。"""
-    return [dict(r) for r in sorted(dev.commands.values(),
-                                    key=lambda r: r["created"], reverse=True)]
+    """按时间倒序返回该设备最近若干条命令的副本（**调用方必须已持有 LOCK**）。
 
-
-# --------------------------------------------------------------------------
-# 落盘：JSONL 追加写，独立线程消费队列，绝不阻塞 HTTP 处理
-# --------------------------------------------------------------------------
-class JsonlLogger:
-    """把遥测与事件追加到 <root>/telemetry-YYYY-MM-DD.jsonl 与 events-*.jsonl。
-
-    写盘在后台线程里做，业务线程只往队列里丢一条记录，所以磁盘慢/满都不会
-    拖慢遥测响应。队列满时丢最旧的（宁可丢日志也不丢实时性）。
+    ⚠️ `dict(r)` 只是**浅拷贝**：`history` 列表和 `result` 字典仍与活记录共享。
+    `_mark()` 会往 `history` 里追加（命令状态每秒都在迁移），而序列化发生在
+    **锁外**（`/api/latest` 与 SSE 都是先出快照再 `json.dumps`）—— 于是这一帧
+    可能混上"拍完之后"才发生的迁移，UI 上表现为时间线抖一下，或同一次轮询里
+    同一条命令一会儿 queued 一会儿 sent。所以这里把可变字段**各自再拷一份**，
+    快照从这一刻起与活记录没有任何共享对象（2026-10-12 修）。
     """
-
-    def __init__(self, root, retain_days=7, log_telemetry=True, log_hz=10.0):
-        self.root = root
-        self.retain_days = retain_days
-        self.log_telemetry = log_telemetry
-        self.log_hz = max(1.0, float(log_hz))
-        self.q = queue.Queue(maxsize=20000)
-        self.dropped = 0
-        self.written = 0
-        self._fhs = {}                 # path -> 文件句柄（遥测与事件是两个文件，
-                                       # 必须各持一个句柄，否则会互相串写）
-        os.makedirs(root, exist_ok=True)
-        self._purge_old()
-        threading.Thread(target=self._run, name="jsonl", daemon=True).start()
-
-    # ---- 生产者 ----------------------------------------------------------
-    def telemetry(self, ts, device, source, pts, dt):
-        if not self.log_telemetry or not pts:
-            return
-        hz = 1.0 / dt if dt > 0 else 0.0
-        step = max(1, int(round(hz / self.log_hz))) if hz else 1
-        thin = pts[::step]
-        self._put({
-            "k": "t",
-            "ts": round(ts, 3),
-            "dev": device,
-            "src": source,
-            "hz": round(hz, 1),
-            "s": [[round(x, 3), round(y, 3), round(z, 3)] for (x, y, z) in thin],
-        })
-
-    def event(self, device, kind, text):
-        self._put({"k": "e", "ts": round(time.time(), 3), "dev": device,
-                   "kind": kind, "text": text})
-
-    def _put(self, rec):
-        try:
-            self.q.put_nowait(rec)
-        except queue.Full:
-            self.dropped += 1
-
-    # ---- 消费者 ----------------------------------------------------------
-    def _run(self):
-        while True:
-            rec = self.q.get()
-            if rec is None:
-                break
-            try:
-                self._write(rec)
-            except OSError:
-                pass          # 磁盘满/权限问题不该拖垮服务器
-
-    def _path(self, prefix, ts):
-        day = datetime.date.fromtimestamp(ts).isoformat()
-        return os.path.join(self.root, "%s-%s.jsonl" % (prefix, day))
-
-    def _write(self, rec):
-        day = datetime.date.fromtimestamp(rec["ts"]).isoformat()
-        path = self._path("telemetry" if rec["k"] == "t" else "events", rec["ts"])
-        fh = self._fhs.get(path)
-        if fh is None:
-            # 跨天时把昨天的句柄关掉，别让长跑的服务攒一堆打开的 fd
-            for old in [p for p in self._fhs if day not in p]:
-                try:
-                    self._fhs.pop(old).close()
-                except OSError:
-                    pass
-            fh = open(path, "a", encoding="utf-8")
-            self._fhs[path] = fh
-        fh.write(json.dumps(rec, ensure_ascii=False, separators=(",", ":")) + "\n")
-        fh.flush()
-        self.written += 1
-
-    def _purge_old(self):
-        """启动时删掉超过保留期的日志，避免一个学期把磁盘写满。"""
-        if self.retain_days <= 0:
-            return
-        cutoff = time.time() - self.retain_days * 86400
-        for name in os.listdir(self.root):
-            if not (name.startswith("telemetry-") or name.startswith("events-")):
-                continue
-            if not name.endswith(".jsonl"):
-                continue
-            path = os.path.join(self.root, name)
-            try:
-                if os.path.getmtime(path) < cutoff:
-                    os.remove(path)
-                    print("   [日志] 已清理过期文件 %s" % name)
-            except OSError:
-                pass
-
-    def stats(self):
-        files = []
-        total = 0
-        for name in sorted(os.listdir(self.root)):
-            if not name.endswith(".jsonl"):
-                continue
-            size = os.path.getsize(os.path.join(self.root, name))
-            files.append({"name": name, "bytes": size})
-            total += size
-        return {"dir": self.root, "files": files, "bytes": total,
-                "written": self.written, "dropped": self.dropped}
+    out = []
+    for r in sorted(dev.commands.values(), key=lambda r: r["created"], reverse=True):
+        c = dict(r)
+        c["history"] = [list(h) for h in r["history"]]
+        if isinstance(r.get("result"), dict):
+            c["result"] = dict(r["result"])
+        out.append(c)
+    return out
 
 
 # --------------------------------------------------------------------------
-# 运动分析：本地规则"AI"
+# 落盘：JSONL 追加写 —— 已搬到 `server/jsonl_log.py`（本文件顶部 import 了它）
 #
-# 坐标契约：板端上报的 x/y 已经是**屏幕坐标系**（+x 右、+y 下），板端在发送前
-# 应用了自己的 NVS 方向校准（accel_input 的 orientation）。服务端不再做任何
-# 轴向假设，两端对"上/下/左/右"的定义因此天然一致。
+# 那个类和 HTTP / IMU / 指令通道一点关系都没有，依赖图算下来它引用的模块级
+# 名字是 **0 个**。留在 2600 行的文件里唯一的效果是让文件更长、让它没法被
+# 单独测试。设计要点（丢最旧而非最新、close() 排空队列、purge_old 必须是
+# 公开名）都写在那个文件的模块 docstring 里。
 # --------------------------------------------------------------------------
-TILT_DIRS = ["上", "右上", "右", "右下", "下", "左下", "左", "左上"]
 
 
-def tilt_direction(x, y):
-    """把屏幕坐标系的重力方向 (x 向右, y 向下) 映射成 8 方位。"""
-    if math.hypot(x, y) < 0.25:
-        return None
-    deg = math.degrees(math.atan2(y, x)) % 360          # 0°=右, 90°=下
-    idx = int(((deg + 22.5) % 360) // 45)               # 0=右
-    order = [2, 3, 4, 5, 6, 7, 0, 1]                    # 右,右下,下,左下,左,左上,上,右上 → 方位表
-    return TILT_DIRS[order[idx]]
-
-
-def count_steps(win, mags, mean):
-    """对 |a| 序列做局部极大值检测（带不应期），返回窗口内步数。
-
-    用局部极大值而不是"高于均值就算一步"，否则一段持续的高幅运动会
-    被每一个采样点都数成一步（100Hz 下会夸张到上百步）。
-    """
-    if len(win) < 3:
-        return 0
-    thr = mean + STEP_MIN_G
-    steps = 0
-    last_t = None
-    for i in range(1, len(win) - 1):
-        m = mags[i]
-        if m <= thr or m < mags[i - 1] or m < mags[i + 1]:
-            continue
-        t = win[i][0]
-        if last_t is None or (t - last_t) >= STEP_REFRACTORY_S:
-            steps += 1
-            last_t = t
-    return steps
-
-
-def max_freefall_run(mags, dt):
-    """返回 mags 中最长的连续失重样本数，用来判跌落。"""
-    need = max(2, int(round(FREEFALL_MIN_S / dt))) if dt > 0 else 2
-    best = run = 0
-    for m in mags:
-        if m < FREEFALL_G:
-            run += 1
-            if run > best:
-                best = run
-        else:
-            run = 0
-    return best if best >= need else 0
-
-
-def zero_cross_rate(mags, dt):
-    """估算 |a| 起伏的主频率（Hz）：去均值后数符号穿越，再折算成周期数。
-
-    这是把"步行"和"晃动"分开的关键——两者幅度可以一样大，频率却差一倍以上。
-    """
-    if len(mags) < 4 or dt <= 0:
-        return 0.0
-    mean = sum(mags) / len(mags)
-    dead = 0.02                     # 死区，避免噪声在均值附近反复穿越
-    sign = 0
-    crossings = 0
-    for m in mags:
-        d = m - mean
-        if d > dead:
-            s = 1
-        elif d < -dead:
-            s = -1
-        else:
-            continue
-        if sign != 0 and s != sign:
-            crossings += 1
-        sign = s
-    span = (len(mags) - 1) * dt
-    return (crossings / span / 2.0) if span > 0 else 0.0
-
-
-def analyze(dev, now, pts, dt):
-    """把一批样本并入该设备的滑动窗口，返回 (活动标签, 事件列表)。"""
-    events = []
-    prev_activity = dev.st["activity"]
-    prev_fall = dev.st.get("fall_active", False)
-
-    n = len(pts)
-    for i, (x, y, z) in enumerate(pts):
-        dev.samples.append((now - (n - 1 - i) * dt, x, y, z))
-
-    win = [s for s in dev.samples if now - s[0] <= WINDOW_S]
-    if not win:
-        return ACTIVITY_IDLE, events
-
-    mags = [math.sqrt(ax * ax + ay * ay + az * az) for (_, ax, ay, az) in win]
-    mean = sum(mags) / len(mags)
-    std_all = math.sqrt(sum((m - mean) ** 2 for m in mags) / len(mags))
-
-    # ---- 瞬时运动：用短窗，长窗会把一次 0.2s 的晃动稀释到测不出来 ----
-    recent = [s for s in win if now - s[0] <= MOTION_WINDOW_S]
-    r_mags = [math.sqrt(ax * ax + ay * ay + az * az) for (_, ax, ay, az) in recent] or mags[-1:]
-    r_mean = sum(r_mags) / len(r_mags)
-    r_std = math.sqrt(sum((m - r_mean) ** 2 for m in r_mags) / len(r_mags))
-    r_peak = max(r_mags)
-
-    steps = count_steps(win, mags, mean)
-    dev.st["step_count"] = steps
-
-    zcr = zero_cross_rate(r_mags, dt)          # 起伏频率，用来区分步行与晃动
-
-    # ---- 晃动：窗口内计数（修复前是开机累计值，文案却说"最近 8 秒内"）----
-    shaking = r_std > MOTION_STD and zcr > SHAKE_ZCR
-    if shaking:
-        if not dev.shake_times or (now - dev.shake_times[-1]) >= SHAKE_MIN_GAP_S:
-            dev.shake_times.append(now)
-            events.append(("shake", "检测到晃动/敲击（%.1f Hz）" % zcr))
-    while dev.shake_times and (now - dev.shake_times[0]) > WINDOW_S:
-        dev.shake_times.popleft()
-    dev.st["shake_count"] = len(dev.shake_times)
-
-    # ---- 跌落：短窗内的连续失重 ----
-    fall_run = max_freefall_run(r_mags, dt)
-    fall_active = fall_run > 0
-    if fall_active and not prev_fall:
-        events.append(("fall", "检测到疑似跌落（失重 %.0f ms）" % (fall_run * dt * 1000)))
-    dev.st["fall_active"] = fall_active
-
-    # ---- 分类 ----
-    if fall_active:
-        activity = "疑似跌落(失重)!"
-    elif shaking:
-        activity = "剧烈晃动"
-    elif r_std > MOTION_STD and zcr >= WALK_ZCR_MIN:
-        activity = "运动/步行 (峰值 %.1fg, 约%d步)" % (r_peak, steps)
-    elif r_std > MOTION_STD:
-        activity = "运动 (峰值 %.1fg)" % r_peak
-    else:
-        tail = [s for s in win if now - s[0] <= 1.0] or win[-1:]
-        gx = sum(s[1] for s in tail) / len(tail)
-        gy = sum(s[2] for s in tail) / len(tail)
-        d = tilt_direction(gx, gy)
-        activity = ("静置·向%s倾斜" % d) if d else "静置·水平"
-
-    if activity != prev_activity:
-        events.append(("activity", "活动变化：%s → %s" % (prev_activity, activity)))
-    return activity, events
+# --------------------------------------------------------------------------
+# 运动分析：本地规则"AI" —— 已搬到 `server/analysis.py`
+#
+# 那 5 个函数（tilt_direction / count_steps / max_freefall_run /
+# zero_cross_rate / analyze）加上它们的 11 个阈值常量整体搬走了：
+# 依赖图显示它们只互相引用，模块级可变状态一个都不碰。
+# **改计步/晃动/跌落的阈值去那个文件**，别在这里加常量。
+#
+# 本文件顶部 import 了 analyze 与 tilt_direction（后者被下面的 ai_summary 用）。
+# 坐标契约也一并搬过去了：板端上报的 x/y 已是屏幕坐标系（+x 右、+y 下）。
+# --------------------------------------------------------------------------
 
 
 def ai_summary(dev):
@@ -980,7 +1047,10 @@ def _transcribe_cloud(cfg, wav):
     req = urllib.request.Request(
         cfg["base"] + "/audio/transcriptions", data=body,
         headers={"Content-Type": "multipart/form-data; boundary=" + boundary,
-                 "Authorization": "Bearer " + cfg["key"]},
+                 "Authorization": "Bearer " + cfg["key"],
+                 # 与大模型同一原因（LLM_USER_AGENT 的注释）：
+                 # urllib 默认 UA 会被部分网关按签名封禁。
+                 "User-Agent": LLM_USER_AGENT},
     )
     try:
         with urllib.request.urlopen(req, timeout=ASR_TIMEOUT) as resp:
@@ -1021,19 +1091,23 @@ def transcribe(audio_bytes):
         return None, "本地识别失败(%s)" % exc.__class__.__name__
 
 
-def ask_llm(dev, question):
+def ask_llm(dev, question, timeout=None, for_board=False):
     """可选：调用 OpenAI 兼容大模型。未配置/失败返回 None → 回退本地模板。
 
     第 4 周「澄清」：带上该设备最近的对话历史，这样"再详细点""那刚才呢"
     这类追问能被理解。历史**按设备隔离**（课堂 20 块板共用一台服务器），
     而且只放问答文本 —— 每轮都重塞一遍遥测摘要既费 token 又会把
     上下文淹没在重复内容里。
+
+    `timeout`：显式覆盖本次请求的等待上限（秒）；
+    `for_board`：为 True 时使用收紧后的 RW1_LLM_BOARD_TIMEOUT 上限（默认 10s）。
     """
-    key = os.environ.get("RW1_LLM_API_KEY")
-    if not key:
+    _load_dotenv()
+    cfg = _llm_cfg(for_board=for_board)
+    if cfg is None:
         return None
-    base = os.environ.get("RW1_LLM_BASE_URL", "https://api.openai.com/v1").rstrip("/")
-    model = os.environ.get("RW1_LLM_MODEL", "gpt-4o-mini")
+    if timeout is not None:
+        cfg["timeout"] = timeout
     with LOCK:
         history = list(dev.chat)
     # ai_summary() 内部要取 LOCK，必须在 with LOCK 之外调用（否则自锁）
@@ -1043,30 +1117,176 @@ def ask_llm(dev, question):
     messages.extend({"role": r, "content": c} for r, c in history)
     messages.append({"role": "user",
                      "content": "开发板传感器情况：%s\n同学想问：%s" % (ai_summary(dev), question)})
-    payload = {"model": model, "messages": messages, "max_tokens": 300}
-    req = urllib.request.Request(
-        base + "/chat/completions",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json", "Authorization": "Bearer " + key},
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=LLM_TIMEOUT) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-        return data["choices"][0]["message"]["content"].strip()
-    except Exception as exc:  # noqa: BLE001 —— 任何失败都回退本地模板
-        push_event(dev, "warn", "大模型调用失败(%s)，已用本地AI回复" % exc.__class__.__name__)
+    payload = {"model": cfg["model"], "messages": messages, "max_tokens": 300}
+
+    # 实测这个上游（new-api 网关 + Cloudflare）丢包严重：建连成功率约六成。
+    # 所以失败**必须重试**：连接类错误、超时、429、5xx、返回非 JSON 都可能是
+    # 瞬时故障；4xx（除 429）是配置/权限问题，重试没意义，直接报原因。
+    # 任何路径都不许静默卡死 —— 最终一定落一句可读原因进事件流。
+    last_err = "未知错误"
+    attempts = 0
+    for attempt in range(1 + cfg["retries"]):
+        attempts = attempt + 1
+        try:
+            req = urllib.request.Request(
+                cfg["base"] + "/chat/completions",
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json",
+                         "Authorization": "Bearer " + cfg["key"],
+                         # Cloudflare 按 UA 签名封禁 urllib 默认 UA（403/1010），
+                         # 必须显式给 —— 见 LLM_USER_AGENT 的注释。
+                         "User-Agent": LLM_USER_AGENT},
+            )
+            with urllib.request.urlopen(req, timeout=cfg["timeout"]) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            text = _llm_extract_text(data)
+            if text:
+                return text
+            last_err = "响应格式异常（找不到正文）"
+        except json.JSONDecodeError:
+            # 网关抖起来会回 Cloudflare 的 HTML 错误页 —— 按瞬时故障处理（重试）
+            last_err = "响应不是合法 JSON"
+        except urllib.error.HTTPError as exc:
+            last_err = _llm_error_text(exc)
+            if exc.code not in (429,) and not (500 <= exc.code < 600):
+                break                      # 4xx 配置错误，重试无意义
+        except Exception as exc:  # noqa: BLE001 —— 连接/超时/DNS 都按瞬时故障重试
+            last_err = _llm_error_text(exc)
+        if attempt < cfg["retries"]:
+            time.sleep(1.0)              # 退避一拍再来，别把网关刷成真正的限流
+    push_event(dev, "warn", "大模型调用失败（%s，共试 %d 次），已用本地AI回复"
+               % (last_err, attempts))
+    return None
+
+
+def _llm_cfg(for_board=False):
+    """大模型配置；没配 key 返回 None（= 整个功能降级到本地规则 AI）。
+
+    base / model / 超时 / 重试次数全部走环境变量（.env 由 _load_dotenv 补齐），
+    代码里不落地任何密钥。默认值保持 OpenAI 官方端点，换渠道只改配置不改代码。
+    """
+    key = os.environ.get("RW1_LLM_API_KEY")
+    if not key:
         return None
+    timeout = float(os.environ.get("RW1_LLM_TIMEOUT", str(LLM_TIMEOUT)))
+    if for_board:
+        board_timeout = float(os.environ.get("RW1_LLM_BOARD_TIMEOUT",
+                                             str(LLM_BOARD_TIMEOUT)))
+        timeout = min(timeout, board_timeout)
+    return {
+        "key": key,
+        "base": os.environ.get("RW1_LLM_BASE_URL",
+                               "https://api.openai.com/v1").rstrip("/"),
+        "model": os.environ.get("RW1_LLM_MODEL", "gpt-4o-mini"),
+        "timeout": timeout,
+        "retries": max(0, min(5, int(os.environ.get("RW1_LLM_RETRIES", "2")))),
+    }
 
 
-def _llm_worker(dev, question, token):
+def _llm_extract_text(data):
+    """从 OpenAI 兼容响应里取正文，容忍几种结构变体。取不到返回 None。
+
+    实测记录（2026-11-03，qwen3.8-27b @ new-api 网关）：标准结构之外还带着
+    `reasoning_content`（思考过程）—— 那是**模型的草稿，不是给用户看的**，
+    content 为空的退化场合宁可判格式异常、回退本地 AI，也不拿草稿冒充正文。
+    """
+    try:
+        ch = data.get("choices")
+        if isinstance(ch, list) and ch:
+            first = ch[0]
+            if isinstance(first, dict):
+                msg = first.get("message")
+                if isinstance(msg, dict):
+                    t = msg.get("content")
+                    if isinstance(t, str) and t.strip():
+                        return t.strip()
+                t = first.get("text")
+                if isinstance(t, str) and t.strip():
+                    return t.strip()
+        for k in ("content", "reply", "text", "output", "answer"):
+            t = data.get(k)
+            if isinstance(t, str) and t.strip():
+                return t.strip()
+    except (AttributeError, TypeError, IndexError, KeyError):
+        pass
+    return None
+
+
+def _llm_error_text(exc):
+    """把一次失败的异常翻成给用户看的一句中文原因。**绝不带任何密钥**。"""
+    if isinstance(exc, urllib.error.HTTPError):
+        code = exc.code
+        if code == 401:
+            return "密钥被拒（401）"
+        if code == 403:
+            return "没有权限（403）"
+        if code == 404:
+            return "接口或模型不存在（404）"
+        if code == 429:
+            return "上游限流（429）"
+        if 500 <= code < 600:
+            return "上游服务错误（%d）" % code
+        return "上游拒绝（%d）" % code
+    msg = ("%s: %s" % (exc.__class__.__name__, exc)).lower()
+    if "timed out" in msg or "timeout" in msg or isinstance(exc, (TimeoutError,)):
+        return "请求超时"
+    if "getaddrinfo" in msg or "11001" in msg or "name or service" in msg \
+            or "temporary failure" in msg or "解析" in msg:
+        return "DNS 解析失败"
+    return "连接失败"
+
+
+_DOTENV_LOADED = False
+
+
+def _load_dotenv():
+    """把仓库根目录 `.env` 里的 RW1_* 读进环境变量（**只补缺省，不覆盖**）。
+
+    `.env` 在 .gitignore 里（密钥绝不入库、不打印）。只放行 RW1_ 前缀，
+    防止一个配置文件悄悄改掉进程的其它行为。文件不存在就静默跳过 —
+    和「不配大模型也能完整跑通」是同一条原则。
+    """
+    global _DOTENV_LOADED
+    if _DOTENV_LOADED:
+        return
+    _DOTENV_LOADED = True
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                        ".env")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, _, v = line.partition("=")
+                k = k.strip()
+                v = v.strip().strip('"').strip("'")
+                if k.startswith("RW1_") and k and k not in os.environ:
+                    os.environ[k] = v
+    except OSError:
+        pass
+
+
+def _llm_worker(dev, question, token, timeout=None, for_board=False):
     """后台线程：调大模型，完成后把结果写回该设备的状态。
 
     注意 ai_summary() 内部会取 LOCK，必须在进入 with LOCK 之前调用，否则自锁。
 
     `token` 是发起这次请求时的取消令牌。回来时若令牌已变（用户按了「停止」），
     结果就**直接丢弃** —— 而不是先写进去再被清掉，那样屏幕上会闪一下旧答案。
+
+    并发上限见 `_LLM_SEM`（LLM_MAX_CONCURRENT）：全班同时提问时排队，
+    排太久就明说并回退本地 AI，不让请求烂在队列里。
     """
-    reply = ask_llm(dev, question)
+    reply = None
+    if _LLM_SEM.acquire(timeout=LLM_QUEUE_TIMEOUT):
+        try:
+            reply = ask_llm(dev, question, timeout=timeout, for_board=for_board)
+        finally:
+            _LLM_SEM.release()
+    else:
+        push_event(dev, "warn", "大模型请求排队超过 %gs，已用本地 AI 回复"
+                                % LLM_QUEUE_TIMEOUT)
     mode = "大模型" if reply else "规则AI"
     if not reply:
         reply = ai_summary(dev)
@@ -1086,7 +1306,10 @@ def _llm_worker(dev, question, token):
         # 记进对话历史（第 4 周「澄清」的原料）
         dev.chat.append(("user", question))
         dev.chat.append(("assistant", reply))
-    push_event(dev, "ai" if mode == "大模型" else "warn",
+    # 规则 AI 的正常回复记 info：warn 留给真正的告警（识别失败、大模型调用失败）。
+    # 前端 CSS 里只有 .k-info 没有 .k-warn —— 原来 warn 事件的圆点是"无色"的，
+    # 这条顺带把"规则 AI 回复在事件流里没有颜色"一起修了。
+    push_event(dev, "ai" if mode == "大模型" else "info",
                "%s回复：%s" % (mode, reply[:60]))
 
 
@@ -1274,7 +1497,7 @@ def run_intent(dev, question, intent):
     return spoken
 
 
-def request_ai(dev, question):
+def request_ai(dev, question, llm_timeout=None, for_board=False):
     """处理一次板端提问，**立即**返回文本；大模型在后台生成，稍后自动生效。
 
     板端每个遥测周期都会带回最新的 ai_reply，所以后台结果下一帧就会显示，
@@ -1289,6 +1512,9 @@ def request_ai(dev, question):
     if intent is not None:
         return run_intent(dev, question, intent)
 
+    # .env 只在这里和 ask_llm 里读一次（幂等）：没有这一行的话，
+    # 只在 .env 里配了 key 的用户会永远走不到大模型这条路。
+    _load_dotenv()
     if os.environ.get("RW1_LLM_API_KEY"):
         with LOCK:
             if dev.st["ai_pending"]:
@@ -1303,8 +1529,9 @@ def request_ai(dev, question):
             dev.st["ai_t0"] = time.time()    # 计时：生成从这一刻算起
             dev.st["ai_ms"] = 0
         push_event(dev, "ask", "板端提问「%s」→ 已转交大模型" % question)
-        threading.Thread(target=_llm_worker, args=(dev, question, token), daemon=True,
-                         name="llm").start()
+        threading.Thread(target=_llm_worker,
+                         args=(dev, question, token, llm_timeout, for_board),
+                         daemon=True, name="llm").start()
         return "正在思考…"
 
     reply = ai_summary(dev)
@@ -1360,7 +1587,12 @@ def _voice_worker(dev, data, saved, turn=None):
     那种情况下这段**迟到的识别结果属于上一轮**，不能再拿它去调 request_ai，
     否则会用一个旧问题顶掉用户刚得到的新答案。
     """
-    t0 = dev.st.get("voice_t0") or 0.0
+    with LOCK:
+        # voice_t0 是共享状态（_ask 会清零、下一轮录音会改写），读它必须持锁 ——
+        # 全文件其它对 dev.st 的读都在锁内，唯独这里漏着。就在 worker 启动这一刻
+        # 取值：语义与原来的无锁读**完全一致**（CPython 下本来也读不坏），只是补上
+        # 锁纪律；若挪到 transcribe 之后反而会改变行为（识别期间被清零时耗时会算成 0）。
+        t0 = dev.st.get("voice_t0") or 0.0
     text, err = transcribe(data)
     now = time.time()
     with LOCK:
@@ -1391,7 +1623,8 @@ def _voice_worker(dev, data, saved, turn=None):
         dev.st["voice_err"] = ""
         dev.st["voice_state"] = "thinking"
     push_event(dev, "ask", "识别到「%s」%s" % (text, ("（%s）" % saved) if saved else ""))
-    request_ai(dev, text)
+    # 板端语音提问：孩子等不了 reasoning 模型的 10s+，用收紧的上限（见 LLM_BOARD_TIMEOUT 注释）
+    request_ai(dev, text, for_board=True)
     # 规则 AI 是同步返回的，这会儿已经出结果了；大模型还要等后台线程，
     # 那种情况下 voice_state 留在 "thinking"，等 _llm_worker 收尾时自然回落。
     with LOCK:
@@ -1465,11 +1698,41 @@ class DashboardServer(ThreadingHTTPServer):
 class Handler(BaseHTTPRequestHandler):
     server_version = "RW1/1.1"
     protocol_version = "HTTP/1.1"     # 让板端的 esp_http_client 能复用连接
+    # 套接字超时。不设的话，一个"连上但不说话"的客户端（或睡着的笔记本挂着的
+    # SSE 半开连接）能永久占住一个线程 —— ThreadingHTTPServer 每连接一线程、
+    # 且没有上限，几十个睡着的浏览器标签就够把线程数堆起来。
+    # SSE 那边每 500 ms 一写，正常客户端永远不会触发；写超时被 `except OSError`
+    # 接住并退出循环，是干净的收尾路径。
+    timeout = 30
 
     def log_message(self, fmt, *args):   # 安静一点
         pass
 
     # ---- helpers ---------------------------------------------------------
+    def _origin_ok(self):
+        """写入口的同源校验（CSRF 防护）。
+
+        威胁模型换个角度看就成立了：**同学/老师浏览任意网页时，那个网页可以
+        `fetch('http://<本机IP>:8000/api/command', {mode:'no-cors'})`** ——
+        CORS 只挡"读响应"，**挡不住请求真的被执行**。配合默认无 token，
+        一条表单就能把 SD 卡格了。
+
+        规则：浏览器会自动带 `Origin`（跨站 POST 一定带）。带了就必须和本次
+        请求的 Host 一致；不带（curl / 板端 / 老工具）一律放行 —— 那些都不是
+        浏览器自动发起的跨站请求，挡住了只会误伤脚本。
+        反向代理把 Host 改掉的场景，可以用 `RW1_ALLOW_CROSS_ORIGIN=1` 关掉这道检查。
+        """
+        if ALLOW_CROSS_ORIGIN:
+            return True
+        origin = (self.headers.get("Origin") or "").strip()
+        if not origin:
+            origin = (self.headers.get("Referer") or "").strip()
+        if not origin:
+            return True
+        netloc = urlsplit(origin).netloc.strip().lower()
+        host = (self.headers.get("Host") or "").strip().lower()
+        return bool(netloc) and netloc == host
+
     def _send_vendor(self, relpath, ctype):
         """只服务仓库里那几个 vendor 文件；路径写死在调用点，不接受外部输入。"""
         full = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -1508,30 +1771,66 @@ class Handler(BaseHTTPRequestHandler):
 
     def _send(self, code, body, ctype="application/json; charset=utf-8", extra=None):
         data = body if isinstance(body, bytes) else body.encode("utf-8")
+        extra = extra or {}
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
-        self.send_header("Cache-Control", "no-store")
+        # `extra` 里给了同名头就以 extra 为准。原来是无条件先写 no-store 再追加，
+        # 于是 /api/shots/<dev>/<file> 的响应同时带着
+        # `no-store` 和 `max-age=31536000` 两个互相矛盾的值（实测确认）——
+        # 浏览器按最严的处理，照片于是永远不缓存，每翻一次列表就重下一遍。
+        if "Cache-Control" not in extra:
+            self.send_header("Cache-Control", "no-store")
         # 每个请求一连接就关：板端本来就是一次 POST 一个 client，浏览器这边请求也
         # 很少。省掉 keep-alive 的状态机，行为对两端都最好预测。
+        # ⚠️ 代价见 README「性能」：32 板 × 2 Hz 时服务端侧会堆 TIME_WAIT，
+        # 这也是 period_ms 下界必须卡在 100ms 的原因（见 sanitize_params）。
         self.send_header("Connection", "close")
-        for k, v in (extra or {}).items():
+        for k, v in extra.items():
             self.send_header(k, v)
         self.end_headers()
         self.wfile.write(data)
 
     def _read_json(self):
-        n = int(self.headers.get("Content-Length") or 0)
-        if n <= 0 or n > 4 * 1024 * 1024:
+        """读一个 JSON body，返回 dict。
+
+        三种结果，调用方必须区分：
+          - 没带 body（Content-Length 为 0/缺省）→ `{}`：老调用方的"默认值"路径照旧；
+          - 带了但读不了（Content-Length 不是数字 / 超 4MB / 不是合法 JSON /
+            不是对象）→ `None`：**一律 400**，不许悄悄当空对象处理；
+          - 正常 → 解析出的 dict。
+
+        为什么必须区分（2026-11-02 实测才修的）：原来坏 body 一律返回 `{}`，
+        而 `_command` 对空对象会兜出默认名 `capture_once` —— 一坨非 JSON 垃圾
+        POST 到 /api/command，服务端**真的下发了一条合法命令**（HTTP 200）；
+        JSON 数组则更糟，`list.get` 直接 AttributeError → 500 + traceback。
+        `Content-Length: abc` 也是同一族：`int()` 抛 ValueError，
+        `_frame`/`_audio` 早就各自挡了，唯独这里漏着。
+        """
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            return None
+        if n <= 0:
             return {}
+        if n > 4 * 1024 * 1024:
+            # 拒绝也要把话说完整（T58 的老规矩）：读掉一部分再回 400，
+            # 客户端拿到的才是我们写的错误而不是连接重置。
+            # 陪它读的上限就是合法上限本身，再大就不奉陪了。
+            try:
+                self.rfile.read(4 * 1024 * 1024)
+            except OSError:
+                pass
+            return None
         try:
             # errors="replace": 即使个别字节异常也不影响数字字段解析
-            return json.loads(self.rfile.read(n).decode("utf-8", errors="replace"))
+            obj = json.loads(self.rfile.read(n).decode("utf-8", errors="replace"))
         except (ValueError, UnicodeDecodeError):
-            return {}
+            return None
+        return obj if isinstance(obj, dict) else None
 
     def _drain(self, n):
         """把请求体读掉再回绝。
@@ -1554,7 +1853,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path, _, query = self.path.partition("?")
         if path == "/":
-            self._send(200, DASHBOARD_HTML, "text/html; charset=utf-8")
+            self._send(200, dashboard_html(), "text/html; charset=utf-8")
         elif path == "/vendor/three.min.js":
             # **白名单**，不做通用静态目录：通用目录会把 server/data/ 里的遥测
             # jsonl（含设备名、事件文本）也一并暴露出去。
@@ -1575,16 +1874,32 @@ class Handler(BaseHTTPRequestHandler):
             want = query_param(query, "device")
             with LOCK:
                 dev = pick_device(clean_device_id(want) if want else None)
-                snap = snapshot(dev)
+                # 瘦身通道：只带**活状态**（设备名/在线/活动/计数/AI/语音/计时）
+                # + 曲线样本 + 设备列表。events 与 commands 是 SSE 的独通道 ——
+                # 见 snapshot() 的 docstring：10Hz 在锁内序列化全量历史会跟
+                # 20 块板的上报抢锁，而同一个浏览器页面 500ms 后就会从 SSE
+                # 拿到它们。**不要再往这里加历史字段**（T47 的教训反过来用：
+                # 两条通道可以分工，但同一份数据只能有一个权威来源）。
+                snap = snapshot(dev, with_events=False, with_commands=False)
                 # ⚠️ **必须带上设备列表**：网页的 pull() 是每 100ms 一次，
                 # 而 renderDevices() 在"列表 ≤ 1 台"时会把「设备」区域藏起来。
                 # 早先这里不带 devices，于是多板课堂下那一块会以取数频率疯狂闪烁
                 # （SSE 每 500ms 把它显示出来、/api/latest 每 100ms 又把它藏起来），
                 # 而且大部分时间是不可见的 —— 2026-09-26 用真浏览器才抓到。
                 snap["devices"] = devices_snapshot()
+                # 曲线点数：**按画布宽度取，不按窗口长度取**。
+                # 那块 canvas 的 CSS 宽度约 240 px（高分屏 480 物理像素），
+                # 120 个点已经超过可分辨的像素数；原来发 240 个点，多出来的一半
+                # 在 drawChart 里直接落在同一列像素上 —— 纯字节。实测载荷
+                # 16.3 KB → 约 8.6 KB。
                 snap["samples"] = [[round(t, 2), x, y, z]
-                                   for (t, x, y, z) in decimate(dev.samples, 240)]
-            self._send(200, json.dumps(snap, ensure_ascii=False))
+                                   for (t, x, y, z) in decimate(dev.samples, CURVE_POINTS)]
+                # 序列化也必须在锁内：events/commands 的快照与活记录共享可变字段，
+                # 锁外 json.dumps 会把"拍完之后"的迁移混进这一帧（mixed snapshot）。
+                # 只把**字节**先在锁内做好；socket 发送留在锁外 —— 持锁写一个
+                # 慢客户端会连累全部板子的上报（T46 同款道理：别在锁里做 IO）。
+                payload = json.dumps(snap, ensure_ascii=False).encode("utf-8")
+            self._send(200, payload, "application/json; charset=utf-8")
         elif path == "/api/commands":
             want = query_param(query, "device")
             with LOCK:
@@ -1593,6 +1908,19 @@ class Handler(BaseHTTPRequestHandler):
                 did = dev.id
             self._send(200, json.dumps({"ok": True, "device": did, "commands": cmds,
                                         "names": list(CMD_NAMES)}, ensure_ascii=False))
+        elif path == "/api/events":
+            # 事件流的"全量"出口。SSE 每帧只发最近 SSE_EVENTS_MAX 条（那是前端
+            # 真正会画出来的量），想翻更早的历史就走这里 —— 服务端保留 200 条。
+            want = query_param(query, "device")
+            limit = clamp_int(query_param(query, "limit"), 1, 200, 200)
+            with LOCK:
+                dev = pick_device(clean_device_id(want) if want else None)
+                evts = list(dev.events)[:limit]
+                kept = len(dev.events)
+                did = dev.id
+            self._send(200, json.dumps({"ok": True, "device": did,
+                                        "events": evts, "kept": kept},
+                                       ensure_ascii=False))
         elif path == "/api/logs":
             self._send(200, json.dumps(LOGGER.stats() if LOGGER else {}, ensure_ascii=False))
         elif path == "/api/frame":
@@ -1617,6 +1945,12 @@ class Handler(BaseHTTPRequestHandler):
                                        ensure_ascii=False))
         elif path.startswith("/api/shots/"):
             self._send_shot(path[len("/api/shots/"):])
+        elif path == "/api/files":
+            self._files_index(query)
+        elif path == "/api/files/download":
+            self._file_send(query, preview=False)
+        elif path == "/api/files/preview":
+            self._file_send(query, preview=True)
         elif path == "/api/stream":
             self._sse(query)
         else:
@@ -1624,6 +1958,27 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path, _, query = self.path.partition("?")
+        # CSRF：写入口必须是"同源"发起的（见 _origin_ok 的威胁模型）。
+        # 放在密钥门之前 —— 跨站请求连"试一次 token"的机会都不该有。
+        if path in WEB_WRITE_PATHS and not self._origin_ok():
+            self._send(403, json.dumps(
+                {"ok": False, "error": "cross-origin blocked",
+                 "hint": "写操作只接受同源请求（用仪表盘页面操作，或去掉 Origin 头）"},
+                ensure_ascii=False))
+            return
+        # 网页写入口的访问密钥门（API_TOKEN 为空时整段跳过，行为与以前一样）。
+        # 故意**不门** /api/telemetry、/api/frame、/api/audio：那是板子的上报
+        # 通道，老固件没有密钥可带，门了就等于把全班挡在门外（后向兼容 > 洁癖）。
+        if API_TOKEN and path in WEB_WRITE_PATHS:
+            got = (self.headers.get("X-RW1-Token")
+                   or query_param(query, "token") or "")
+            if not hmac.compare_digest(got.encode("utf-8"),
+                                       API_TOKEN.encode("utf-8")):
+                self._send(401, json.dumps(
+                    {"ok": False, "error": "bad token",
+                     "hint": "服务端开启了访问密钥：网页页脚点「🔑 密钥」填写"},
+                    ensure_ascii=False))
+                return
         if path == "/api/telemetry":
             self._telemetry()
         elif path == "/api/command":
@@ -1638,6 +1993,10 @@ class Handler(BaseHTTPRequestHandler):
             self._ask_cancel(query)
         elif path == "/api/shots/delete":
             self._shot_delete()
+        elif path == "/api/files/delete":
+            self._file_delete()
+        elif path == "/api/files/upload":
+            self._file_upload(query)
         else:
             self._send(404, json.dumps({"ok": False, "error": "not found"}))
 
@@ -1665,6 +2024,13 @@ class Handler(BaseHTTPRequestHandler):
             old = FRAMES.get(dev)
             FRAMES[dev] = {"jpeg": data, "ts": time.time(),
                            "n": (old["n"] + 1) if old else 1}
+            # 基数封顶：设备名是外部输入，不封的话"无限设备名 × 400 KB"就是
+            # 一条不需要任何凭据的内存耗尽路径（见 FRAME_MAX_DEVICES 的注释）。
+            while len(FRAMES) > FRAME_MAX_DEVICES:
+                victim = min(FRAMES, key=lambda k: FRAMES[k]["ts"])
+                if victim == dev:
+                    break                    # 刚写进来的这台永远是"最新"，不会选中
+                FRAMES.pop(victim, None)
         saved = None
         if save:
             saved = self._shot_save(dev, data)
@@ -1677,6 +2043,12 @@ class Handler(BaseHTTPRequestHandler):
             return None
         d = os.path.join(SHOTS_DIR, safe_name(dev))
         try:
+            # 设备目录数封顶：每台设备 200 张是"每台的上限"，但设备名是外部输入，
+            # 没有这一道就能用无限个设备名造出无限个目录（磁盘写满）。
+            # 已经在册的设备照常写；新设备到顶就不存 —— 板端只是少一份留档，
+            # 网页上那张照片本来就是"顺手留的"，不影响拍照本身。
+            if not os.path.isdir(d) and self._shot_dev_dirs() >= SHOT_MAX_DEVICES:
+                return None
             os.makedirs(d, exist_ok=True)
             name = time.strftime("%Y%m%d-%H%M%S") + "-%03d.jpg" % (int(time.time() * 1000) % 1000)
             with open(os.path.join(d, name), "wb") as fh:
@@ -1693,10 +2065,45 @@ class Handler(BaseHTTPRequestHandler):
             print("  拍照存盘失败: %s" % e)
             return None
 
+    @staticmethod
+    def _shot_dev_dirs():
+        """`SHOTS_DIR` 下已经有多少个设备目录（用于 SHOT_MAX_DEVICES 封顶）。"""
+        try:
+            with os.scandir(SHOTS_DIR) as it:
+                return sum(1 for e in it if e.is_dir())
+        except OSError:
+            return 0
+
+    @staticmethod
+    def _audio_dev_dirs():
+        """`AUDIO_DIR` 下已经有多少个设备目录（用于 AUDIO_MAX_DEVICES 封顶）。"""
+        try:
+            with os.scandir(AUDIO_DIR) as it:
+                return sum(1 for e in it if e.is_dir())
+        except OSError:
+            return 0
+
     def _shots_list(self, query):
-        dev = clean_device_id(query_param(query, "device") or "")
+        """列某台设备的留档照片。
+
+        `?device=` **缺省**时回退到"最近上报的那台"，和 /api/latest、/api/frame
+        一个口径 —— 网页单板场景下 selDevice 是空的，三个取数接口都靠这条回退。
+        原来这里 `clean_device_id("")` 会得到兜底名 `"-"`，于是去翻 SHOTS_DIR/-/
+        （永远不存在），**单板课堂存下来的照片一张也列不出来**（2026-11-12 抓到：
+        文件在盘上、save=1 也返回 ok，网页列表恒为空）。
+
+        ⚠️ **给了名字就不要走 pick_device**：留档目录只认设备名，而"只推帧、
+        从不上报遥测"的设备（相机板 / 已被 LRU 淘汰的板）不在 DEVICES 册子里，
+        pick_device 会把它悄悄换成别台 —— 指名查照片却拿到别人的列表。
+        """
+        want = query_param(query, "device") or ""
+        if want:
+            dev = clean_device_id(want)
+        else:
+            with LOCK:
+                dev = pick_device(None).id
         out = []
-        if SHOTS_DIR and dev:
+        if SHOTS_DIR:
             d = os.path.join(SHOTS_DIR, safe_name(dev))
             if os.path.isdir(d):
                 for f in sorted(os.listdir(d), reverse=True):
@@ -1712,8 +2119,11 @@ class Handler(BaseHTTPRequestHandler):
         """按设备+文件名取一张留档照片。**路径必须夹紧**，不能让它读到目录外。"""
         name = urllib.parse.unquote(name)
         dev, _, fn = name.rpartition("/")
+        # ":" 一并拒绝：Windows 上它是 NTFS 备用数据流的分隔符（"x.jpg:evil"），
+        # 虽然服务端自生成的文件名不含冒号、当前没有实际攻击面，但校验是白名单
+        # 性质 —— 越紧越不容易被将来的改动绕出意外。
         if (not dev or not fn or "/" in fn or "\\" in fn or ".." in fn
-                or ".." in dev or not SHOTS_DIR):
+                or ":" in fn or ".." in dev or not SHOTS_DIR):
             self._send(404, b"", "image/jpeg")
             return
         full = os.path.join(SHOTS_DIR, safe_name(dev), fn)
@@ -1726,9 +2136,19 @@ class Handler(BaseHTTPRequestHandler):
 
     def _shot_delete(self):
         msg = self._read_json()
-        dev = clean_device_id(str(msg.get("device", "")))
+        if msg is None:
+            self._send(400, json.dumps({"ok": False, "error": "bad json body"},
+                                       ensure_ascii=False))
+            return
+        raw_dev = str(msg.get("device") or "").strip()
+        if raw_dev:
+            dev = clean_device_id(raw_dev)
+        else:
+            with LOCK:
+                dev = pick_device(None).id
         fn = str(msg.get("name", ""))
-        if (not dev or not fn or "/" in fn or "\\" in fn or ".." in fn or not SHOTS_DIR):
+        if (not dev or not fn or "/" in fn or "\\" in fn or ".." in fn
+                or ":" in fn or not SHOTS_DIR):
             self._send(400, json.dumps({"ok": False, "error": "bad request"},
                                        ensure_ascii=False))
             return
@@ -1738,6 +2158,236 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, json.dumps({"ok": True}, ensure_ascii=False))
         except OSError as e:
             self._send(404, json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False))
+
+    # ---- 文件管理（2026-11-04）--------------------------------------------
+    def _files_index(self, query):
+        """列某台设备（或日志目录）下的文件。`?cat=shots|audio|logs` 可选。"""
+        cat = (query_param(query, "cat") or "").strip()
+        if cat and cat not in FILE_CATS:
+            self._send(400, json.dumps({"ok": False, "error": "unknown category"},
+                                       ensure_ascii=False))
+            return
+        device = (query_param(query, "device") or "").strip()
+        keys = [cat] if cat else list(FILE_CATS)
+        # 明确点名了设备就**必须合法**：这种情况下要是也"好心兜底"，
+        # 一次 `?device=..` 的拼错就会变成"列/删了最近那台板子的目录"。
+        if device and any(k != "logs" for k in keys) and not file_device_dir(device):
+            self._send(400, json.dumps({"ok": False, "error": "bad device name"},
+                                       ensure_ascii=False))
+            return
+        # 只读列表允许"没给设备"：和 /api/shots 一样退回最近上报的那台
+        # （单板场景页面永远不带 ?device=）。**删除/上传不享受这个兜底** ——
+        # 写操作必须点名设备，免得手一滑删掉别人的文件。
+        if not device and any(k != "logs" for k in keys):
+            with LOCK:
+                device = pick_device(None).id
+        cats = []
+        for key in keys:
+            base = file_cat_dir(key)
+            files = []
+            note = ""
+            folder = None
+            if base is None:
+                note = "目录未初始化"
+            elif key == "logs":
+                folder = base
+            else:
+                sd = file_device_dir(device)
+                if sd:
+                    folder = os.path.join(base, sd)
+                else:
+                    note = "需要先选择设备"
+            if folder and os.path.isdir(folder):
+                try:
+                    with os.scandir(folder) as it:
+                        for ent in it:
+                            try:
+                                if not ent.is_file():
+                                    continue
+                                stt = ent.stat()
+                            except OSError:
+                                continue     # 列目录时被删掉/无权限：跳过这一条
+                            lname = ent.name.lower()
+                            files.append({"name": ent.name, "bytes": stt.st_size,
+                                          "mtime": round(stt.st_mtime, 1),
+                                          "text": lname.endswith(TEXT_EXTS)})
+                except OSError as e:
+                    note = "读取目录失败: %s" % e
+            # 先按时间排再截断：截断必须留下**最近的** 500 条，而不是 scandir
+            # 碰上什么算什么（旧实现是先截后排，超限时留下的是任意 500 条）。
+            files.sort(key=lambda f: (-f["mtime"], f["name"]))
+            capped = len(files) > FILE_LIST_MAX
+            files = files[:FILE_LIST_MAX]
+            cats.append({"key": key, "label": FILE_CATS[key], "files": files,
+                         "note": note, "capped": capped,
+                         "device": device if key != "logs" else ""})
+        self._send(200, json.dumps({"ok": True, "device": device, "categories": cats,
+                                    "max_bytes": FILE_MAX_BYTES,
+                                    "preview_max": FILE_PREVIEW_MAX},
+                                   ensure_ascii=False))
+
+    def _file_send(self, query, preview):
+        """下载 / 预览。预览只读前 limit 字节并明确标注 truncated。"""
+        cat = (query_param(query, "cat") or "").strip()
+        name = query_param(query, "name") or ""
+        path = file_path(cat, query_param(query, "device") or "", name)
+        if path is None:
+            # 路径/设备/分类不合法 → 400（404 会让人以为"文件只是没了"，
+            # 掩盖掉真正的坏输入）
+            self._send(400, json.dumps({"ok": False, "error": "bad path or device"},
+                                       ensure_ascii=False))
+            return
+        if not os.path.isfile(path):
+            self._send(404, json.dumps({"ok": False, "error": "no such file"},
+                                       ensure_ascii=False))
+            return
+        if preview and not name.lower().endswith(TEXT_EXTS):
+            self._send(415, json.dumps({"ok": False, "error": "not a text file"},
+                                       ensure_ascii=False))
+            return
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            self._send(404, json.dumps({"ok": False, "error": "stat failed"},
+                                       ensure_ascii=False))
+            return
+        if preview:
+            limit = clamp_int(query_param(query, "limit"), 1, FILE_PREVIEW_MAX,
+                              FILE_PREVIEW_DEFAULT)
+            try:
+                with open(path, "rb") as f:
+                    blob = f.read(limit)
+            except OSError as e:
+                self._send(400, json.dumps({"ok": False, "error": str(e)},
+                                           ensure_ascii=False))
+                return
+            self._send(200, json.dumps({
+                "ok": True,
+                "name": os.path.basename(path),
+                "bytes": size,
+                "limit": limit,
+                "truncated": size > len(blob),
+                "text": blob.decode("utf-8", errors="replace"),
+            }, ensure_ascii=False))
+            return
+        fname = os.path.basename(path)
+        ctype = FILE_CTYPES.get(os.path.splitext(fname)[1].lower(),
+                                "application/octet-stream")
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(size))
+        # RFC 5987：中文文件名必须用 filename*，否则浏览器会拿到乱码/被截断的名字
+        self.send_header("Content-Disposition",
+                         "attachment; filename*=UTF-8''" + quote(fname))
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        # 大文件分块写，不把整个文件读进内存（照片/录音可能到几十 MB）
+        try:
+            with open(path, "rb") as f:
+                while True:
+                    chunk = f.read(256 * 1024)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass    # 浏览器取消下载：连接断了，没什么可补救的
+
+    def _file_delete(self):
+        msg = self._read_json()
+        if msg is None:
+            self._send(400, json.dumps({"ok": False, "error": "bad json body"},
+                                       ensure_ascii=False))
+            return
+        path = file_path(str(msg.get("cat") or ""), str(msg.get("device") or ""),
+                         str(msg.get("name") or ""))
+        if path is None:
+            self._send(400, json.dumps({"ok": False, "error": "bad path or device"},
+                                       ensure_ascii=False))
+            return
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            self._send(404, json.dumps({"ok": False, "error": "no such file"},
+                                       ensure_ascii=False))
+            return
+        except OSError as e:
+            self._send(400, json.dumps({"ok": False, "error": str(e)},
+                                       ensure_ascii=False))
+            return
+        self._send(200, json.dumps({"ok": True, "deleted": os.path.basename(path)},
+                                   ensure_ascii=False))
+
+    def _file_upload(self, query):
+        """`?cat=&device=&name=` + 裸 body。先校验路径与扩展名，再读 body。"""
+        cat = (query_param(query, "cat") or "").strip()
+        name = query_param(query, "name") or ""
+        path = file_path(cat, query_param(query, "device") or "", name)
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            n = -1
+        if path is None:
+            # T58：拒绝时也要把 body 读掉，否则客户端收到的是 RST 而不是 400
+            self._drain(min(n, FILE_MAX_BYTES + 1) if n > 0 else 0)
+            self._send(400, json.dumps({"ok": False, "error": "bad path or device"},
+                                       ensure_ascii=False))
+            return
+        fname = file_safe_name(name)
+        if not fname or not file_ext_ok(cat, fname):
+            self._drain(min(n, FILE_MAX_BYTES + 1) if n > 0 else 0)
+            self._send(415, json.dumps({"ok": False, "error": "extension not allowed",
+                                        "allowed": list(FILE_EXTS.get(cat) or ())},
+                                       ensure_ascii=False))
+            return
+        if n <= 0:
+            self._send(400, json.dumps({"ok": False, "error": "empty body"},
+                                       ensure_ascii=False))
+            return
+        if n > FILE_MAX_BYTES:
+            # 413 之前尽量把 body 读掉：`_drain` 的上限（4×音频上限）不够覆盖
+            # 8MB 上传档，没读干净就关闭连接会让客户端收到 RST 而不是 413（T58）。
+            left = min(n, FILE_MAX_BYTES + 4 * 1024 * 1024)
+            try:
+                while left > 0:
+                    chunk = self.rfile.read(min(left, 256 * 1024))
+                    if not chunk:
+                        break
+                    left -= len(chunk)
+            except OSError:
+                pass
+            self._send(413, json.dumps({"ok": False, "error": "too large",
+                                        "max_bytes": FILE_MAX_BYTES},
+                                       ensure_ascii=False))
+            return
+        data = self.rfile.read(n)
+        if len(data) != n:
+            self._send(400, json.dumps({"ok": False, "error": "short body"},
+                                       ensure_ascii=False))
+            return
+        existed = os.path.exists(path)
+        folder = os.path.dirname(path)
+        tmp = None
+        try:
+            os.makedirs(folder, exist_ok=True)
+            # 先写临时文件再原子替换：上传中断时不会留下半截文件冒充完整文件
+            tmp = "%s.%d.part" % (path, threading.get_ident())
+            with open(tmp, "wb") as f:
+                f.write(data)
+            os.replace(tmp, path)
+        except OSError as e:
+            if tmp:
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+            self._send(500, json.dumps({"ok": False, "error": str(e)},
+                                       ensure_ascii=False))
+            return
+        self._send(200, json.dumps({"ok": True, "cat": cat, "name": fname,
+                                    "bytes": len(data), "replaced": existed},
+                                   ensure_ascii=False))
 
     # ---- voice (板 → 服务器 → 识别 → 大模型 → 板/网页) ----------------------
     def _audio(self, query):
@@ -1763,25 +2413,71 @@ class Handler(BaseHTTPRequestHandler):
             self._send(400, json.dumps({"ok": False, "error": "audio too short"},
                                        ensure_ascii=False))
             return
+        # 限流（见 AUDIO_MIN_GAP_S）：**必须在读完 body 之后**再回绝，否则客户端
+        # 拿到的是连接重置而不是 429（手册 T58 的老坑）。被拒的也不更新时刻，
+        # 这样"连发 10 次"只会全部被拒、不会积攒下一次的额度。
+        with LOCK:
+            now_a = time.time()
+            # `AUDIO_LAST` 的键是外部输入（设备名），会随"无限设备名"长大。
+            # 先清 60 秒前的（这些记录已经不可能再挡住谁：冷却只有 1.5 秒），
+            # 清完还超上限就丢最旧的 —— 只丢冷却记录，不丢钱（钱归 AUDIO_BUDGET 管）。
+            if len(AUDIO_LAST) > AUDIO_LAST_MAX:
+                for k in [k for k, t in AUDIO_LAST.items() if now_a - t > 60.0]:
+                    AUDIO_LAST.pop(k, None)
+            if len(AUDIO_LAST) > AUDIO_LAST_MAX:
+                for k in sorted(AUDIO_LAST, key=AUDIO_LAST.get)[
+                        :len(AUDIO_LAST) - AUDIO_LAST_MAX]:
+                    AUDIO_LAST.pop(k, None)
+            too_soon = (now_a - AUDIO_LAST.get(dev_id, 0.0)) < AUDIO_MIN_GAP_S
+            if not too_soon:
+                AUDIO_LAST[dev_id] = now_a
+                # 全局预算**只统计真要受理的请求**：被每设备冷却挡掉的不占额度。
+                budget_ok = AUDIO_BUDGET.allow(now_a)
+                notice = False
+                if not budget_ok and (now_a - AUDIO_BUDGET_NOTICE_AT[0]) > 60.0:
+                    AUDIO_BUDGET_NOTICE_AT[0] = now_a
+                    notice = True
+            else:
+                budget_ok, notice = True, False
+        if too_soon:
+            self._send(429, json.dumps(
+                {"ok": False, "error": "too soon", "hint": "同一台设备 %.1f 秒内只收一段录音"
+                 % AUDIO_MIN_GAP_S}, ensure_ascii=False))
+            return
+        if not budget_ok:
+            # 打印而不是 push_event：此刻设备可能还不存在（伪造名字），
+            # 而 push_event 会顺手把它建出来。控制台一行足够老师看见。
+            if notice:
+                print("   [语音] 本机每分钟录音上限 %d 已到，后续请求一律 429" % AUDIO_MAX_PER_MIN)
+            self._send(429, json.dumps(
+                {"ok": False, "error": "audio budget exhausted",
+                 "hint": "本机每分钟最多受理 %d 段录音，请稍后再试" % AUDIO_MAX_PER_MIN},
+                ensure_ascii=False))
+            return
         with LOCK:
             dev = get_device(dev_id)
-            if dev.st["voice_state"] in ("transcribing", "thinking"):
-                self._send(429, json.dumps(
-                    {"ok": False, "error": "上一段还在处理"}, ensure_ascii=False))
-                return
-            dev.st["voice_state"] = "transcribing"
-            dev.st["voice_err"] = ""
-            # 计时（第 6 周）：这一轮语音任务从"收到录音"这一刻算起。
-            dev.st["voice_t0"] = time.time()
-            dev.st["voice_ms"] = 0
-            dev.st["total_ms"] = 0
-            # 记下此刻的回合令牌：识别期间用户要是又问了一句，令牌会变，
-            # 这段迟到的识别结果就该丢弃（第 6 周「迟到结果隔离」）。
-            turn = dev.st["ai_cancel"]
-            # 板端立刻有反馈：识别要几秒（云端更久），这段时间屏幕不该一动不动。
-            # 但如果上一轮大模型还在生成，就别把它挤掉 —— 那会把快出结果的那次弄丢。
-            if not dev.st["ai_pending"]:
-                dev.st["ai_reply"] = "正在识别…"
+            busy = dev.st["voice_state"] in ("transcribing", "thinking")
+            if not busy:
+                dev.st["voice_state"] = "transcribing"
+                dev.st["voice_err"] = ""
+                # 计时（第 6 周）：这一轮语音任务从"收到录音"这一刻算起。
+                dev.st["voice_t0"] = time.time()
+                dev.st["voice_ms"] = 0
+                dev.st["total_ms"] = 0
+                # 记下此刻的回合令牌：识别期间用户要是又问了一句，令牌会变，
+                # 这段迟到的识别结果就该丢弃（第 6 周「迟到结果隔离」）。
+                turn = dev.st["ai_cancel"]
+                # 板端立刻有反馈：识别要几秒（云端更久），这段时间屏幕不该一动不动。
+                # 但如果上一轮大模型还在生成，就别把它挤掉 —— 那会把快出结果的那次弄丢。
+                if not dev.st["ai_pending"]:
+                    dev.st["ai_reply"] = "正在识别…"
+        if busy:
+            # 429 的发送必须在 LOCK 之外：持锁写 socket，一个卡住的客户端会连累
+            # 全部板子的上报 —— /api/latest 与 SSE 早就按这条规矩把序列化留在
+            # 锁内、发送挪到锁外，这里不能做例外。
+            self._send(429, json.dumps(
+                {"ok": False, "error": "上一段还在处理"}, ensure_ascii=False))
+            return
         saved = self._audio_save(dev, data)
         push_event(dev, "ask", "收到 %d 字节录音，开始识别" % len(data))
         threading.Thread(target=_voice_worker, args=(dev, data, saved, turn),
@@ -1795,6 +2491,11 @@ class Handler(BaseHTTPRequestHandler):
             return None
         try:
             d = os.path.join(AUDIO_DIR, safe_name(dev.id))
+            # 设备目录数封顶（与 _shot_save 的 SHOT_MAX_DEVICES 同一个道理，
+            # 见 AUDIO_MAX_DEVICES 的注释）：已经在册的设备照常写，
+            # 新设备到顶就不存 —— 板端只少一份留档，识别与回复完全不受影响。
+            if not os.path.isdir(d) and self._audio_dev_dirs() >= AUDIO_MAX_DEVICES:
+                return None
             os.makedirs(d, exist_ok=True)
             name = time.strftime("%Y%m%d-%H%M%S") + "-%03d.wav" % (int(time.time() * 1000) % 1000)
             wav = data if data[:4] == b"RIFF" else _pcm_to_wav(data)
@@ -1823,6 +2524,10 @@ class Handler(BaseHTTPRequestHandler):
         真正的回答会通过后续 SSE 推送过来（网页不用轮询）。
         """
         msg = self._read_json()
+        if msg is None:
+            self._send(400, json.dumps({"ok": False, "error": "bad json body"},
+                                       ensure_ascii=False))
+            return
         text = str(msg.get("text", "")).strip()[:200]
         if not text:
             self._send(400, json.dumps({"ok": False, "error": "empty text"},
@@ -1856,6 +2561,12 @@ class Handler(BaseHTTPRequestHandler):
     # ---- command (网页 → 服务器 → 板 → 服务器 → 网页) -----------------------
     def _command(self):
         msg = self._read_json()
+        if msg is None:
+            # 坏 body 一律拒（见 _read_json 的 docstring）：
+            # 修复前这里会把垃圾当空对象、兜出默认 capture_once 真的下发出去。
+            self._send(400, json.dumps({"ok": False, "error": "bad json body"},
+                                       ensure_ascii=False))
+            return
         name = str(msg.get("name", "capture_once"))[:32]
         if name not in CMD_NAMES:
             self._send(400, json.dumps(
@@ -1887,6 +2598,28 @@ class Handler(BaseHTTPRequestHandler):
         if not targets:
             targets = [None]
 
+        # ⚠️ **写接口不许"猜"目标**：只要调用方明确点了设备名，就必须真存在。
+        #
+        # 原来这里对"不在册的名字"会退回到"最近上报过的那台"（`pick_device` 的
+        # 读接口语义），于是把设备名拼错一个字（比如「第三组-07」打成「第三组-7」）
+        # 就会把 sd_format 发给**另一块板**，页面上还显示"已下发"。
+        # 读接口（/api/latest）该容错，写接口不该 —— 破坏性动作的代价不对等。
+        #
+        # 判据用"不在 DEVICES 里"而不是"离线"：离线的板子仍在册，命令排队等它
+        # 回来是**设计行为**（网页上明确提示了"等它们回来才会执行"）。
+        # 全有或全无：只要有一台不认识就一条都不发，避免"20 台里格了 19 台"。
+        with LOCK:
+            missing = [t for t in targets if t is not None and t not in DEVICES]
+            if missing:
+                known = sorted(d.id for d in DEVICES.values() if d.st["last_post"] > 0)
+        if missing:
+            self._send(404, json.dumps(
+                {"ok": False, "error": "device not found", "missing": missing,
+                 "known": known,
+                 "hint": "设备名要以仪表盘列表里显示的为准；不在册的一律不下发"},
+                ensure_ascii=False))
+            return
+
         results = []
         for t in targets:
             with LOCK:
@@ -1912,7 +2645,18 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- telemetry (板 → 服务器 → 板) --------------------------------------
     def _telemetry(self):
+        # 服务端自报耗时，随响应回给板子（板子忽略这个字段，只影响调试与压测）。
+        # **为什么要有**：`tools/load_classroom.py` 之前只能量"客户端往返"，
+        # 而它的 20 块假板子是同一进程里的线程、抢同一把 GIL —— 客户端自己
+        # 就是瓶颈。2026-11-01 实测往返 p50=400ms，看起来像服务端很慢，
+        # 其实大头是测试进程排队。分开报这两个数，才能判断到底谁慢。
+        _t0 = time.perf_counter()
         msg = self._read_json()
+        if msg is None:
+            # 坏 body（非法 Content-Length / 超 4MB / 不是 JSON 对象）：
+            # 板端只发 JSON body，坏了就归并到下面的"bad payload"那条 400 出路，
+            # 不能让 None 溜进 _parse_points（msg.get 会 AttributeError）。
+            msg = {}
         now = time.time()
 
         pts = self._parse_points(msg)
@@ -1928,8 +2672,7 @@ class Handler(BaseHTTPRequestHandler):
             st = dev.st
             prev_post = st["last_post"]
             was_online = st["device_online"]
-            # 采样间隔由"本批样本数 / 两批到达的间隔"自校准，不依赖板端上报
-            # dt 由"本批样本数 / 两批到达的间隔"自校准。但**晚到的帧不可信**：
+            # dt 由"本批样本数 / 两批到达的间隔"自校准，不依赖板端上报。但**晚到的帧不可信**：
             # 若某帧因网络抖动晚到 3 秒，50 个样本的推断间隔会被算成 60 ms，
             # 这批样本就被摊到 3 秒的时间轴上 —— MOTION_WINDOW_S(0.6 s) 的短窗里
             # 只剩最后 1~2 个样本，晃动/跌落全部漏检，sample_hz 也会跳变。
@@ -1993,7 +2736,8 @@ class Handler(BaseHTTPRequestHandler):
         reply = ""
         if msg.get("ask"):                  # 板子 BOOT 键 → 请求一次 AI 交互
             question = str(msg.get("q", "我现在的状态怎么样？"))[:200]
-            reply = request_ai(dev, question)   # 立刻返回；大模型走后台线程
+            # 板端按键提问：收紧等待上限（见 LLM_BOARD_TIMEOUT 的注释）
+            reply = request_ai(dev, question, for_board=True)   # 立刻返回；大模型走后台线程
 
         with LOCK:
             final_reply = reply or dev.st["ai_reply"]
@@ -2004,6 +2748,9 @@ class Handler(BaseHTTPRequestHandler):
             "activity": activity,
             "reply": clip_utf8(final_reply, BOARD_REPLY_MAX),
             "pending": pending,
+            # 服务端处理这一段（解析 + 等锁 + 分类）的毫秒数，**不含 socket 收发**。
+            # 客户端往返减去它，就是网络 + 客户端自己的开销。
+            "ms": int((time.perf_counter() - _t0) * 1000),
         }
         if cmd is not None:
             out["cmd"] = cmd
@@ -2011,19 +2758,46 @@ class Handler(BaseHTTPRequestHandler):
 
     @staticmethod
     def _parse_points(msg):
-        """支持两种载荷：新协议 batch=[[x,y,z],...]，以及单帧 x/y/z（向后兼容）。"""
+        """支持两种载荷：新协议 batch=[[x,y,z],...]，以及单帧 x/y/z（向后兼容）。
+
+        **每个点都要过 isValidSample()**：`json.loads` 默认接受 `NaN` / `Infinity`
+        这两个非法 JSON 字面量，`float()` 也照收。一旦放进去：
+
+          - `analyze()` 里 `tilt_direction()` 的 `int(nan)` 抛 ValueError，
+            而且抛在 `_send()` **之前** —— 客户端拿到的是"连接被掐断"，不是 500；
+          - 更糟的是 NaN 已经进了 `dev.samples`，**接下来 8 秒内每一帧正常数据**
+            都会在同一个 `int(nan)` 上再次抛异常（窗口里还留着它）；
+          - `/api/latest` 再把 NaN 序列化出去（`json.dumps` 允许，RFC 8259 不允许），
+            浏览器 `JSON.parse` 抛错 → 整页停在旧数据上。
+
+        固件侧早就有等价的一道（`transport.c` 的 `sanitize3`：任一轴越界整帧丢弃、
+        **绝不填 0**，因为 0 恰好是失重特征）。服务端一直漏着，这里补上。
+        """
         pts = []
+
+        def take(item):
+            """一个点要么完整可用，要么整点丢弃 —— 不做部分填充。"""
+            try:
+                x, y, z = float(item[0]), float(item[1]), float(item[2])
+            except (TypeError, ValueError, IndexError, KeyError):
+                return
+            if not (math.isfinite(x) and math.isfinite(y) and math.isfinite(z)):
+                return
+            # 量程兜底：加速度计满量程 ±8g（固件 sanitize3 同一口径），
+            # 16g 是给三轴合成留的余量。超出的一律当坏帧 —— 否则网页曲线
+            # 的纵轴会被一个 1e300 直接压成一条线。
+            if max(abs(x), abs(y), abs(z)) > VALID_G_MAX:
+                return
+            pts.append((x, y, z))
+
         batch = msg.get("batch")
         if isinstance(batch, list):
             for item in batch[:MAX_BATCH]:
-                try:
-                    pts.append((float(item[0]), float(item[1]), float(item[2])))
-                except (TypeError, ValueError, IndexError, KeyError):
-                    continue
+                take(item)
         if not pts:
             try:
-                pts.append((float(msg["x"]), float(msg["y"]), float(msg["z"])))
-            except (KeyError, TypeError, ValueError):
+                take((msg["x"], msg["y"], msg["z"]))
+            except (KeyError, TypeError):
                 return []
         return pts
 
@@ -2043,11 +2817,32 @@ class Handler(BaseHTTPRequestHandler):
                     # 每轮重新解析一次设备：选中的板子被淘汰/改名时，
                     # 这里会自动退回"最近上报过的那台"，前端看到 device 变了就跟着切。
                     dev = pick_device(clean_device_id(want) if want else None)
-                    snap = snapshot(dev)
+                    snap = snapshot(dev, with_events=False, with_commands=False)
                     snap["devices"] = devices_snapshot(now)
                     snap["sample"] = list(dev.samples[-1]) if dev.samples else None
-                snap["now"] = now
-                self.wfile.write(b"data: " + json.dumps(snap, ensure_ascii=False).encode("utf-8") + b"\n\n")
+                    snap["now"] = now
+                    # ⚠️ 只发"前端真的会画出来的那些"，别发整本历史。
+                    #
+                    # 原来这里发的是 snapshot(dev) 的全量：200 条事件 + 20 条命令，
+                    # 单帧 35.3 KB、2 Hz = 69 KB/s —— 而 renderEvents() 只画
+                    # `evts.slice(0,40)`、renderCmds() 只画前 8 条。也就是说
+                    # **八成以上的字节从服务端搬到浏览器，然后在 DOM 里被丢掉**。
+                    # 现在按渲染上限裁剪：40 + 8，单帧降到约 9 KB。
+                    # 事件仍然是"最近 40 条"的滑动窗口（前端本来就是覆盖式重绘，
+                    # 不需要增量协议）；要更多历史时另有 /api/events 可查。
+                    snap["events"] = list(dev.events)[:SSE_EVENTS_MAX]
+                    # 事件总条数（缓冲区里实际有多少，最多 200）。前端标题写着
+                    # "最近 N 条" —— 裁剪之后如果还用 `evts.length`，N 会**永远
+                    # 卡在 40**，看起来像"事件只有 40 条"，其实只是没发全。
+                    # 多发一个整数换一句不说谎的文案。
+                    snap["ev_total"] = len(dev.events)
+                    snap["commands"] = commands_snapshot(dev)[:SSE_COMMANDS_MAX]
+                    # 与 /api/latest 同修：序列化在锁内做，字节发出去在锁外。
+                    # SSE 是长连接、每 500ms 一帧；持锁期间客户端网络卡一下，
+                    # 全校板子的上报都要等它 —— 那正是第一需求场景下最怕的事。
+                    frame = (b"data: " + json.dumps(snap, ensure_ascii=False).encode("utf-8")
+                             + b"\n\n")
+                self.wfile.write(frame)
                 self.wfile.flush()
                 time.sleep(0.5)
         except (BrokenPipeError, ConnectionResetError, OSError):
@@ -2059,2454 +2854,39 @@ class Handler(BaseHTTPRequestHandler):
 # --------------------------------------------------------------------------
 # 网页仪表盘
 # --------------------------------------------------------------------------
-DASHBOARD_HTML = """<!doctype html>
-<!-- data-theme 写在标记里 = 默认明亮（用户 2026-09-26 要求）。
-     下面那个内联脚本会在**首次绘制之前**把它改成用户上次选的那套。 -->
-<html lang="zh-CN" data-theme="light">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Ego Link · 实时仪表盘</title>
-<script>
-/* 主题必须在**首次绘制之前**定下来，否则会先闪一下明亮再跳深色（FOUC）。
-   所以它必须是 head 里第一段内联脚本，不能等 DOMContentLoaded、也不能放外链。 */
-(function(){
-  try {
-    var t = localStorage.getItem("rw1-theme");
-    if (t === "light" || t === "dark") document.documentElement.setAttribute("data-theme", t);
-  } catch (e) { /* 隐私模式读不到 localStorage —— 保持标记里的默认值（明亮） */ }
-})();
-</script>
-<!-- 空 favicon：不写这行浏览器会去请求 /favicon.ico，服务端没有这条路由，
-     于是每次打开页面都留一条 404 在控制台（2026-09-23 E2E 抓到的）。 -->
-<link rel="icon" href="data:,">
-<script src="/vendor/three.min.js"></script>
-<style>
-/* ==========================================================================
-   设计令牌（Design Tokens）
-   --------------------------------------------------------------------------
-   这个页面和开发板屏幕（device/main/ui.c）共用一套**语义色含义**：
-   同一台板子、同一时刻，屏幕上和网页上说的是同一件事。
-   但两边的**表现形式**不同 —— 板子是 240x240 的 LVGL 面板，这里是浏览器。
-   所以这里不照抄板端的像素参数，只共享语义，视觉语言另起一套更严格的规则。
-
-   硬性规则（违反即视为 bug）：
-     · 字体：不用 Inter / Roboto / 泛型 sans-serif；标题正文用 Sora，
-       数字代码用 IBM Plex Mono，两者都是**仓库内自托管**的 woff2 ——
-       教室局域网常常没有外网，引 CDN 必然白屏（配网页当初就是踩过这个坑）。
-       中文回落到明确列出的 CJK 字面，而不是让它掉到系统默认字体。
-     · 颜色：全部 OKLCH，按角色命名。主色**只有青绿一个**，只出现在
-       「可操作 / 系统活着」的地方；活动语义色只用于数据本身。
-       底色不是纯黑（纯黑会让所有层级糊成一团），文字不是纯白。
-     · 圆角：全站只有 3 个值（6 / 10 / 14）。禁止到处 16px。
-       圆形（状态点、气泡球、圆环）是形状不是圆角，不占额度。
-     · 间距：8px 基准网格 —— 4/8/12/16/24/32/48/64/96，没有别的值。
-     · 字号：正文 15px，标题按 1.25~1.5 倍逐级步进，
-       hero 48px = 正文的 3.2 倍（规则要求 ≥ 3 倍）。
-     · 阴影：按层级分三档，不是一刀切的大模糊。
-
-   ⚠️ **这一套已冻结**（2026-09-26 用户看过截图后确认："后面的都按照这个来设置"）。
-   以后新增页面 / 卡片**照抄这套令牌**，不要另起一套视觉语言。
-   改完必须跑 `node tools/e2e_design.js`（19 条断言，含离线空状态与 320px 窄屏）——
-   设计规则是硬约束，只靠看截图不算验证。
-   细节与踩过的坑见 `.workbuddy-ai/memory/2026-09-26.md`。
-
-   ⚠️ 关于"字号不要太大"（2026-09-26 第二版）：
-   第一版老老实实按 15 → 19 → 24 → 32 → 48 铺了五级，结果**九个标题同时在喊**
-   （3 个区域标题 32px + 6 个卡片标题 24px），一屏里没有重点，看着就是"乱"。
-   现在砍掉 32px 那一级：正文 15 / 卡片标题 19 / 区域标题 24 / hero 48。
-   步进 1.267 和 1.263 仍然落在规则要求的 1.25~1.5 里，hero 仍然是正文的 3.2 倍。
-   **规则约束的是比例，不是"层级越多越好"。**
-   ========================================================================== */
-
-/* ---- 字体：仓库自托管，不走 CDN ---- */
-@font-face{font-family:"Sora";src:url("/vendor/fonts/sora-400.woff2") format("woff2");font-weight:400;font-style:normal;font-display:swap}
-@font-face{font-family:"Sora";src:url("/vendor/fonts/sora-600.woff2") format("woff2");font-weight:600;font-style:normal;font-display:swap}
-@font-face{font-family:"Sora";src:url("/vendor/fonts/sora-700.woff2") format("woff2");font-weight:700;font-style:normal;font-display:swap}
-@font-face{font-family:"PlexMono";src:url("/vendor/fonts/plexmono-400.woff2") format("woff2");font-weight:400;font-style:normal;font-display:swap}
-@font-face{font-family:"PlexMono";src:url("/vendor/fonts/plexmono-500.woff2") format("woff2");font-weight:500;font-style:normal;font-display:swap}
-@font-face{font-family:"PlexMono";src:url("/vendor/fonts/plexmono-600.woff2") format("woff2");font-weight:600;font-style:normal;font-display:swap}
-
-:root{
-  color-scheme:dark;
-
-  /* 中文回落是**逐个点名的**字体，不是泛型 sans-serif */
-  --font-display:"Sora","PingFang SC","Microsoft YaHei UI","Microsoft YaHei","Noto Sans CJK SC","Source Han Sans SC",sans-serif;
-  --font-body:"Sora","PingFang SC","Microsoft YaHei UI","Microsoft YaHei","Noto Sans CJK SC","Source Han Sans SC",sans-serif;
-  --font-mono:"PlexMono","IBM Plex Mono","Cascadia Mono",Consolas,"Microsoft YaHei UI",monospace;
-
-  /* ---- 表面：由深到浅四层，都是低饱和冷中性色（不是蓝黑，也不是纯黑） ---- */
-  --color-bg:           oklch(0.170 0.010 258);
-  --color-surface:      oklch(0.216 0.011 258);
-  --color-surface-2:    oklch(0.252 0.012 258);
-  --color-surface-3:    oklch(0.290 0.013 258);
-  --color-line:         oklch(0.310 0.013 258);
-  --color-line-strong:  oklch(0.400 0.015 258);
-
-  /* ---- 文字：三级，对比度都过 WCAG AA（按最亮的卡片底色算最坏情况） ---- */
-  --color-text:         oklch(0.950 0.006 258);
-  --color-text-muted:   oklch(0.780 0.013 258);
-  --color-text-faint:   oklch(0.655 0.013 258);
-
-  /* ---- 主色：只有一个。出现在主按钮、焦点环、在线指示 ---- */
-  --color-action-primary:      oklch(0.800 0.130 178);
-  --color-action-primary-hi:   oklch(0.860 0.130 178);
-  --color-action-primary-ink:  oklch(0.200 0.030 178);
-  --color-action-primary-soft: oklch(0.800 0.130 178 / 0.16);
-
-  /* 危险操作（格式化 SD / 删文件）的按钮底与文字色。
-     它不算"主色"，是**语义例外**：破坏性动作必须一眼看出跟别的不一样。 */
-  --color-danger:     oklch(0.660 0.200 25);
-  --color-danger-hi:  oklch(0.720 0.200 25);
-  --color-danger-ink: oklch(0.170 0.030 25);
-
-  /* ---- 数据语义色：只用于数据本身（活动词、圆环、轴条、曲线、事件点） ----
-     色相刻意与板端 UI_C_* 保持同一含义，换端不用重新学。 */
-  --color-still:  oklch(0.735 0.170 145);   /* 静置 */
-  --color-walk:   oklch(0.690 0.165 295);   /* 步行 */
-  --color-move:   oklch(0.730 0.150 250);   /* 运动 */
-  --color-shake:  oklch(0.810 0.140 80);    /* 晃动 */
-  --color-fall:   oklch(0.660 0.200 25);    /* 跌落 */
-  --color-idle:   oklch(0.655 0.013 258);   /* 无读数 */
-
-  /* 当前活动的颜色与 RGB 分量：JS 按 classify() 结果注入，驱动 hero 整体联动 */
-  --act-color: var(--color-idle);
-  --act-rgb: 135,141,148;
-
-  /* ---- 间距：8px 基准网格，没有第五个值 ---- */
-  --sp-1:4px; --sp-2:8px; --sp-3:12px; --sp-4:16px; --sp-6:24px;
-  --sp-8:32px; --sp-12:48px; --sp-16:64px; --sp-24:96px;
-
-  /* ---- 圆角：全站只有这 3 个 ---- */
-  --radius-control:6px;   /* 按钮 / 输入框 / 下拉 / 标签 / 状态块 */
-  --radius-card:10px;     /* 卡片 / 面板 / 画面 / 图表 */
-  --radius-modal:14px;    /* 弹窗 */
-
-  /* ---- 字号：正文 15 → 卡片标题 19 → 区域标题 24 → hero 48 ---- */
-  --fs-meta:12.5px;
-  --fs-body:15px;
-  --fs-h3:19px;    /* 卡片 / 面板标题 */
-  --fs-h2:24px;    /* 区域标题 */
-  --fs-hero:48px;  /* hero 活动词 = 正文 3.2 倍 */
-
-  /* ---- 阴影：三档，分别对应「浮在页面上」「浮在卡片上」「浮在所有东西上」 ----
-     深色底上的阴影靠"更黑"来分层；浅色底上同样的黑度会显得脏，
-     所以浅色主题那一份把 alpha 压到 1/5 左右（见下面的 light 块）。 */
-  --shadow-1:0 1px 1px oklch(0 0 0/.30), 0 2px 6px oklch(0 0 0/.22);
-  --shadow-2:0 1px 1px oklch(0 0 0/.32), 0 4px 10px oklch(0 0 0/.26), 0 12px 28px oklch(0 0 0/.20);
-  --shadow-3:0 2px 2px oklch(0 0 0/.36), 0 10px 24px oklch(0 0 0/.32), 0 32px 64px oklch(0 0 0/.34);
-  --ring:0 0 0 3px var(--color-action-primary-soft);
-
-  /* ---- 下面这些是「只在个别地方用一次」的表面/色调，抽成令牌是为了能整套换主题 ---- */
-  --appbar-bg:oklch(0.170 0.010 258 / .84);              /* 顶栏（半透明 + 毛玻璃） */
-  --bg-wash:radial-gradient(1100px 520px at 8% -12%, oklch(0.300 0.020 258 / .42), transparent 70%);
-  --stage-veil:linear-gradient(180deg, oklch(0.196 0.011 258), transparent);  /* hero 带子的"抬起感" */
-  --ball-from:oklch(0.270 0.013 258);                    /* 姿态球的球面渐变 */
-  --ball-to:oklch(0.190 0.010 258);
-  --video-bg:oklch(0.140 0.008 258);                     /* 摄像头/照片的取景框底 */
-  --modal-backdrop:oklch(0.140 0.008 258 / .70);
-  --sheen:oklch(1 0 0 / .05);                            /* 卡片/弹窗顶部 1px 内高光 */
-  /* 语义色的"淡底"版本（状态胶囊、选中行、状态块）。深色底上要淡得能透出底色，
-     浅色底上要用更深的同色相 —— 所以每个主题各一份，不靠 color-mix()。 */
-  --tint-primary:oklch(0.800 0.130 178 / .10);
-  --tint-primary-line:oklch(0.800 0.130 178 / .40);
-  --tint-danger:oklch(0.660 0.200 25 / .10);
-  --tint-danger-line:oklch(0.660 0.200 25 / .40);
-  --tint-still:oklch(0.735 0.170 145 / .16);
-  --tint-shake:oklch(0.810 0.140 80 / .16);
-  --tint-fall:oklch(0.660 0.200 25 / .16);
-
-  --w-max:1440px;
-  --ease:cubic-bezier(.16,1,.3,1);
-}
-
-/* ==========================================================================
-   浅色主题 —— **默认就是这一套**（用户 2026-09-26 要求"默认明亮"）
-   --------------------------------------------------------------------------
-   只覆盖"角色令牌"的值，不改任何一条结构/尺寸规则 —— 两套主题共用同一份
-   圆角、间距、字号阶梯、组件结构。这样"设计规则"只写一遍，两个主题都受约束。
-
-   数值不是眼睛调的，是按**最坏底色**算过 WCAG AA 的（卡片 surface 最亮，
-   所以它才是最难过的那个底）：
-     正文 15.6 / 次级 7.6 / 弱文字 5.4（对 surface）；弱文字对 surface-2 是 4.7
-     主按钮白字对主色 5.3；危险按钮 5.9
-     数据语义色（静置/步行/运动/晃动/跌落）对 surface 分别 5.5/6.9/5.8/5.2/5.9
-   `tools/e2e_design.js` 会**在两个主题下各跑一遍**这些断言，改坏了会红。
-
-   两条容易翻车的规则，这里都刻意避开了：
-     · 禁纯白大面积：底是 oklch(0.962)（≈#f1f2f5），卡片是 oklch(0.990)（≈#fbfcfd），
-       都不是 #fff。
-     · 主色只有一个：浅色里主色变深（0.500 而不是 0.800）——
-       深色的亮青绿放到白底上对比度不够，直接照抄会挂。
-   ========================================================================== */
-html[data-theme="light"]{
-  color-scheme:light;
-
-  --color-bg:           oklch(0.962 0.004 258);
-  --color-surface:      oklch(0.990 0.002 258);
-  --color-surface-2:    oklch(0.945 0.005 258);
-  --color-surface-3:    oklch(0.900 0.006 258);
-  --color-line:         oklch(0.905 0.006 258);
-  --color-line-strong:  oklch(0.820 0.008 258);
-
-  --color-text:         oklch(0.250 0.012 258);
-  --color-text-muted:   oklch(0.440 0.014 258);
-  --color-text-faint:   oklch(0.520 0.014 258);
-
-  --color-action-primary:      oklch(0.500 0.115 178);
-  --color-action-primary-hi:   oklch(0.450 0.115 178);
-  --color-action-primary-ink:  oklch(0.990 0.008 178);
-  --color-action-primary-soft: oklch(0.500 0.115 178 / 0.20);
-
-  --color-danger:     oklch(0.520 0.200 25);
-  --color-danger-hi:  oklch(0.470 0.200 25);
-  --color-danger-ink: oklch(0.990 0.008 25);
-
-  --color-still:  oklch(0.500 0.150 145);
-  --color-walk:   oklch(0.480 0.170 295);
-  --color-move:   oklch(0.500 0.160 250);
-  --color-shake:  oklch(0.530 0.140 80);
-  --color-fall:   oklch(0.520 0.200 25);
-  --color-idle:   oklch(0.520 0.014 258);
-
-  --tint-primary:oklch(0.500 0.115 178 / .10);
-  --tint-primary-line:oklch(0.500 0.115 178 / .34);
-  --tint-danger:oklch(0.520 0.200 25 / .10);
-  --tint-danger-line:oklch(0.520 0.200 25 / .34);
-  --tint-still:oklch(0.500 0.150 145 / .14);
-  --tint-shake:oklch(0.530 0.140 80 / .16);
-  --tint-fall:oklch(0.520 0.200 25 / .14);
-
-  /* 浅色底上的阴影必须比深色淡得多，否则整页显脏 */
-  --shadow-1:0 1px 1px oklch(0 0 0/.05), 0 2px 6px oklch(0 0 0/.05);
-  --shadow-2:0 1px 1px oklch(0 0 0/.06), 0 4px 10px oklch(0 0 0/.06), 0 12px 28px oklch(0 0 0/.06);
-  --shadow-3:0 2px 2px oklch(0 0 0/.08), 0 10px 24px oklch(0 0 0/.10), 0 32px 64px oklch(0 0 0/.12);
-
-  --appbar-bg:oklch(0.988 0.002 258 / .82);
-  --bg-wash:radial-gradient(1100px 520px at 8% -12%, oklch(0.930 0.010 258 / .70), transparent 70%);
-  --stage-veil:linear-gradient(180deg, oklch(0.998 0.002 258), transparent);
-  --ball-from:oklch(0.998 0.002 258);
-  --ball-to:oklch(0.940 0.005 258);
-  --video-bg:oklch(0.930 0.004 258);
-  --modal-backdrop:oklch(0.300 0.010 258 / .32);
-  --sheen:transparent;
-}
-
-*{box-sizing:border-box;margin:0}
-html{-webkit-text-size-adjust:100%}
-/* [hidden] 来自浏览器默认样式表（UA 样式），**任何作者样式里的 display 都能盖掉它**：
-   `.card{display:flex}` 一写，#card3d 上那个 hidden 就形同虚设 —— 3D 还没初始化完，
-   一张空卡片已经先亮在那里了（本仓库经验库里第 1 类高频真 bug）。
-   所以在最前面显式提权一次，后面所有 display 都盖不掉它。 */
-[hidden]{display:none !important}
-
-body{
-  min-height:100vh;
-  background-color:var(--color-bg);
-  /* 一处极淡的顶光，给纯色底一点纵深；不用蓝紫渐变 */
-  background-image:var(--bg-wash);
-  background-attachment:fixed;
-  color:var(--color-text);
-  font:400 var(--fs-body)/1.6 var(--font-body);
-  -webkit-font-smoothing:antialiased;
-  text-rendering:optimizeLegibility;
-}
-h1,h2,h3{font-family:var(--font-display);text-wrap:balance}
-.mono{font-family:var(--font-mono);font-variant-numeric:tabular-nums}
-.shell{max-width:var(--w-max);margin:0 auto;padding-inline:var(--sp-8)}
-/* 三类辅助文字，权重依次退下去 */
-.src{font:400 var(--fs-meta)/1.5 var(--font-mono);color:var(--color-text-faint)}
-.hint{font:400 var(--fs-meta)/1.7 var(--font-body);color:var(--color-text-muted)}
-.hint b{color:var(--color-text);font-weight:600}
-.empty{font:400 var(--fs-meta)/1.6 var(--font-body);color:var(--color-text-faint);padding:var(--sp-3) 0}
-.eyebrow{
-  display:inline-flex;align-items:center;gap:var(--sp-2);
-  font:500 var(--fs-meta)/1 var(--font-mono);
-  letter-spacing:.18em;text-transform:uppercase;color:var(--color-text-faint);
-}
-.eyebrow::before{content:"";width:20px;height:1px;background:var(--color-line-strong)}
-.panel-head{display:flex;align-items:baseline;justify-content:space-between;gap:var(--sp-4);flex-wrap:wrap}
-.panel-title{font:600 var(--fs-h3)/1.3 var(--font-display);letter-spacing:-.01em}
-
-/* ==========================================================================
-   顶栏：一屏里最安静的一层。它只回答"连上没有、跑多快"，不抢注意力。
-   ========================================================================== */
-.appbar{
-  position:sticky;top:0;z-index:40;
-  background:var(--appbar-bg);
-  backdrop-filter:blur(16px) saturate(140%);
-  border-bottom:1px solid var(--color-line);
-}
-.appbar .shell{
-  min-height:56px;display:flex;align-items:center;gap:var(--sp-6);
-  flex-wrap:wrap;padding-block:var(--sp-2);
-}
-.brand{display:flex;align-items:center;gap:var(--sp-3);min-width:0}
-.brand .mark{
-  width:26px;height:26px;flex:none;
-  border-radius:var(--radius-control);
-  border:1px solid var(--tint-primary-line);
-  background:var(--tint-primary);
-  display:grid;place-items:center;color:var(--color-action-primary);
-}
-.brand .mark svg{width:15px;height:15px;display:block}
-.brand b{font:600 var(--fs-body)/1.2 var(--font-display);letter-spacing:-.01em}
-.brand span{
-  font:500 10.5px/1 var(--font-mono);letter-spacing:.16em;text-transform:uppercase;
-  color:var(--color-text-faint);
-}
-.appbar .gap{flex:1 1 auto}
-
-.status{display:flex;align-items:center;gap:var(--sp-2);flex-wrap:wrap}
-.pill{
-  display:inline-flex;align-items:center;gap:var(--sp-2);
-  height:28px;padding:0 var(--sp-3);
-  border-radius:var(--radius-control);
-  border:1px solid var(--color-line);
-  background:var(--color-surface);
-  font:500 var(--fs-meta)/1 var(--font-mono);
-  color:var(--color-text-muted);white-space:nowrap;
-}
-.pill i{width:6px;height:6px;border-radius:50%;background:currentColor;flex:none}
-.pill.on{color:var(--color-action-primary);border-color:var(--tint-primary-line);background:var(--tint-primary)}
-.pill.off{color:var(--color-fall);border-color:var(--tint-danger-line);background:var(--tint-danger)}
-.pill.off i{animation:breathe 1.7s ease-in-out infinite}
-@keyframes breathe{0%,100%{opacity:1}50%{opacity:.22}}
-
-/* ==========================================================================
-   Hero 舞台：首屏只讲一件事 —— 板子现在在干什么。
-   --------------------------------------------------------------------------
-   它刻意**不是一张卡片**：是一整条横贯页面的带子，直接坐在页面底色上，
-   只有它配得上 48px 的字号和整片活动色染底。
-   ⚠️ 带子内部**一个卡片都不放**（第一版把图表和 AI 回复做成了卡片，
-   于是"带子里又套卡片"，盒子套盒子就是"乱"的来源）。内部一律用
-   发丝线 + 留白来分块。
-   ========================================================================== */
-.stage{
-  border-bottom:1px solid var(--color-line);
-  padding-block:var(--sp-16);
-  background-image:
-    radial-gradient(880px 320px at 4% 0%, rgb(var(--act-rgb) / .10), transparent 64%),
-    var(--stage-veil);
-  transition:background-image .7s var(--ease);
-}
-.stage-head{
-  display:flex;align-items:baseline;justify-content:space-between;
-  gap:var(--sp-6);flex-wrap:wrap;margin-bottom:var(--sp-8);
-}
-
-/* 三列：读数 | 姿态 | AI。列宽**刻意不等**，比例按"内容真的填得满"调 ——
-   列给太宽，右边会拖出一条比 32px 栅格间距宽得多的空档，三列就不像一行了。 */
-.stage-grid{
-  display:grid;gap:var(--sp-8);align-items:stretch;
-  grid-template-columns:minmax(0,1fr) minmax(0,.82fr) minmax(0,1fr);
-}
-.hero-readout{display:grid;grid-template-columns:168px minmax(0,1fr);gap:var(--sp-6);align-items:center}
-.hero-ring{position:relative;width:168px;height:168px;flex:none}
-.hero-ring svg{width:100%;height:100%;display:block;transform:rotate(135deg)}
-.hero-ring .track{fill:none;stroke:var(--color-surface-3);stroke-width:9;stroke-linecap:round;stroke-dasharray:263.9 351.9}
-.hero-ring .val{
-  fill:none;stroke:var(--color-idle);stroke-width:9;stroke-linecap:round;
-  stroke-dasharray:0 351.9;
-  transition:stroke-dasharray .5s var(--ease),stroke .4s ease;
-}
-.ring-mid{
-  position:absolute;inset:0;display:flex;flex-direction:column;
-  align-items:center;justify-content:center;gap:var(--sp-1);
-}
-.ring-mid b{font:600 var(--fs-h2)/1 var(--font-mono);font-variant-numeric:tabular-nums}
-.ring-mid span{font:500 11px/1 var(--font-mono);letter-spacing:.14em;color:var(--color-text-faint)}
-
-/* hero 标题：全页最大的字。48px = 正文 15px 的 3.2 倍。 */
-.hero-word{
-  font:700 var(--fs-hero)/1.02 var(--font-display);
-  letter-spacing:-.02em;color:var(--act-color);
-  transition:color .45s ease;
-}
-.hero-word.pop{animation:pop .45s var(--ease)}
-@keyframes pop{from{opacity:.15;transform:translateY(6px)}to{opacity:1;transform:none}}
-/* 读数行：三个「小标签 + 大数字」，标签比数字小两级，层级一眼看得出 */
-.hero-metrics{display:flex;gap:var(--sp-8);margin-top:var(--sp-6);flex-wrap:wrap}
-.hero-metrics>div{display:flex;flex-direction:column;gap:var(--sp-2)}
-.hero-metrics dt{
-  font:500 10.5px/1 var(--font-mono);letter-spacing:.14em;
-  text-transform:uppercase;color:var(--color-text-faint);
-}
-.hero-metrics dd{font:600 var(--fs-h3)/1.1 var(--font-mono);font-variant-numeric:tabular-nums}
-.hero-metrics dd.is-text{font:600 var(--fs-body)/1.3 var(--font-body)}
-
-.hero-attitude{display:grid;gap:var(--sp-6);align-content:start}
-/* flex 而不是 grid：AI 那一列要**撑满整行高度**，否则右边留一块空洞 */
-.hero-ai{display:flex;flex-direction:column}
-
-/* ---- 姿态球：几何尺寸与旧版同一套手感（BUBBLE_MAX 是按这个半径定的） ----
-   刻意**左对齐**（不 margin:auto 居中）：上面那行标题是左对齐的，
-   球在中间飘着会和标题错开，三列看起来就不像一行了。 */
-.ball{
-  position:relative;width:100%;max-width:210px;aspect-ratio:1;
-  border-radius:50%;border:1px solid var(--color-line);
-  background:radial-gradient(circle at 50% 38%, var(--ball-from), var(--ball-to) 72%);
-}
-.ball .ring2{
-  position:absolute;left:50%;top:50%;width:34%;height:34%;
-  transform:translate(-50%,-50%);border-radius:50%;border:1px dashed var(--color-line);
-}
-.ball .cross::before,.ball .cross::after{content:"";position:absolute;background:var(--color-line)}
-.ball .cross::before{left:50%;top:14%;bottom:14%;width:1px}
-.ball .cross::after{top:50%;left:14%;right:14%;height:1px}
-.ball .cross2{position:absolute;left:50%;top:50%;width:52%;height:52%;transform:translate(-50%,-50%) rotate(45deg)}
-.ball .cross2::before,.ball .cross2::after{content:"";position:absolute;background:var(--color-line-strong);opacity:.45}
-.ball .cross2::before{left:50%;top:0;bottom:0;width:1px}
-.ball .cross2::after{top:50%;left:0;right:0;height:1px}
-.ball .dot{
-  position:absolute;left:50%;top:50%;width:20px;height:20px;margin:-10px 0 0 -10px;
-  border-radius:50%;background:var(--color-still);
-  /* 小球短且线性：0.15s linear 让它贴着数据走，没有加速-减速的假动作。
-     原来 .3s ease-out 配 500ms 一次的数据更新，观感是"猛冲一下然后停住"。 */
-  transition:transform .15s linear,background .4s,box-shadow .4s;
-}
-.bars{display:flex;flex-direction:column;gap:var(--sp-3)}
-.bar{display:grid;grid-template-columns:16px minmax(0,1fr) 56px;gap:var(--sp-3);align-items:center}
-.bar em{font:600 var(--fs-meta)/1 var(--font-mono);font-style:normal}
-.bar .t{position:relative;height:6px;border-radius:var(--radius-control);background:var(--color-surface-3)}
-.bar .t i{position:absolute;top:0;height:100%;border-radius:var(--radius-control);left:50%;width:0;transition:left .3s,width .3s,background .3s}
-.bar .t::after{content:"";position:absolute;left:50%;top:-2px;bottom:-2px;width:1px;transform:translateX(-.5px);background:var(--color-line-strong)}
-.bar .v{text-align:right;font:500 var(--fs-meta)/1 var(--font-mono)}
-
-/* ---- AI 回复：**引用块**，不是卡片 ----
-   一根左侧竖条 + 缩进就够了。第一版给它套了卡片（边框 + 底色 + 阴影），
-   在 hero 带子里就是"卡片里套卡片"，纯属加噪。 */
-.reply{
-  flex:1 1 auto;position:relative;
-  display:flex;flex-direction:column;gap:var(--sp-3);
-  padding-left:var(--sp-4);border-left:2px solid var(--color-line-strong);
-  min-height:120px;
-}
-.reply .tag{
-  /* 字距收到 .08em：这个标签是"拉丁 + 中文"混排（AI 回复），
-     等宽字体上 .16em 的字距会把 A 和 I 拉得像两个词，中文也跟着散。 */
-  font:600 11px/1 var(--font-mono);letter-spacing:.08em;text-transform:uppercase;
-  color:var(--color-text-faint);
-}
-.reply .txt{font-size:var(--fs-body);color:var(--color-text-muted);white-space:pre-wrap;word-break:break-word}
-.reply.has{border-left-color:var(--color-shake)}
-.reply.has .tag{color:var(--color-shake)}
-.reply.has .txt{color:var(--color-text)}
-/* 第 5 周：文字入口 —— 和「三击说话」走**同一条链路**（同一个 request_ai），
-   课程要求"用同一句任务对照文字和语音入口"。发送按钮走"退下去"那一档，
-   不加第二个实心主操作（设计系统：全页只允许 1 个 primary）。 */
-.askrow{display:flex;align-items:center;gap:var(--sp-2);flex-wrap:wrap;margin-top:var(--sp-3)}
-.askrow input{flex:1 1 200px;min-width:0}
-.reply-foot{
-  margin-top:auto;display:flex;justify-content:space-between;gap:var(--sp-4);flex-wrap:wrap;
-  font:400 11.5px/1.5 var(--font-mono);color:var(--color-text-faint);
-}
-.reply.pending::after{
-  content:"";position:absolute;right:0;top:0;
-  width:13px;height:13px;border-radius:50%;
-  border:2px solid var(--color-surface-3);border-top-color:var(--color-action-primary);
-  animation:spin .9s linear infinite;
-}
-@keyframes spin{to{transform:rotate(360deg)}}
-
-/* hero 带子内部的分块：发丝线 + 留白，不用卡片 */
-.stage-block{
-  margin-top:var(--sp-8);padding-top:var(--sp-8);
-  border-top:1px solid var(--color-line);
-  display:flex;flex-direction:column;gap:var(--sp-4);
-}
-.stage-actions{
-  display:flex;align-items:center;gap:var(--sp-3);flex-wrap:wrap;
-  margin-top:var(--sp-8);padding-top:var(--sp-8);border-top:1px solid var(--color-line);
-}
-.cmdbar{display:flex;align-items:center;gap:var(--sp-2);flex-wrap:wrap;flex:1 1 auto}
-/* 破坏性指令（格式化 SD 卡）与安全指令之间**留一道可伸缩的间隔**，
-   把它顶到最右边 —— 一排按钮里挨着「读取存储信息」，误点代价太大。 */
-.cmdbar .cmd-gap{flex:1 1 var(--sp-6)}
-
-/* ==========================================================================
-   区域：每一块上下各留 64px，块与块之间用一条发丝线分隔。
-   宁可页面长一点，也不要挤成一坨 —— 信息密度要能喘气。
-   ========================================================================== */
-.region{padding-block:var(--sp-16);border-bottom:1px solid var(--color-line)}
-.region:last-of-type{border-bottom:0}
-.region-head{
-  display:flex;align-items:baseline;justify-content:space-between;
-  gap:var(--sp-6);flex-wrap:wrap;margin-bottom:var(--sp-8);
-}
-.region-head h2{font:600 var(--fs-h2)/1.2 var(--font-display);letter-spacing:-.02em}
-/* 区域说明用等宽小字，靠右 —— 它是注脚，不该跟标题争大小。
-   第一版写成了 15px 正文段落，三段加起来就是三坨噪音。 */
-.region-sub{
-  font:400 var(--fs-meta)/1.6 var(--font-mono);color:var(--color-text-faint);
-  max-width:64ch;text-align:right;
-}
-.region-tools{display:flex;align-items:center;gap:var(--sp-3);flex-wrap:wrap}
-
-/* 用 flex + flex-grow 而不是固定列数：某张卡被 JS 隐藏时，
-   同排的卡会自动占满整行，不会留一个空洞。
-   align-items:flex-start（不是 stretch）—— 同排两张卡内容量差很多时，
-   拉平高度只会让短的那张底下空出一大块，比高低不齐更难看。 */
-.cols{display:flex;flex-wrap:wrap;gap:var(--sp-6);align-items:flex-start}
-.cols>*{flex:1 1 430px;min-width:0}
-.cols>.lead{flex:1.3 1 520px}
-
-/* 卡片：**平面 + 发丝线 + 一档轻阴影**。
-   第一版每张卡都带渐变和 shadow-2，六张卡同时喊"我在这一层"，
-   结果 hero 反而压不住它们。层次要靠"hero 更重"来给，不是"卡片更重"。 */
-.card{
-  display:flex;flex-direction:column;gap:var(--sp-4);
-  padding:var(--sp-6);
-  border:1px solid var(--color-line);
-  border-radius:var(--radius-card);
-  background:var(--color-surface);
-  box-shadow:var(--shadow-1);
-}
-.card-head{display:flex;align-items:baseline;justify-content:space-between;gap:var(--sp-4);flex-wrap:wrap}
-.card-head h3{font:600 var(--fs-h3)/1.2 var(--font-display);letter-spacing:-.015em}
-.card-head h3.sm{font-size:var(--fs-body)}
-
-/* ---- 设备列表（多板场景；只有一台时整块不出现） ----
-   做成**表格式的行**而不是卡片：设备是重复项，一屏可能有 20 台，
-   列对齐比卡片好扫读，也不会出现"很宽的卡片里挤着一行小字、右边空一大片"。
-   选中态用左侧 2px 强调条 + 淡底，不用整块高亮（整块高亮会跟 hover 撞车）。 */
-.devlist{
-  display:flex;flex-direction:column;
-  border:1px solid var(--color-line);border-radius:var(--radius-card);
-  background:var(--color-surface);overflow:hidden;
-}
-.dev{
-  display:grid;align-items:center;gap:var(--sp-4);
-  grid-template-columns:18px 8px minmax(110px,180px) minmax(150px,240px) minmax(0,1fr);
-  padding:var(--sp-3) var(--sp-4);
-  border-bottom:1px solid var(--color-line);
-  cursor:pointer;transition:background .16s;
-}
-.dev:last-child{border-bottom:0}
-.dev:hover{background:var(--color-surface-2)}
-.dev.sel{background:var(--tint-primary);box-shadow:inset 2px 0 0 var(--color-action-primary)}
-/* 设备行是"可点的 div"，必须自己把键盘可达性补上：
-   给它 tabindex/role（见 renderDevices），这里给焦点样式。
-   用 outline + 负 offset，不去动 box-shadow（那被选中态的强调条占着）。 */
-.dev:focus-visible{outline:2px solid var(--color-action-primary);outline-offset:-2px}
-.dev input[type=checkbox]{accent-color:var(--color-action-primary);width:15px;height:15px;cursor:pointer}
-.dev .dot{width:8px;height:8px;border-radius:50%}
-.dev .dot.off{animation:breathe 1.7s ease-in-out infinite}
-.dev .did{font:600 var(--fs-body)/1.3 var(--font-display);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.dev .meta{
-  font:400 11.5px/1.5 var(--font-mono);color:var(--color-text-faint);
-  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
-}
-
-/* ==========================================================================
-   控件：**两级**。
-   ---- 主操作（.primary）：实心青绿，一屏只允许一个 ----
-   ---- 其余一律"退下去"：透明底 + 发丝线 + 次级文字色 ----
-   第一版所有按钮都是"深底 + 边框 + 文字"，8 个按钮重量完全一样，
-   主操作跳不出来，一排看过去就是一团。
-   ========================================================================== */
-button{
-  font:600 var(--fs-body)/1 var(--font-body);
-  height:36px;padding:0 var(--sp-4);
-  border-radius:var(--radius-control);
-  border:1px solid var(--color-line);
-  background:transparent;
-  color:var(--color-text-muted);
-  cursor:pointer;
-  transition:background .16s,border-color .16s,color .16s,transform .06s;
-}
-button:hover:not(:disabled){
-  background:var(--color-surface-2);color:var(--color-text);border-color:var(--color-line-strong);
-}
-button:active:not(:disabled){transform:translateY(1px)}
-button:focus-visible{outline:none;box-shadow:var(--ring)}
-button:disabled{opacity:.38;cursor:not-allowed}
-button.primary{
-  background:var(--color-action-primary);
-  border-color:var(--color-action-primary);
-  color:var(--color-action-primary-ink);
-}
-button.primary:hover:not(:disabled){
-  background:var(--color-action-primary-hi);border-color:var(--color-action-primary-hi);
-  color:var(--color-action-primary-ink);
-}
-button.danger{color:var(--color-fall);border-color:var(--tint-danger-line)}
-button.danger:hover:not(:disabled){background:var(--tint-danger);color:var(--color-fall);border-color:var(--color-danger)}
-button.sm{height:28px;padding:0 var(--sp-3);font-size:var(--fs-meta)}
-/* 图标按钮：和状态胶囊同高（28px），走"退下去"那一档 ——
-   主题切换是工具，不该跟主操作抢注意力。 */
-button.icon{width:32px;height:28px;padding:0;display:grid;place-items:center;flex:none}
-button.icon svg{width:15px;height:15px;display:block}
-/* 图标显示的是"点了会变成什么"：明亮时显示月亮（去深色），深色时显示太阳 */
-html[data-theme="light"] button.icon .i-sun{display:none}
-html[data-theme="dark"] button.icon .i-moon{display:none}
-
-input[type=text],input[type=password],input[type=number],select{
-  height:36px;padding:0 var(--sp-3);
-  border-radius:var(--radius-control);
-  border:1px solid var(--color-line);
-  background:var(--color-bg);           /* 输入框比卡片更深 = 凹进去 */
-  color:var(--color-text);
-  font:400 var(--fs-body)/1 var(--font-body);
-}
-input::placeholder{color:var(--color-text-faint)}
-input:focus,select:focus{outline:none;border-color:var(--color-action-primary);box-shadow:var(--ring)}
-select{padding-right:var(--sp-2);font-family:var(--font-mono);font-size:var(--fs-meta)}
-.field{display:flex;flex-direction:column;gap:var(--sp-2)}
-.field>label{font:500 10.5px/1 var(--font-mono);letter-spacing:.14em;text-transform:uppercase;color:var(--color-text-faint)}
-.formrow{display:flex;gap:var(--sp-4);flex-wrap:wrap;align-items:flex-end}
-.actions{display:flex;align-items:center;gap:var(--sp-3);flex-wrap:wrap}
-
-/* ==========================================================================
-   列表：指令记录 / 事件流 / 文件。做成紧凑的"数据表"，
-   行与行之间用发丝线，不用卡片套卡片。
-   ========================================================================== */
-.list{display:flex;flex-direction:column}
-.item{
-  display:flex;align-items:baseline;gap:var(--sp-3);flex-wrap:wrap;
-  padding:var(--sp-3) 0;
-  border-bottom:1px solid var(--color-line);
-  font-size:var(--fs-meta);color:var(--color-text-muted);
-  /* ⚠️ 指令参数是一整串**没有空格**的 JSON（{"n":3,"on_ms":80,"off_ms":80,...}）。
-     默认情况下它算一个"不可断词"，flex 子项的 min-width:auto 又不允许收缩到
-     min-content 以下 —— 于是它把整页撑宽。实测 320px 下溢出 44px，
-     而 set_config 的参数更长（ssid/url/period_ms），390px 手机上也会破。
-     overflow-wrap:anywhere 允许在任意位置断行（并且会**降低 min-content**，
-     这正是 flex 能收缩的前提）；min-width:0 是配套的那一半。 */
-  overflow-wrap:anywhere;
-}
-.item>*{min-width:0}
-.item:last-child{border-bottom:0}
-.item .name{color:var(--color-text);font-weight:600;font-family:var(--font-display)}
-.item .meta{color:var(--color-text-faint);font-size:11.5px;font-family:var(--font-mono)}
-.st{
-  font:500 11px/1 var(--font-mono);letter-spacing:.06em;
-  padding:4px var(--sp-2);border-radius:var(--radius-control);
-  white-space:nowrap;flex:none;
-}
-.st-queued{background:var(--color-surface-3);color:var(--color-text-muted)}
-.st-sent{background:var(--tint-shake);color:var(--color-shake)}
-.st-done{background:var(--tint-still);color:var(--color-still)}
-.st-failed,.st-timeout{background:var(--tint-fall);color:var(--color-fall)}
-#feed{max-height:340px;overflow-y:auto}
-#feed .t{color:var(--color-text-faint);font-size:11.5px;flex:none;font-family:var(--font-mono)}
-#feed .k{flex:none;width:7px;height:7px;border-radius:50%;margin-top:6px}
-.k-info{background:var(--color-text-faint)}
-.k-motion{background:var(--color-move)}
-.k-shake{background:var(--color-shake)}
-.k-fall,.k-alert{background:var(--color-fall)}
-.k-ask{background:var(--color-walk)}
-.k-cmd{background:var(--color-action-primary)}
-
-/* ---- 曲线 ---- */
-#cv{width:100%;height:144px;display:block;border-radius:var(--radius-card)}
-.legend{display:flex;gap:var(--sp-6);font:400 11.5px/1 var(--font-mono);color:var(--color-text-faint);flex-wrap:wrap}
-.legend i{display:inline-block;width:12px;height:3px;border-radius:var(--radius-control);vertical-align:middle;margin-right:var(--sp-2)}
-
-/* ---- 摄像头 ---- */
-.camwrap{display:grid;grid-template-columns:minmax(0,1fr) 224px;gap:var(--sp-6)}
-.camview{
-  position:relative;aspect-ratio:4/3;max-height:340px;
-  display:flex;align-items:center;justify-content:center;
-  background:var(--video-bg);border:1px solid var(--color-line);
-  border-radius:var(--radius-card);overflow:hidden;
-}
-.camview img{width:100%;height:100%;object-fit:contain;display:block}
-.camview .nosig{color:var(--color-text-faint);font:400 var(--fs-meta)/1.7 var(--font-body);text-align:center;padding:var(--sp-6)}
-.camside{display:flex;flex-direction:column;gap:var(--sp-3);align-items:flex-start}
-.shot{
-  display:flex;align-items:center;gap:var(--sp-3);
-  padding:var(--sp-2);border-radius:var(--radius-control);
-  border:1px solid var(--color-line);background:var(--color-surface);
-}
-.shot img{width:56px;height:42px;object-fit:cover;border-radius:var(--radius-control);background:var(--video-bg);flex:none}
-.shot .nm{font:400 var(--fs-meta)/1.5 var(--font-mono);flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-
-/* ---- 存储占用圆环 ---- */
-.ringwrap{display:flex;align-items:center;gap:var(--sp-6);flex-wrap:wrap}
-.ring{
-  position:relative;width:104px;height:104px;flex:0 0 auto;cursor:pointer;
-  border-radius:50%;transition:transform .16s;
-}
-.ring:hover{transform:scale(1.03)}
-.ring:focus-visible{outline:2px solid var(--color-action-primary);outline-offset:2px}
-.ring svg{display:block;transform:rotate(-90deg)}
-.ring .ringtxt{
-  position:absolute;inset:0;display:flex;flex-direction:column;
-  align-items:center;justify-content:center;line-height:1.15;
-}
-.ring .ringtxt b{font:600 var(--fs-h3)/1 var(--font-mono)}
-.ring .ringtxt span{font:500 10.5px/1 var(--font-mono);letter-spacing:.14em;color:var(--color-text-faint)}
-.ringmeta{font:400 var(--fs-meta)/1.9 var(--font-mono);color:var(--color-text-muted)}
-.ringmeta .k{color:var(--color-text-faint)}
-
-footer{
-  border-top:1px solid var(--color-line);
-  padding-block:var(--sp-8);
-  color:var(--color-text-faint);font:400 11.5px/1.9 var(--font-mono);
-}
-
-/* ==========================================================================
-   弹窗：全站唯一用 14px 圆角的地方。用原生 <dialog>，
-   不用 window.confirm() —— 系统弹窗在深色界面上是一块白方块，
-   而且会阻塞整个页面（SSE 推送和 3D 渲染全停）。
-   ========================================================================== */
-dialog.modal{
-  width:min(448px,calc(100vw - 32px));
-  padding:0;border:1px solid var(--color-line-strong);
-  border-radius:var(--radius-modal);
-  background:var(--color-surface);color:var(--color-text);
-  box-shadow:var(--shadow-3), inset 0 1px 0 var(--sheen);
-}
-dialog.modal::backdrop{background:var(--modal-backdrop);backdrop-filter:blur(3px)}
-.modal-body{padding:var(--sp-8) var(--sp-8) var(--sp-6);display:grid;gap:var(--sp-3)}
-.modal-body h3{font:600 var(--fs-h2)/1.25 var(--font-display);letter-spacing:-.015em}
-.modal-body p{font-size:var(--fs-body);color:var(--color-text-muted)}
-.modal-foot{display:flex;justify-content:flex-end;gap:var(--sp-3);padding:0 var(--sp-8) var(--sp-8)}
-
-/* ==========================================================================
-   响应式：窄屏优先保证"读得到、点得到"，不追求信息量
-   ========================================================================== */
-@media(max-width:1280px){
-  .stage-grid{grid-template-columns:minmax(0,1fr) minmax(0,.86fr)}
-  .hero-ai{grid-column:1 / -1;margin-top:var(--sp-2)}
-  .reply{min-height:0}
-}
-@media(max-width:1024px){
-  .stage-grid{grid-template-columns:minmax(0,1fr)}
-  .camwrap{grid-template-columns:minmax(0,1fr)}
-  .cols>*,.cols>.lead{flex-basis:100%}
-  .region-sub{text-align:left}
-}
-@media(max-width:760px){
-  .shell{padding-inline:var(--sp-4)}
-  .stage{padding-block:var(--sp-12)}
-  .region{padding-block:var(--sp-12)}
-  /* 设备行在窄屏折成三行：复选框+状态点 | 设备名 / 状态 / 活动，都落在第 3 列 */
-  .dev{grid-template-columns:18px 8px minmax(0,1fr);gap:var(--sp-2) var(--sp-3)}
-  .dev .did,.dev .meta{grid-column:3}
-  /* hero 字号在窄屏**不缩**：规则要求 hero ≥ 正文 × 3（15 × 3 = 45），
-     原来缩到 --fs-h2(24) 就是 1.6 倍 —— 直接违规（2026-09-26 补空状态断言时抓到）。
-     正解不是缩字号，是**改成上下堆叠**：圆环在上、标题在下，
-     48px 的标题就有整行宽度可用（最长 4 个汉字 = 192px < 288px，320px 屏也放得下）。 */
-  .hero-readout{grid-template-columns:minmax(0,1fr);justify-items:start;gap:var(--sp-4)}
-  .hero-ring{width:112px;height:112px}
-  /* 环变小了，里面的读数也要跟着小，否则 "0.00 g" 会顶到环的描边上 */
-  .ring-mid b{font-size:var(--fs-h3)}
-  .hero-metrics{gap:var(--sp-6)}
-  #cv{height:140px}
-  .card{padding:var(--sp-4)}
-  .appbar .shell{min-height:52px;gap:var(--sp-3)}
-  /* 手机上输入框小于 16px 时，iOS 聚焦会强制放大页面 —— 很难受 */
-  input[type=text],input[type=password],input[type=number],select{font-size:16px}
-}
-
-/* ==========================================================================
-   动效偏好：系统里开了"减少动态效果"就把所有动画/过渡压到几乎为 0。
-   这个页面有呼吸点、活动词淡入、曲线过渡、3D slerp —— 对前庭敏感的人是干扰。
-   只压缩**时长**，不删动画本身：布局和最终状态完全不变。
-   ========================================================================== */
-@media (prefers-reduced-motion: reduce){
-  *,*::before,*::after{
-    animation-duration:.01ms !important;
-    animation-iteration-count:1 !important;
-    transition-duration:.01ms !important;
-  }
-}
-</style>
-</head>
-<body>
-
-<header class="appbar">
-  <div class="shell">
-    <div class="brand">
-      <span class="mark" aria-hidden="true">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
-          <path d="M12 2.5 20 7v10l-8 4.5L4 17V7z"></path><path d="M12 12v9.5M12 12 4 7M12 12l8-5"></path>
-        </svg>
-      </span>
-      <div>
-        <b>Ego Link</b>
-        <span>实时仪表盘</span>
-      </div>
-    </div>
-    <div class="gap"></div>
-    <div class="status">
-      <span id="dev" class="pill off"><i></i>离线</span>
-      <span id="hzp" class="pill">— Hz</span>
-      <span id="postsp" class="pill">↑0 帧</span>
-      <button id="theme" class="icon" type="button" title="切换主题" aria-label="切换主题">
-        <svg class="i-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true">
-          <circle cx="12" cy="12" r="4.2"></circle>
-          <path d="M12 2.6v2.2M12 19.2v2.2M4.6 4.6l1.6 1.6M17.8 17.8l1.6 1.6M2.6 12h2.2M19.2 12h2.2M4.6 19.4l1.6-1.6M17.8 6.2l1.6-1.6"></path>
-        </svg>
-        <svg class="i-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true">
-          <path d="M20.5 14.6A8.6 8.6 0 0 1 9.4 3.5a8.6 8.6 0 1 0 11.1 11.1z"></path>
-        </svg>
-      </button>
-    </div>
-  </div>
-</header>
-
-<main class="shell">
-  <section class="region" id="devcard" hidden>
-    <div class="region-head">
-      <h2>设备</h2>
-      <div class="region-tools">
-        <span class="src" id="devcount"></span>
-        <button id="devall" class="sm">全选</button>
-      </div>
-    </div>
-    <div class="devlist" id="devs"></div>
-    <p class="hint" style="margin-top:var(--sp-3)">勾选多台后，远程指令会<b>同时</b>下发给它们；一台都不勾 = 只发给当前查看的那台。</p>
-  </section>
-
-  <!-- ===================================================================
-       Hero 舞台。整页最重要的一块，也是唯一不在卡片里的内容。
-       =================================================================== -->
-  <section class="stage">
-    <div class="stage-head">
-      <span class="eyebrow">实时状态 · 最近 8 秒</span>
-      <span class="src">数据来源 <span id="src">—</span></span>
-    </div>
-
-    <div class="stage-grid">
-      <div class="hero-readout">
-        <div class="hero-ring">
-          <svg viewBox="0 0 140 140" aria-hidden="true">
-            <circle class="track" cx="70" cy="70" r="56"></circle>
-            <circle class="val" id="ring" cx="70" cy="70" r="56"></circle>
-          </svg>
-          <div class="ring-mid">
-            <b id="abs">0.00 g</b>
-            <span>合加速度</span>
-          </div>
-        </div>
-        <div>
-          <h1 class="hero-word" id="act">…</h1>
-          <dl class="hero-metrics">
-            <div><dt>步数 / 8s</dt><dd id="steps">0</dd></div>
-            <div><dt>晃动 / 8s</dt><dd id="shakes">0</dd></div>
-            <div><dt>AI 来源</dt><dd class="is-text" id="mode">规则AI</dd></div>
-          </dl>
-        </div>
-      </div>
-
-      <div class="hero-attitude">
-        <div class="panel-head">
-          <span class="panel-title">姿态</span>
-          <span class="src mono" id="tilt">倾角 —</span>
-        </div>
-        <div class="ball">
-          <div class="cross"></div>
-          <div class="cross2"></div>
-          <div class="ring2"></div>
-          <div class="dot" id="ball"></div>
-        </div>
-        <div class="bars">
-          <div class="bar"><em style="color:var(--color-fall)">X</em><div class="t"><i id="bx"></i></div><span class="v mono" id="vx">0.00</span></div>
-          <div class="bar"><em style="color:var(--color-still)">Y</em><div class="t"><i id="by"></i></div><span class="v mono" id="vy">0.00</span></div>
-          <div class="bar"><em style="color:var(--color-move)">Z</em><div class="t"><i id="bz"></i></div><span class="v mono" id="vz">0.00</span></div>
-        </div>
-      </div>
-
-      <div class="hero-ai">
-        <div class="reply" id="replybox">
-          <span class="tag">AI 回复</span>
-          <div class="txt" id="reply">还没有提问。</div>
-          <div class="reply-foot">
-            <span>按板子 BOOT 键提问，<b>三击</b>说话</span>
-            <span id="voicehint">回复同时显示在板子屏幕上</span>
-            <!-- 计时（第 6 周）：板端屏幕只显示回复正文，看不到"等了多久"，
-                 所以耗时在这里给。没有数据时整个元素收起来，不占位。 -->
-            <span id="timing" hidden></span>
-            <button id="aicancel" class="sm" hidden>停止</button>
-          </div>
-          <div class="askrow">
-            <input id="asktext" type="text" maxlength="200"
-                   placeholder="也可以打字下达任务 —— 和说话走同一条链路"
-                   aria-label="打字下达任务">
-            <button id="asksend" class="sm" type="button">发送</button>
-            <button id="ttsbtn" class="sm" type="button" aria-pressed="true">播报 开</button>
-          </div>
-        </div>
-      </div>
-    </div>
-
-    <!-- 主操作**放在曲线之前**：整条 hero 带子约 900px 高，
-         曲线是"细看"的内容，主操作是"要用的"内容 —— 放在最后会被
-         900px 高的笔记本切在折线以下（规则要求主操作必须跳出来）。 -->
-    <div class="stage-actions">
-      <span class="cmdbar" id="cmdbts"></span>
-      <span id="cmdhint" class="hint"></span>
-    </div>
-
-    <div class="stage-block">
-      <div class="panel-head">
-        <span class="panel-title">合加速度 |a|</span>
-        <span class="src">最近 8 秒 · 服务端降采样</span>
-      </div>
-      <canvas id="cv" role="img" aria-label="合加速度 |a| 最近 8 秒的曲线"></canvas>
-      <div class="legend">
-        <span><i style="background:var(--color-move)"></i>|a| 曲线</span>
-        <span><i style="background:var(--color-text-faint)"></i>1g 参考线</span>
-        <span><i style="background:var(--color-fall)"></i>失重阈值 0.35g（疑似跌落）</span>
-      </div>
-    </div>
-  </section>
-
-  <section class="region">
-    <div class="region-head">
-      <h2>远程操作</h2>
-      <p class="region-sub">指令搭在「下一帧遥测的响应」里下发，板子在再下一帧回传结果 —— 一次真实的硬件往返。</p>
-    </div>
-    <div class="cols">
-      <div class="card lead" id="cardcmd">
-        <div class="card-head">
-          <h3>指令记录</h3>
-          <span class="src">最近 8 条</span>
-        </div>
-        <div class="formrow">
-          <div class="field">
-            <label for="orientsel">方向档位 oN</label>
-            <select id="orientsel"></select>
-          </div>
-          <button id="orientapply">应用档位</button>
-          <span id="orientnow" class="hint"></span>
-        </div>
-        <div class="list" id="cmds"></div>
-      </div>
-
-      <div class="card" id="cardfeed">
-        <div class="card-head">
-          <h3>事件流</h3>
-          <span class="src" id="evcount"></span>
-        </div>
-        <div id="feed"></div>
-      </div>
-    </div>
-  </section>
-
-  <section class="region">
-    <div class="region-head">
-      <h2>设备与画面</h2>
-      <p class="region-sub">板子是 HTTP 客户端，没有自己的服务端，所以画面由板子推上来、网页从这里取。</p>
-    </div>
-    <div class="cols">
-      <div class="card lead" id="cardcam">
-        <div class="card-head">
-          <h3>摄像头</h3>
-          <span class="src" id="camwho">—</span>
-        </div>
-        <div class="camwrap">
-          <div class="camview">
-            <!-- 一开始就 hidden：没有 src 时浏览器会画一个"图片裂了"的破图标，
-                 比什么都不显示还难看。收到第一帧再让它出现。 -->
-            <img id="camimg" alt="" hidden>
-            <div class="nosig" id="camnosig">点右侧「开启实时画面」<br>
-              （板子离线 / 摄像头自检没过时不会有画面）</div>
-          </div>
-          <div class="camside">
-            <button id="camshot">拍照 → 存进板子 SD 卡</button>
-            <button id="camlive">开启实时画面</button>
-            <div class="field">
-              <label for="camfps">帧率</label>
-              <select id="camfps" title="板子推帧的速度，改这里会下发命令给板子。调低省 WiFi 带宽；调高更跟手。注意：板子一帧要「等帧 + 开一条 TCP + POST 27KB」，实测上限约 2 帧/秒 —— 选「极限」也不会超过它，那是链路上限，不是设置没生效。">
-                <option value="1">省流 · 最省带宽</option>
-                <option value="2" selected>标准</option>
-                <option value="4">流畅</option>
-                <option value="6">极限 · 板子能给的最快</option>
-              </select>
-            </div>
-            <div class="hint">
-              实时画面是板子<b>推</b>上来的，帧率<b>由板子决定</b>（在上面选）。
-              实测上限约 2 帧/秒：一帧要等帧 + 开一条 TCP + POST 27KB。
-              分辨率由传感器固定为 1280x720（OV3660 的 JPEG 只有这一档）。
-              关掉可省 WiFi 带宽。
-            </div>
-            <div class="hint" id="camstat">—</div>
-          </div>
-        </div>
-        <div class="card-head" style="margin-top:var(--sp-2)">
-          <h3 class="sm">本机照片存档</h3>
-          <span class="src" id="shotwho">—</span>
-        </div>
-        <div class="list" id="shotlist"></div>
-      </div>
-
-      <div class="card" id="card3d" hidden>
-        <div class="card-head">
-          <h3>板子姿态 · 3D</h3>
-          <span class="src" id="d3src">—</span>
-        </div>
-        <div class="field">
-          <label for="pollsel">页面取数频率</label>
-          <select id="pollsel" title="页面从服务器取数的频率。想更跟手就选 60Hz —— 但前提是板端上报周期也调到 50ms（板子设置里的「灵敏度」），两个都够快才真跟手">
-            <option value="16">60 Hz</option>
-            <option value="33">30 Hz</option>
-            <option value="50">20 Hz</option>
-            <option value="100" selected>10 Hz</option>
-            <option value="200">5 Hz</option>
-            <option value="500">2 Hz</option>
-            <option value="2000">0.5 Hz</option>
-          </select>
-        </div>
-        <canvas id="board3d" role="img" aria-label="板子姿态 3D 示意" style="width:100%;height:280px;display:block"></canvas>
-        <div class="hint">橙色小条 = 板子顶边（远的那条）；地面网格固定不动，板子跟着实时姿态转。
-          画面按 60Hz 平滑（中间做 slerp），所以取数慢一点也不会一跳一跳。</div>
-      </div>
-    </div>
-  </section>
-
-  <section class="region">
-    <div class="region-head">
-      <h2>板子管理</h2>
-      <p class="region-sub">改完通过「下一帧遥测的响应」下发到板子并写入 NVS；空着 = 不改那一项。</p>
-    </div>
-    <div class="cols">
-      <div class="card lead" id="cardcfg">
-        <div class="card-head">
-          <h3>板子设置</h3>
-        </div>
-        <div class="formrow">
-          <div class="field">
-            <label for="cfgssid">WiFi 名称</label>
-            <input id="cfgssid" type="text" placeholder="不改就留空" autocomplete="off">
-          </div>
-          <div class="field">
-            <label for="cfgpass">密码</label>
-            <input id="cfgpass" type="password" placeholder="不改就留空" autocomplete="new-password">
-          </div>
-        </div>
-        <div class="formrow">
-          <div class="field" style="flex:1 1 240px">
-            <label for="cfgurl">服务器地址</label>
-            <input id="cfgurl" type="text" placeholder="http://192.168.x.x:8000" autocomplete="off">
-          </div>
-          <div class="field">
-            <label for="cfgper">上报周期 ms</label>
-            <input id="cfgper" type="number" min="50" max="2000" step="10" placeholder="50~2000" style="width:120px">
-          </div>
-        </div>
-        <div class="actions">
-          <button id="cfgapply">下发到板子</button>
-          <span id="cfghint" class="hint"></span>
-        </div>
-        <div class="hint">
-          <b>改 WiFi 会先试连、连上了才保存</b>（最多 8 秒）—— 密码填错不会把板子弄失联。
-          <b>上报周期就是「灵敏度」</b>：50ms=20Hz（最跟手）/ 100ms=10Hz / 500ms=2Hz（默认）。
-          越小越跟手，但 WiFi 压力越大；50ms 已接近单次往返的量级，跑不到也正常。
-        </div>
-      </div>
-
-      <div class="card" id="cardsd">
-        <div class="card-head">
-          <h3>存储管理</h3>
-          <span class="src" id="sdwho">—</span>
-        </div>
-        <div class="actions">
-          <button id="sdrefresh">读取存储信息</button>
-        </div>
-        <div id="sdring" class="ringwrap"></div>
-        <div class="list" id="sdfiles"></div>
-      </div>
-    </div>
-  </section>
-</main>
-
-<footer>
-  <div class="shell">
-    服务器 <span id="host"></span> · <span id="logdir"></span> ·
-    页面只用标准库 SSE 推送，不依赖外网；指令白名单 <span id="names"></span>
-  </div>
-</footer>
-
-<dialog class="modal" id="cfm">
-  <div class="modal-body">
-    <h3 id="cfm-title">确认操作</h3>
-    <p id="cfm-body"></p>
-  </div>
-  <div class="modal-foot">
-    <button id="cfm-cancel" type="button">取消</button>
-    <button id="cfm-ok" type="button" class="danger">确定</button>
-  </div>
-</dialog>
-
-<script>
-(function(){
-"use strict";
-
-var $ = function(id){ return document.getElementById(id); };
-
-/* 设备名/事件文本都是**外部输入**（板端上报、且设备名由用户在配网页手填），
-   拼进 innerHTML 之前必须转义。 */
-var ESCMAP = { "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;" };
-function esc(s){
-  return String(s == null ? "" : s).replace(/[&<>"']/g, function(c){ return ESCMAP[c]; });
-}
-/* 「最后上报」的人话表述 */
-function ago(sec){
-  if (!(sec >= 0)) return "—";
-  if (sec < 1) return "刚刚";
-  if (sec < 60) return sec.toFixed(1) + " 秒前";
-  if (sec < 3600) return Math.round(sec/60) + " 分钟前";
-  return Math.round(sec/3600) + " 小时前";
-}
-
-/* ---------------- 确认弹窗 ----------------
- * 用原生 <dialog>，不用 window.confirm()：系统弹窗在深色界面上是一块白方块，
- * 而且会**阻塞整个页面**（SSE 推送、3D 渲染全停）。
- * 这里是 Promise 风格，调用方写 .then(function(ok){...})。
- * 浏览器不支持 showModal() 时退回 window.confirm —— 功能不能因为 UI 新特性而丢。 */
-var cfmDlg = $("cfm");
-function confirmDialog(title, body, okLabel){
-  if (!cfmDlg || typeof cfmDlg.showModal !== "function"){
-    return Promise.resolve(window.confirm(title + "：" + body));
-  }
-  $("cfm-title").textContent = title;
-  $("cfm-body").textContent = body;
-  $("cfm-ok").textContent = okLabel || "确定";
-  return new Promise(function(resolve){
-    var settled = false;
-    function finish(ok){
-      if (settled) return;
-      settled = true;
-      cfmDlg.removeEventListener("close", onClose);
-      $("cfm-ok").onclick = null;
-      $("cfm-cancel").onclick = null;
-      resolve(ok);
-    }
-    function onClose(){ finish(cfmDlg.returnValue === "ok"); }
-    cfmDlg.addEventListener("close", onClose);
-    /* 两个按钮**必须自己 close()**：它们不在 <form method="dialog"> 里，
-       浏览器不会替我们把弹窗关掉（第一版就是这样，点"取消"弹窗纹丝不动）。
-       用 close(value) 直接定 returnValue，Esc 关闭时它保持空 = 取消。 */
-    $("cfm-ok").onclick = function(){ cfmDlg.close("ok"); };
-    $("cfm-cancel").onclick = function(){ cfmDlg.close(""); };
-    cfmDlg.returnValue = "";
-    cfmDlg.showModal();
-  });
-}
-
-/* ---------------- 颜色：一律从 CSS 令牌取，不在 JS 里抄第二份 ----------------
- * canvas 拿不到 CSS 变量，而页面有**两套主题**（浅色/深色）。
- * 早先这里是一张写死的 hex 表 —— 加主题那一刻它就成了第二个真相来源，
- * 迟早不同步（而且"看起来没坏"，只是某个主题下图表颜色不对）。
- * 现在用 1x1 canvas 把任意 CSS 颜色落成一个像素读回来：
- * oklch() / color() / rgba() 都能拿到确定的 sRGB 分量。
- * 结果按「主题 + 变量名」缓存，避免每帧都做一次 getImageData。 */
-var _probeCtx = null, _varCache = {}, _varCacheTheme = "";
-function _themeName(){
-  return document.documentElement.getAttribute("data-theme") === "dark" ? "dark" : "light";
-}
-function _resolve(css){
-  if (!_probeCtx){
-    var pc = document.createElement("canvas"); pc.width = pc.height = 1;
-    _probeCtx = pc.getContext("2d", {willReadFrequently: true});
-  }
-  _probeCtx.fillStyle = "#000"; _probeCtx.fillRect(0, 0, 1, 1);
-  _probeCtx.fillStyle = css;    _probeCtx.fillRect(0, 0, 1, 1);
-  var d = _probeCtx.getImageData(0, 0, 1, 1).data;
-  return [d[0], d[1], d[2]];
-}
-function varRGB(name){
-  var th = _themeName();
-  if (th !== _varCacheTheme){ _varCache = {}; _varCacheTheme = th; }   /* 换主题自动失效 */
-  if (_varCache[name]) return _varCache[name];
-  var raw = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
-  var rgb = raw ? _resolve(raw) : [128, 128, 128];
-  _varCache[name] = rgb;
-  return rgb;
-}
-function cssVar(name, alpha){
-  var c = varRGB(name);
-  return (alpha === undefined)
-    ? "rgb(" + c[0] + "," + c[1] + "," + c[2] + ")"
-    : "rgba(" + c[0] + "," + c[1] + "," + c[2] + "," + alpha + ")";
-}
-/* "r,g,b" 三元组：CSS 里用 rgb(var(--act-rgb) / .10) 染色时要用 */
-function varTriplet(name){ var c = varRGB(name); return c[0] + "," + c[1] + "," + c[2]; }
-
-/* ---------------- 主题 ----------------
- * 默认明亮（写在 <html data-theme> 上），用户选过的存在 localStorage，
- * head 里那段内联脚本会在首次绘制前应用 —— 所以这里不需要再管"初始值"。
- * 切换后要**强制重画**：canvas 的像素是画上去的，CSS 换了它不会自己变。 */
-function applyTheme(t){
-  document.documentElement.setAttribute("data-theme", t === "dark" ? "dark" : "light");
-  /* 清掉"上次是什么"的缓存，否则 setRing/setBall/setTilt 会认为值没变而跳过重绘 */
-  lastRing = -1; lastAct = ""; lastBall = ""; lastBallColor = ""; lastTilt = "";
-  fitCanvas();
-  pull();
-  var btn = $("theme");
-  if (btn){
-    var toDark = t !== "dark";
-    btn.title = toDark ? "切换到深色主题" : "切换到明亮主题";
-    btn.setAttribute("aria-label", btn.title);
-  }
-}
-
-/* 服务器文案 → 活动词 + 颜色（与板端 classify() 同一套规则） */
-/* 服务器文案 → 活动词 + 颜色。这里存的是**CSS 变量名**而不是色值 ——
-   语义色的含义与板端 device/main/ui.c 的 UI_C_* 一致，具体色值由主题决定。 */
-var ACT = [
-  { k:["跌落","失重"], word:"跌落", v:"--color-fall"  },
-  { k:["晃动"],        word:"晃动", v:"--color-shake" },
-  { k:["步行"],        word:"步行", v:"--color-walk"  },
-  { k:["运动"],        word:"运动", v:"--color-move"  },
-  { k:["静置"],        word:"静置", v:"--color-still" }
-];
-function actColor(t){
-  return { word: t.word, color: cssVar(t.v), rgb: varTriplet(t.v) };
-}
-function classify(s){
-  for (var i=0;i<ACT.length;i++){
-    for (var j=0;j<ACT[i].k.length;j++){
-      if (s.indexOf(ACT[i].k[j]) >= 0) return actColor(ACT[i]);
-    }
-  }
-  return actColor({ word: s ? s.slice(0,4) : "等待", v:"--color-idle" });
-}
-
-/* 指令 → 按钮文案与参数（按钮从 /api/commands 的 names 动态生成，
-   所以服务端新增指令时本页不用改代码） */
-var CMD_UI = {
-  capture_once:{ label:"采集一次", params:{}, primary:true },
-  led_blink:   { label:"闪灯 ×3",  params:{n:3,on_ms:80,off_ms:80} },
-  led_set:     { label:"LED 常亮", params:{on:true}, toggle:true },
-  set_orient:  { label:"设置方向档位" },
-  set_config:  { label:"下发板子设置" },
-  sd_format:   { label:"格式化 SD 卡", danger:true },
-  sd_ls:       { label:"读取存储信息" },
-  /* sd_rm 需要文件名参数，裸点必然失败 —— 它只该从「存储管理」里每个文件的
-     删除按钮触发，所以这里标 hidden，不在指令栏出按钮。 */
-  sd_rm:       { label:"删除文件", danger:true, hidden:true },
-  cam_capture: { label:"拍照" },
-  /* cam_stream 由摄像头卡片里的「开启/关闭实时画面」按钮触发，
-     不在指令栏出按钮（那里会出现"开/关"两种语义，容易点错）。 */
-  cam_stream:  { label:"实时画面", hidden:true }
-};
-
-/* ---------------- 环形仪表（270°，与板端同款） ---------------- */
-var RING_R = 56, RING_C = 2*Math.PI*RING_R, RING_ARC = RING_C*0.75, ABS_FULL = 2.0;
-var lastRing = -1, lastAct = "", lastBall = "", lastBallColor = "", lastTilt = "";
-var lastActColor = cssVar("--color-idle");   /* 曲线读数胶囊描边用，随活动色更新 */
-
-function setRing(mag){
-  var pct = Math.max(0, Math.min(1, mag/ABS_FULL));
-  var v = Math.round(pct*100);
-  if (v === lastRing) return;
-  lastRing = v;
-  $("ring").style.strokeDasharray = (pct*RING_ARC).toFixed(1) + " " + RING_C.toFixed(1);
-  $("abs").textContent = mag.toFixed(2) + " g";
-}
-
-/* ---------------- 曲线 ---------------- */
-var cv = $("cv"), ctx = cv.getContext("2d"), samples = [];
-function fitCanvas(){
-  var dpr = window.devicePixelRatio || 1;
-  cv.width = Math.max(1, Math.round(cv.clientWidth*dpr));
-  cv.height = Math.max(1, Math.round(cv.clientHeight*dpr));
-  drawChart();
-}
-function drawChart(){
-  var W = cv.width, H = cv.height, dpr = window.devicePixelRatio || 1;
-  ctx.clearRect(0,0,W,H);
-  if (W < 2 || H < 2) return;
-
-  var padL = 34*dpr, padR = 10*dpr, padT = 12*dpr, padB = 16*dpr;
-  var plotW = W - padL - padR, plotH = H - padT - padB;
-  var maxG = 2.4;
-  /* 颜色全部走令牌（见 cssVar）：两套主题下图表要跟着变 */
-  var cGrid = cssVar("--color-text-faint", .22), cFaint = cssVar("--color-text-faint"),
-      cMove = cssVar("--color-move"), cDim = cssVar("--color-text-muted");
-
-  function yOf(g){ return padT + plotH - Math.min(g, maxG)/maxG*plotH; }
-
-  /* 网格 + 刻度 */
-  ctx.strokeStyle = cGrid; ctx.lineWidth = 1*dpr;
-  ctx.fillStyle = cFaint; ctx.font = (10*dpr)+"px PlexMono,Consolas,monospace";
-  ctx.textAlign = "right"; ctx.textBaseline = "middle";
-  [0,0.5,1,1.5,2].forEach(function(g){
-    var y = yOf(g);
-    ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(W-padR, y); ctx.stroke();
-    ctx.fillText(g.toFixed(1), padL-6*dpr, y);
-  });
-
-  /* 失重阈值 + 1g 参考线 */
-  function hline(g, color, dash){
-    var y = yOf(g);
-    ctx.save(); ctx.setLineDash(dash.map(function(x){return x*dpr}));
-    ctx.strokeStyle = color; ctx.lineWidth = 1*dpr;
-    ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(W-padR, y); ctx.stroke();
-    ctx.restore();
-  }
-  hline(0.35, cssVar("--color-fall", .55), [4,4]);
-  hline(1.0,  cssVar("--color-text-faint", .40), [2,5]);
-
-  var n = samples.length;
-  if (n < 2){
-    ctx.fillStyle = cFaint; ctx.textAlign = "left";
-    ctx.fillText("等待开发板上报…", padL+6*dpr, padT+14*dpr);
-    return;
-  }
-
-  /* 面积 + 折线 */
-  var pts = samples.map(function(s, i){
-    var g = Math.sqrt(s[1]*s[1] + s[2]*s[2] + s[3]*s[3]);
-    return [padL + i/(n-1)*plotW, yOf(g), g];
-  });
-
-  var grad = ctx.createLinearGradient(0, padT, 0, padT+plotH);
-  grad.addColorStop(0, cssVar("--color-move", .34));
-  grad.addColorStop(1, cssVar("--color-move", .02));
-  ctx.beginPath(); ctx.moveTo(pts[0][0], padT+plotH);
-  pts.forEach(function(p){ ctx.lineTo(p[0], p[1]); });
-  ctx.lineTo(pts[n-1][0], padT+plotH); ctx.closePath();
-  ctx.fillStyle = grad; ctx.fill();
-
-  ctx.beginPath();
-  pts.forEach(function(p, i){ i ? ctx.lineTo(p[0],p[1]) : ctx.moveTo(p[0],p[1]); });
-  ctx.strokeStyle = cMove; ctx.lineWidth = 2*dpr;
-  ctx.lineJoin = "round"; ctx.stroke();
-
-  /* 末端点 */
-  var last = pts[n-1];
-  ctx.beginPath(); ctx.arc(last[0], last[1], 4*dpr, 0, 6.2832);
-  ctx.fillStyle = cMove; ctx.fill();
-  ctx.beginPath(); ctx.arc(last[0], last[1], 8*dpr, 0, 6.2832);
-  ctx.fillStyle = cssVar("--color-move", .20); ctx.fill();
-
-  /* 末端读数胶囊：半透明深色底 + 当前活动色描边，贴在末端点上方，不出右界 */
-  var label = last[2].toFixed(2) + " g";
-  ctx.font = (11*dpr)+"px PlexMono,Consolas,monospace";
-  var tw = ctx.measureText(label).width;
-  var lx = Math.max(padL + 4*dpr, Math.min(last[0] - tw/2, W - padR - tw - 12*dpr));
-  var ly = Math.max(padT, padT - 2*dpr);
-  ctx.beginPath();
-  if (ctx.roundRect) ctx.roundRect(lx - 6*dpr, ly, tw + 12*dpr, 16*dpr, 6*dpr);
-  else ctx.rect(lx - 6*dpr, ly, tw + 12*dpr, 16*dpr);
-  ctx.fillStyle = cssVar("--color-surface", .92);
-  ctx.fill();
-  ctx.lineWidth = 1*dpr;
-  ctx.strokeStyle = lastActColor.replace(")", ",.45)").replace("rgb", "rgba");
-  ctx.stroke();
-  ctx.fillStyle = cDim; ctx.textAlign = "left"; ctx.textBaseline = "middle";
-  ctx.fillText(label, lx, ly + 8*dpr);
-}
-addEventListener("resize", fitCanvas);
-
-/* ---------------- 姿态球与三轴条 ---------------- */
-/* 1g 对应的像素偏移。这个值**必须跟着球的大小走**：球半径 105px（max-width 210），
-   偏移 68px + 小球半径 10px = 78 < 105，小球永远压在球面之内；
-   比例沿用旧版的 65% 左右，所以"倾斜多少、球跑多远"的手感没变。 */
-var BUBBLE_MAX = 68;
-/* ---------------- 板子姿态 3D ----------------
- * 把板子做成一块小牌子，按加速度计实时转动 —— "板子现在什么姿态"一眼就懂，
- * 比数字和圆点直观得多（用户 2026-09-23 提的需求）。
- *
- * three.js 用仓库里 vendor 的那份（`/vendor/three.min.js`，服务端白名单放行），
- * **不引 CDN**：教室/局域网常常没有外网，引 CDN 必然白屏。
- *
- * 坐标约定与板端屏幕、姿态球**完全一致**：+x 右、+y 下、+z 出屏。 */
-var d3 = null;
-function init3d(){
-  if (typeof THREE === "undefined") return;
-  var cv3 = $("board3d");
-  if (!cv3) return;
-  var renderer;
-  try {
-    renderer = new THREE.WebGLRenderer({canvas: cv3, antialias: true, alpha: true});
-  } catch (e) {
-    return;                    /* 没有 WebGL 就不显示这张卡，别留个空白框 */
-  }
-  var W = Math.max(200, cv3.clientWidth || 320), H = 280;
-  renderer.setPixelRatio(Math.min(2, window.devicePixelRatio || 1));
-  renderer.setSize(W, H, false);
-
-  var scene = new THREE.Scene();
-  var camera = new THREE.PerspectiveCamera(38, W / H, 0.1, 100);
-  /* 相机仰角要**高**：原来是 (0, 2.4, 4.8) 只有 26.6°，
-   * 板子平放时几乎是"侧着一条线"，左右倾斜根本看不出来（用户反馈：
-   * "平放着向左右倾斜板子不会显示，立起来就会"）。抬到 ~53°，
-   * 平放时看到的是一个完整的方形面，倾斜一眼就能看出来。 */
-  camera.position.set(0, 4.6, 3.4);
-  camera.lookAt(0, 0, 0);
-
-  scene.add(new THREE.AmbientLight(0xffffff, 0.8));
-  var dl = new THREE.DirectionalLight(0xffffff, 1.05);
-  dl.position.set(3, 6, 5);
-  scene.add(dl);
-
-  /* 板子本体：按**屏幕系**建模，于是"把测到的重力方向转到世界正上方"
-     就等于"板子的真实姿态"（见 update3d）。 */
-  var g = new THREE.Group();
-  g.add(new THREE.Mesh(
-    new THREE.BoxGeometry(2.0, 2.0, 0.2),
-    new THREE.MeshStandardMaterial({color: 0x2b3444, roughness: 0.62, metalness: 0.18})));
-  /* 屏幕面（+z 那面）用活动色的绿，一眼分出正反面。
-   * ⚠️ 必须**露在板子表面之外**：板厚 0.2 → 表面在 z=±0.1，
-   * 所以这里要 > 0.1。之前是 0.085（板厚还是 0.16 时勉强露在外面），
-   * 我把板厚加到 0.2 之后它就被埋进板子里了 —— 屏幕面整块看不见。 */
-  var scr = new THREE.Mesh(new THREE.PlaneGeometry(1.62, 1.62),
-                           new THREE.MeshBasicMaterial({color: 0x1d9e75,
-                                                        side: THREE.DoubleSide}));
-  /* ⚠️ 屏幕面在 **-z** 侧。板子的坐标系是「+x 右、+y 下、**+z 朝屏幕里**」——
-   * 这样才是右手系（x×y = z：右×下 = 朝里）。我第一版把 +z 当成「朝屏幕外」，
-   * 于是整个模型是**镜像**的 —— 这才是立起来看到背面的真正根因。 */
-  scr.position.z = -0.106;
-  g.add(scr);
-  /* 顶边标记：做成**跨在板子顶边上、两面都露出来的一条棱**，
-   * 而不是贴在某一面上的薄片 —— 原来贴在 +z 面（z=0.09），从背面看被板子挡住。
-   * 现在 z 方向做到 ±0.14（板厚 ±0.1），正反面都看得到；
-   * +y 是"下"（屏幕系），所以顶边在 -y。
-   * 这样两种摆法都对：
-   *   平放（屏幕朝上）→ 顶边在**离你远的那条边**
-   *   立起来          → 顶边在**上面**
-   * （曾经为了"平放时在远边"改成 +y，结果立起来就跑到下面去了 —— 用 -y 才对。） */
-  var top = new THREE.Mesh(new THREE.BoxGeometry(0.7, 0.14, 0.28),
-                           new THREE.MeshBasicMaterial({color: 0xef9f27}));
-  top.position.set(0, -1.0, 0);
-  g.add(top);
-  scene.add(g);
-
-  /* 地面网格固定在世界里：板子转、网格不动，倾斜才有参照物 */
-  var grid = new THREE.GridHelper(9, 18, 0x3d4757, 0x252d3a);
-  grid.position.y = -2.0;
-  scene.add(grid);
-
-  var flat = makeFlatPose();
-  d3 = {renderer: renderer, scene: scene, camera: camera, group: g,
-        target: flat.clone(), cur: flat.clone()};
-  g.quaternion.copy(flat);
-  $("card3d").hidden = false;
-
-  /* 画面 60Hz 走、数据按「刷新」选择器的频率到：每帧朝目标姿态 slerp 一点点，
-     所以即使数据来得慢，画面也是连续转的（取数越快越跟手）。 */
-  (function loop(){
-    requestAnimationFrame(loop);
-    d3.cur.slerp(d3.target, 0.18);
-    d3.group.quaternion.copy(d3.cur);
-    d3.renderer.render(d3.scene, d3.camera);
-  })();
-
-  window.addEventListener("resize", function(){
-    var w = Math.max(200, cv3.clientWidth || 320);
-    renderer.setSize(w, H, false);
-    camera.aspect = w / H;
-    camera.updateProjectionMatrix();
-  });
-}
-
-/* 把板子转到「真实姿态」。
- *
- * 板子的坐标系（右手系）：**+x 右、+y 下、+z 朝屏幕里**（右×下 = 朝里 ✓）。
- * 上报的 x/y/z 就是**重力（下坡）方向**在这个坐标系里的分量 ——
- * 三个物理校准点（2026-09-24 实测）都吻合：
- *
- *     平放（屏幕朝上）  → (0.00,  0.02, +0.99)   下坡 = 朝屏幕里 = 朝下 ✓
- *     立起来（屏幕朝我）→ (0.00, +1.00,  0.00)   下坡 = 屏幕的「下」方向 ✓
- *     右边压低          → (+0.70, -0.03, +0.72)  下坡偏向右边 ✓
- *
- * 所以只要把**下坡方向对到世界的下方 (0,-1,0)**，板子姿态就对了 ——
- * 不需要任何镜像。（我前几版在这里又是翻 z 又是镜像 x/y，都是在补
- * 「模型镜像」这个更底层的错，两个错互相抵消了一部分，越补越乱。）
- *
- * ⚠️ 剩下的自由度：绕竖直轴转了多少，加速度计**测不出来**。
- * 板子立着时它能告诉你「下在哪」，却分不清屏幕朝你还是朝墙。
- * 用「最短弧」补这个自由度会挑到把板子翻过去的解 ——
- * 所以绕世界竖直轴扫一圈，取**离当前姿态最近**的解（靠连续性消歧，不猜）。
- * 初始姿态设成「平放、屏幕朝上、顶边朝远处」（板子开机通常就这么放）。
- */
-function makeFlatPose(){
-  /* 平放自然姿态：板子 +z（朝屏幕里）→ 世界下方；+y（屏幕的「下」）→ 朝观察者；
-     于是 -z（屏幕面）→ 世界上方，-y（顶边）→ 世界远处。
-     第三列必须是 (0,-1,0) —— 取 (0,1,0) 的话行列式 = -1，是镜像不是旋转。 */
-  var m = new THREE.Matrix4();
-  m.makeBasis(new THREE.Vector3(1, 0, 0),    /* 板子 +x → 世界 +x */
-              new THREE.Vector3(0, 0, 1),    /* 板子 +y → 世界 +z（朝观察者） */
-              new THREE.Vector3(0, -1, 0));  /* 板子 +z → 世界 -y（朝下） */
-  return new THREE.Quaternion().setFromRotationMatrix(m);
-}
-function update3d(x, y, z){
-  if (!d3) return;
-  var down = new THREE.Vector3(x, y, z);
-  if (down.lengthSq() < 1e-6) return;
-  down.normalize();
-  var base = new THREE.Quaternion().setFromUnitVectors(down, new THREE.Vector3(0, -1, 0));
-
-  /* 绕世界竖直轴扫一圈，挑唯一解。加速度计**测不出**绕竖直轴的朝向，
-   * 这一段是「约定」不是「测量」，所以两条约定要按板子的姿态**平滑加权**：
-   *
-   *   ① 屏幕面尽量朝观察者 —— 板子**立着**时才有意义（正面朝我是最自然的拿法）
-   *   ② 顶边尽量朝远处     —— 板子**平放**时才有意义（通常就是这么摆在桌上）
-   *
-   * ⚠️ 这里踩过一个坑：一开始给①设了 1e-3 的固定容差，以为"平放时①会退化"。
-   * 实际上平放时①不是**零**、而是**很小**（屏幕面朝上，其 z 分量只有零点几的
-   * 噪声量级）—— 于是①照样压过②，**旋转角由噪声决定**：
-   * 用户板子明明平放（0,-0.03,1.02），3D 却转了 30°。
-   * 现在按"有多平"加权：w=1 完全用②，w=0 完全用①，中间平滑过渡。 */
-  var flatness = Math.min(1, Math.abs(down.z));   /* 重力越沿屏幕法线 → 越平 */
-  var w = flatness;
-
-  var axis = new THREE.Vector3(0, 1, 0);
-  var q = new THREE.Quaternion();
-  var vFace = new THREE.Vector3(), vTop = new THREE.Vector3();
-  var best = null, bestScore = -9;
-  for (var i = 0; i < 72; i++) {
-    q.setFromAxisAngle(axis, i * Math.PI / 36).multiply(base);
-    /* 板子 -z 是屏幕面（+z 朝屏幕里），-y 是顶边 */
-    vFace.set(0, 0, -1).applyQuaternion(q);
-    vTop.set(0, -1, 0).applyQuaternion(q);
-    var score = (1 - w) * vFace.z + w * (-vTop.z);
-    if (score > bestScore + 1e-6) {
-      bestScore = score;
-      best = q.clone();
-    }
-  }
-  d3.target.copy(best || base);
-}
-
-function setBall(x, y, mag){
-  var bx = Math.max(-1, Math.min(1, x)) * BUBBLE_MAX;
-  var by = Math.max(-1, Math.min(1, y)) * BUBBLE_MAX;
-  var key = bx.toFixed(0)+","+by.toFixed(0);
-  var horiz = Math.sqrt(x*x + y*y);
-  /* 与板端同一套判据：mag<0.05 是还没有效读数（灰），<0.35 才是失重红 */
-  var color = (mag < 0.05) ? cssVar("--color-idle")
-            : (mag < 0.35) ? cssVar("--color-fall")
-            : (horiz < 0.15) ? cssVar("--color-still")
-            : (horiz < 0.7) ? cssVar("--color-shake") : cssVar("--color-fall");
-  if (key !== lastBall || color !== lastBallColor){
-    lastBall = key;
-    lastBallColor = color;
-    var d = $("ball");
-    d.style.transform = "translate(" + bx.toFixed(1) + "px," + by.toFixed(1) + "px)";
-    d.style.background = color;
-    d.style.boxShadow = "0 0 18px -2px " + color;
-  }
-}
-var lastDeg = null;
-function setTilt(z, mag){
-  var t, color;
-  if (mag < 0.05){ t = "无读数"; color = cssVar("--color-idle"); lastDeg = null; }
-  else if (mag < 0.35){ t = "失重"; color = cssVar("--color-fall"); lastDeg = null; }
-  else {
-    var c = Math.min(1, Math.abs(z)/mag);
-    var raw = Math.acos(c)*180/Math.PI;
-    /* 只对**角度**做低通：acos 在接近平放时对噪声极敏感（0.03g → 14°），
-       板端踩过同一个坑。姿态球不动它 —— 球要跟手。 */
-    lastDeg = (lastDeg === null) ? raw : (lastDeg + 0.4*(raw - lastDeg));
-    var deg = Math.round(lastDeg);
-    t = "倾角 " + deg + "°";
-    color = deg === 0 ? cssVar("--color-still") : (deg < 40 ? cssVar("--color-shake") : cssVar("--color-fall"));
-  }
-  if (t !== lastTilt){
-    lastTilt = t;
-    var el = $("tilt");
-    el.textContent = t;
-    el.style.color = color;
-  }
-}
-function setBar(i, v){
-  var el = $(["bx","by","bz"][i]), vl = $(["vx","vy","vz"][i]);
-  var pct = Math.min(Math.abs(v), 2)/2*50;      /* 对称：从中点往两边长 */
-  el.style.width = pct + "%";
-  el.style.left = (v >= 0 ? 50 : 50-pct) + "%";
-  var ac = [cssVar("--color-fall"), cssVar("--color-still"), cssVar("--color-move")][i];
-  el.style.background = ac;
-  vl.style.color = ac;                           /* 数值与 X/Y/Z 标签同色，与板端一致 */
-  vl.textContent = (v >= 0 ? "+" : "") + v.toFixed(2);
-}
-
-/* ---------------- 指令面板 ---------------- */
-var busy = false, devOnline = false, ledSteady = false, cmdNames = [], cmdsSeen = [];
-/* 多选下发：勾中的设备名集合（空 = 不指定，交给服务端用"最近上报的那台"，
-   单板场景与以前完全一样）。**只在"下发指令"时生效**，"查看"仍然是单选。 */
-var selDevices = {};
-/* 板端上报的方向档位（每台一份），用来显示"板子现在是哪一档" */
-var devOrient = {};
-var STNAME = { queued:"排队中", sent:"已下发", done:"已完成", failed:"失败", timeout:"超时" };
-
-function renderButtons(){
-  var host = $("cmdbts");
-  if (host.dataset.built === cmdNames.join(",")) { syncButtons(); return; }
-  host.dataset.built = cmdNames.join(",");
-  /* 分两组渲染：安全指令在左，**破坏性指令单独顶到最右**，中间用可伸缩间隔隔开。
-     原来它们按服务端给的顺序挨着排 —— 「格式化 SD 卡」紧邻「读取存储信息」，
-     误点一次就是整张卡的数据，而这两个按钮长得一模一样。 */
-  var safe = [], risky = [];
-  cmdNames.forEach(function(n){
-    var ui = CMD_UI[n] || {};
-    if (ui.hidden) return;                     /* hidden：只走程序内部触发，不出按钮 */
-    var html = '<button data-cmd="' + n + '"' + (ui.primary ? ' class="primary"' : '') + '>'
-             + (ui.label || n) + '</button>';
-    (ui.danger ? risky : safe).push(html);
-  });
-  host.innerHTML = (safe.length || risky.length)
-    ? safe.join("") + (risky.length ? '<span class="cmd-gap"></span>' + risky.join("") : "")
-    : '<span class="empty">服务端没有开放任何远程指令</span>';
-  Array.prototype.forEach.call(host.querySelectorAll("button"), function(b){
-    b.onclick = function(){ sendCmd(b.dataset.cmd, b); };
-  });
-  syncButtons();
-}
-function syncButtons(){
-  var host = $("cmdbts");
-  Array.prototype.forEach.call(host.querySelectorAll("button"), function(b){
-    var n = b.dataset.cmd, ui = CMD_UI[n] || {};
-    b.disabled = busy || !devOnline;
-    if (ui.toggle && n === "led_set"){
-      b.textContent = ledSteady ? "LED 熄灭" : "LED 常亮";
-    } else if (n === "capture_once" && busy){
-      b.textContent = "等待板子回传…";
-    } else {
-      b.textContent = ui.label || n;
-    }
-  });
-}
-/* 破坏性指令（目前只有 sd_format）先弹确认 —— 一键清掉整张卡，点错了没有撤销。
-   confirmDialog 是异步的，所以真正的下发逻辑挪到 doSendCmd 里。 */
-function sendCmd(name, btn, overrideParams){
-  var ui0 = CMD_UI[name] || {};
-  if (ui0.danger){
-    confirmDialog("格式化 SD 卡",
-                  "板子上的 SD 卡会被整张清空，卡里原有内容全部丢失，无法恢复。",
-                  "格式化").then(function(ok){
-      if (ok) doSendCmd(name, btn, overrideParams);
-    });
-    return;
-  }
-  doSendCmd(name, btn, overrideParams);
-}
-function doSendCmd(name, btn, overrideParams){
-  var ui = CMD_UI[name] || {};
-  var params = overrideParams !== undefined ? overrideParams
-             : (ui.toggle && name === "led_set" ? {on: !ledSteady} : (ui.params || {}));
-  if (btn) btn.disabled = true;
-  $("cmdhint").textContent = "";
-  var body = {name:name, params:params};
-  var picked = Object.keys(selDevices);
-  if (picked.length > 1){
-    /* 多选 → 一次请求让服务端给每台各建一条命令（比前端循环 N 次更省事，
-       而且服务端会去重、保持顺序） */
-    body.devices = picked;
-  } else if (picked.length === 1){
-    body.device = picked[0];
-  } else if (selDevice){
-    /* 没勾任何一台 → 就发给"当前查看的那台"（单板场景与以前完全一样） */
-    body.device = selDevice;
-  }
-  fetch("/api/command", {
-    method:"POST", headers:{"Content-Type":"application/json"},
-    body: JSON.stringify(body)
-  }).then(function(r){ return r.json(); }).then(function(d){
-    if (!d.ok){ $("cmdhint").textContent = "下发失败：" + (d.error || "未知错误"); return; }
-    if (d.batch){
-      var off = (d.results || []).filter(function(x){ return !x.device_online; }).length;
-      $("cmdhint").textContent = "已下发给 " + d.count + " 台"
-        + (off ? ("（其中 " + off + " 台当前不在线，等它们回来才会执行）") : "");
-    } else {
-      $("cmdhint").textContent = "已下发 " + d.id
-        + (d.device ? " → " + d.device : "")
-        + (d.device_online ? "" : "（注意：这块板子当前不在线）");
-    }
-    pull();
-  }).catch(function(e){
-    $("cmdhint").textContent = "下发失败：" + e;
-  }).then(function(){ syncButtons(); });
-}
-
-/* ---------------- 摄像头 ----------------
- * 板子是 HTTP 客户端、没有自己的服务端，所以画面是**板子 POST 上来、网页从这里取**。
- * 网页只拿最近一帧（/api/frame），拍照则由板子写 SD 卡、服务器另存一份给这里展示。 */
-var camDev = "", camOn = false, camTimer = null, camFails = 0;
-
-/* 卡片现在是**常驻**的：早先版本让它 hidden、等收到第一帧才显示，
- * 但"开启实时画面"按钮就在卡片里 —— 收不到帧就点不到按钮，点不到按钮就
- * 收不到帧，**死锁**（用户反馈"我好像没看到实时画面"就是这个）。
- * 这里保留函数只为了别处调用不报错。 */
-function camShow(on){
-  var c = $("cardcam");
-  if (c) c.hidden = false;
-}
-function camFrame(){
-  var im = $("camimg");
-  if (!im) return;
-  var dev = selDevice || "";      /* 空着就交给服务端回退到"最近上报的那台" */
-  camDev = dev;
-  im.src = "/api/frame?device=" + encodeURIComponent(dev) + "&t=" + Date.now();
-  im.onload = function(){
-    camFails = 0;
-    camShow(true);
-    im.hidden = false;          /* 收到第一帧才让它出现，之前别露出"图片裂了"的图标 */
-    var ns = $("camnosig");
-    if (ns) ns.style.display = "none";
-    var st = $("camstat");
-    if (st) st.textContent = "画面 " + im.naturalWidth + "×" + im.naturalHeight +
-                             "（约 2 帧/秒）";
-  };
-  im.onerror = function(){
-    camFails++;
-    im.hidden = true;
-    var ns = $("camnosig");
-    if (ns) ns.style.display = "";
-    /* 连续取不到就别一直重试了，提示一次即可 */
-    if (camFails === 3) {
-      var st = $("camstat");
-      if (st) st.textContent = "还没有画面 —— 摄像头自检没过时不会有帧（先看板子串口）";
-    }
-  };
-}
-/* 当前选的帧率（1..10，和板端 CAM_STREAM_FPS_MAX 对齐）。 */
-function camFps(){
-  var el = $("camfps");
-  var n = el ? parseInt(el.value, 10) : 2;
-  return (isFinite(n) && n >= 1 && n <= 10) ? n : 2;
-}
-function camSetLive(on){
-  camOn = on;
-  if (camTimer) { clearInterval(camTimer); camTimer = null; }
-  var btn = $("camlive");
-  var fps = camFps();
-  if (on) {
-    camFrame();
-    /* 取帧间隔跟着**板端的推帧间隔**走 —— 板子只推 2 帧/秒时页面每 200ms 取一次
-     * 纯属白问（三次里两次拿到同一帧，白占连接）。下限 100ms 兜住离谱输入。 */
-    camTimer = setInterval(camFrame, Math.max(100, Math.round(1000 / fps)));
-  }
-  if (btn) btn.textContent = on ? "关闭实时画面" : "开启实时画面";
-  /* ⚠️ **必须把命令下发给板子**，光起本地定时器没用。
-   *
-   * 板子是 HTTP 客户端、只会"推"：它不推，服务端 FRAMES 里就没有帧，
-   * 页面每 200ms 轮询到的永远是 404，表现成"实时画面点了没反应、只有拍照才有图"
-   * —— 2026-09-28 用户反馈的正是这个。原来的实现只切了本地状态与定时器，
-   * 注释里写着"由这个按钮触发 cam_stream"，但**那一句 sendCmd 从来没写**。
-   * （当时从服务端看，点过按钮却收不到任何 cam_stream 命令，就是这个原因。）
-   *
-   * fps 一起下发：省流还是丝滑是**板子**的事（真正决定占多少 WiFi 带宽的是它），
-   * 页面只负责按同样的节奏取。
-   * （画质已撤掉 —— 板端写 JPEG 质量控制项会让摄像头一帧都不出。） */
-  sendCmd("cam_stream", null, {on: on, fps: fps});
-}
-function shotRow(dev, name, bytes, local){
-  return '<div class="shot"><img src="' + (local ? local : "/api/shots/" +
-      encodeURIComponent(dev) + "/" + encodeURIComponent(name)) + '" alt="">' +
-    '<span class="nm">' + esc(name) + '<br><span class="hint">' +
-    (bytes ? fmtBytes(bytes) : "") + (local ? " · 本机存档" : " · 板子/服务器") + '</span></span>' +
-    '<button class="sm" data-shot="' + esc(name) + '" data-local="' + (local ? "1" : "") + '">删除</button></div>';
-}
-function renderShots(){
-  var host = $("shotlist");
-  if (!host) return;
-  var dev = selDevice || "";      /* 空着就交给服务端回退到"最近上报的那台" */
-  var who = $("shotwho");
-  if (who) who.textContent = dev || "—";
-  var server = [];
-  var finish = function(){
-    /* 服务器上的 + 本机 IndexedDB 里的，合起来展示（本机在前，刷新页面也不丢） */
-    idbList(function(local){
-      var html = local.map(function(x){ return shotRow(dev, x.name, x.bytes, x.url); }).join("") +
-                 server.map(function(x){ return shotRow(x.device, x.name, x.bytes, null); }).join("");
-      host.innerHTML = html || '<div class="empty">还没有照片。点上面的「拍照」按钮。</div>';
-      Array.prototype.forEach.call(host.querySelectorAll("[data-shot]"), function(btn){
-        btn.onclick = function(){
-          var nm = btn.getAttribute("data-shot");
-          confirmDialog("删除照片", "将永久删除 " + nm + "，无法恢复。", "删除").then(function(ok){
-            if (!ok) return;
-            if (btn.getAttribute("data-local")) {
-              idbDel(nm, renderShots);
-            } else {
-              fetch("/api/shots/delete", {method: "POST",
-                headers: {"Content-Type": "application/json"},
-                body: JSON.stringify({device: dev, name: nm})}).then(renderShots);
-            }
-          });
-        };
-      });
-    });
-  };
-  fetch("/api/shots?device=" + encodeURIComponent(dev)).then(function(r){ return r.json(); })
-    .then(function(d){ server = (d && d.shots) || []; finish(); })
-    .catch(function(){ finish(); });
-}
-
-/* ---- 本机存档：IndexedDB（用户要求"存浏览器里、保持持久性"）----
- * 用 IndexedDB 而不是 localStorage：照片是二进制，localStorage 只能存字符串且只有 5MB。 */
-var IDB_NAME = "rw1-photos", IDB_STORE = "shots";
-function idbOpen(cb){
-  var req = indexedDB.open(IDB_NAME, 1);
-  req.onupgradeneeded = function(){
-    var db = req.result;
-    if (!db.objectStoreNames.contains(IDB_STORE)) {
-      db.createObjectStore(IDB_STORE, {keyPath: "name"});
-    }
-  };
-  req.onsuccess = function(){ cb(req.result); };
-  req.onerror = function(){ cb(null); };
-}
-function idbPut(name, blob, cb){
-  idbOpen(function(db){
-    if (!db) { if (cb) cb(); return; }
-    var tx = db.transaction(IDB_STORE, "readwrite");
-    tx.objectStore(IDB_STORE).put({name: name, bytes: blob.size, blob: blob,
-                                   t: Date.now()});
-    tx.oncomplete = function(){ db.close(); if (cb) cb(); };
-  });
-}
-function idbDel(name, cb){
-  idbOpen(function(db){
-    if (!db) { if (cb) cb(); return; }
-    var tx = db.transaction(IDB_STORE, "readwrite");
-    tx.objectStore(IDB_STORE).delete(name);
-    tx.oncomplete = function(){ db.close(); if (cb) cb(); };
-  });
-}
-function idbList(cb){
-  idbOpen(function(db){
-    if (!db) { cb([]); return; }
-    var out = [];
-    var tx = db.transaction(IDB_STORE, "readonly");
-    var req = tx.objectStore(IDB_STORE).getAll();
-    req.onsuccess = function(){
-      db.close();
-      (req.result || []).sort(function(a, b){ return b.t - a.t; }).forEach(function(x){
-        out.push({name: x.name, bytes: x.bytes, url: URL.createObjectURL(x.blob)});
-      });
-      cb(out);
-    };
-    req.onerror = function(){ db.close(); cb([]); };
-  });
-}
-/* 拍照：让板子写 SD 卡；同时把这一帧存进本机 IndexedDB 做持久备份 */
-function camShot(){
-  var dev = selDevice || "";      /* 空着就交给服务端回退到"最近上报的那台" */
-  sendCmd("cam_capture");
-  fetch("/api/frame?device=" + encodeURIComponent(dev) + "&t=" + Date.now())
-    .then(function(r){ if (!r.ok) throw new Error("no frame"); return r.blob(); })
-    .then(function(bl){
-      var nm = "local-" + new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19) + ".jpg";
-      idbPut(nm, bl, function(){ renderShots(); });
-    })
-    .catch(function(){ renderShots(); });
-}
-
-/* ---------------- 存储管理 ----------------
- * 数据来自最近一条 sd_ls 命令回传的 `note` 字段，格式：
- *     SPACE,<total>,<free>;NAME|<size>;NAME|<size>;...
- * 用 `|` `;` 分隔是安全的 —— 8.3 文件名里不可能出现它们（板端也是这么拼的）。 */
-function fmtBytes(n){
-  if (!isFinite(n) || n < 0) return "?";
-  if (n >= 1073741824) return (n / 1073741824).toFixed(2) + " GB";
-  if (n >= 1048576) return (n / 1048576).toFixed(1) + " MB";
-  if (n >= 1024) return (n / 1024).toFixed(1) + " KB";
-  return n + " B";
-}
-function parseSdNote(note){
-  var out = { total:null, free:null, files:[], more:false };
-  if (!note) return out;
-  note.split(";").forEach(function(part){
-    if (!part) return;
-    if (part.indexOf("SPACE,") === 0){
-      var p = part.split(",");
-      out.total = parseInt(p[1], 10);
-      out.free  = parseInt(p[2], 10);
-    } else if (part === "..."){
-      out.more = true;
-    } else {
-      var i = part.lastIndexOf("|");
-      if (i > 0) out.files.push({ name: part.slice(0, i), size: parseInt(part.slice(i + 1), 10) });
-    }
-  });
-  return out;
-}
-/* 只在内容真的变了才重写 DOM。
-   renderCmds / renderSd 都跟着 10Hz 轮询跑，而内容绝大多数时候没变 ——
-   无脑 `innerHTML =` 等于每秒把同一段 HTML 重写十遍：白干活，还会打断
-   键盘焦点、文本选中、以及正在跑的过渡动画（点存储圆环时那个高亮闪烁就中招）。
-   用元素上的一个私有属性记"上次写进去的 HTML"，比再养一堆模块级变量干净。 */
-function setHTML(el, html){
-  if (!el || el.__html === html) return;
-  el.__html = html;
-  el.innerHTML = html;
-}
-
-function renderSd(){
-  var host = $("sdring"), list = $("sdfiles");   /* 容器 id 是 sdring（圆环） */
-  if (!host || !list) return;
-  /* 取最近一条**成功**的 sd_ls 结果 */
-  var last = null;
-  (cmdsSeen || []).forEach(function(c){
-    if (c.name === "sd_ls" && c.state === "done" && c.result && c.result.note) last = c;
-  });
-  if (!last){
-    setHTML(host, '<div class="hint">还没读过 —— 点上面的「读取存储信息」' +
-      '（板子离线时命令会排队，等它回来再执行）</div>');
-    setHTML(list, "");
-    return;
-  }
-  var d = parseSdNote(last.result.note);
-  if (d.total === null){
-    setHTML(host, '<div class="hint">板端没返回容量信息</div>');
-  } else {
-    var used = Math.max(0, d.total - d.free);
-    var pct = d.total ? (used / d.total * 100) : 0;
-    var bar = pct > 90 ? cssVar("--color-fall") : (pct > 75 ? cssVar("--color-shake") : cssVar("--color-still"));
-    /* 圆环：中间写百分比，比一条横条直观；**点它 = 进入文件管理** */
-    var R = 44, CIRC = 2 * Math.PI * R;
-    var off = (CIRC * (1 - Math.min(100, pct) / 100)).toFixed(1);
-    setHTML(host,
-      '<div class="ring" id="sdringbtn" role="button" tabindex="0" title="点击进入文件管理">' +
-        '<svg width="104" height="104" viewBox="0 0 104 104">' +
-          '<circle cx="52" cy="52" r="' + R + '" fill="none" stroke="' + cssVar("--color-surface-3") + '" stroke-width="10"/>' +
-          '<circle cx="52" cy="52" r="' + R + '" fill="none" stroke="' + bar + '" stroke-width="10" ' +
-            'stroke-linecap="round" stroke-dasharray="' + CIRC.toFixed(1) + '" ' +
-            'stroke-dashoffset="' + off + '"/>' +
-        '</svg>' +
-        '<div class="ringtxt"><b style="color:' + bar + '">' + pct.toFixed(0) + '%</b>' +
-        '<span>已用</span></div>' +
-      '</div>' +
-      '<div class="ringmeta">' +
-        '<div><span class="k">已用</span> ' + fmtBytes(used) + '</div>' +
-        '<div><span class="k">总共</span> ' + fmtBytes(d.total) + '</div>' +
-        '<div><span class="k">剩余</span> ' + fmtBytes(d.free) + '</div>' +
-        '<div class="hint" style="margin-top:4px">点圆环跳到下面的文件列表 ↓</div>' +
-      '</div>');
-    var rb = $("sdringbtn");
-    if (rb) {
-      var jump = function(){
-        var fl = $("sdfiles");
-        if (fl) {
-          fl.scrollIntoView({behavior: "smooth", block: "center"});
-          fl.style.transition = "box-shadow .3s";
-          fl.style.boxShadow = "0 0 0 2px " + bar;
-          setTimeout(function(){ fl.style.boxShadow = "none"; }, 1200);
-        }
-      };
-      rb.onclick = jump;
-      /* 圆环也是"可点的 div"，同样要补键盘可达性 */
-      rb.tabIndex = 0;
-      rb.setAttribute("role", "button");
-      rb.onkeydown = function(ev){
-        if (ev.key === "Enter" || ev.key === " " || ev.key === "Spacebar"){
-          ev.preventDefault();
-          jump();
-        }
-      };
-    }
-  }
-  if (!d.files.length){
-    setHTML(list, '<div class="empty">卡上没有文件。</div>');
-    return;
-  }
-  setHTML(list, d.files.map(function(f){
-    return '<div class="item"><span class="name">' + esc(f.name) + '</span>' +
-      '<span class="meta">' + fmtBytes(f.size) + '</span>' +
-      '<button class="sm" data-rm="' + esc(f.name) + '" style="margin-left:auto">删除</button></div>';
-  }).join("") + (d.more ? '<div class="hint">（文件较多，只列了前 12 个）</div>' : ""));
-  Array.prototype.forEach.call(list.querySelectorAll("[data-rm]"), function(b){
-    b.onclick = function(){
-      var fn = b.getAttribute("data-rm");
-      confirmDialog("删除板子上的文件", "将永久删除 SD 卡里的 " + fn + "，无法恢复。", "删除")
-        .then(function(ok){ if (ok) sendCmd("sd_rm", null, {name: fn}); });
-    };
-  });
-}
-
-/* ---- 方向档位 oN：显示 + 点选修改 ----
- * 板端长按 BOOT 也能换档，但那是"盲按 N 次"；网页上直接选第几档、还能看到
- * 板子当前在哪一档，标定方向就不用再靠猜了（2026-09-23 用户真机标定时踩过）。 */
-function syncOrient(){
-  var sel = $("orientsel");
-  if (sel && !sel.dataset.built){
-    var opts = "";
-    for (var i = 0; i < 16; i++) opts += '<option value="' + i + '">o' + i + '</option>';
-    sel.innerHTML = opts;
-    sel.dataset.built = "1";
-  }
-  var now = $("orientnow");
-  if (!now) return;
-  var who = Object.keys(selDevices);
-  var ids = who.length ? who : (selDevice ? [selDevice] : Object.keys(devOrient));
-  var parts = ids.filter(function(id){ return devOrient[id] !== undefined; })
-                 .map(function(id){ return esc(id) + " = o" + devOrient[id]; });
-  now.textContent = parts.length ? ("当前 " + parts.join(" / "))
-                                 : "（还没收到板端上报的档位）";
-}
-
-function renderCmds(cmds){
-  cmdsSeen = cmds || [];
-  var el = $("cmds");
-  if (!cmds || !cmds.length){
-    setHTML(el, '<div class="empty">还没有下发过指令。</div>');
-    return;
-  }
-  setHTML(el, cmds.slice(0,8).map(function(c){
-    var r = c.result || {}, extra = "";
-    if (c.state === "done" && r.x !== undefined){
-      extra = '<span class="meta">x=' + (+r.x).toFixed(3) + ' y=' + (+r.y).toFixed(3)
-            + ' z=' + (+r.z).toFixed(3) + ' · ' + (r.n||0) + ' 样本 · '
-            + Math.round(r.ms||0) + ' ms · σ=' + (+(r.std||0)).toFixed(4) + ' g</span>';
-    } else if (c.state === "failed"){
-      extra = '<span class="meta">' + esc(r.err || "") + '</span>';
-    }
-    var lat = (c.sent && c.done)
-      ? '<span class="meta">往返 ' + Math.round((c.done-c.sent)*1000) + ' ms</span>' : "";
-    var ps = (c.params && Object.keys(c.params).length)
-      ? '<span class="meta">' + esc(JSON.stringify(c.params)) + '</span>' : "";
-    /* 第 4 周：标出这条指令是不是"说话触发的" —— 网页上点的和板子前说的
-       混在同一个列表里，不标就分不清"刚才那句『拍张照』到底执行了没有"。 */
-    var src = (c.source === "nl") ? '<span class="meta">语音</span>' : "";
-    return '<div class="item"><span class="st st-' + esc(c.state) + '">' + esc(STNAME[c.state]||c.state) + '</span>'
-         + '<span class="name">' + esc(c.name) + '</span>' + ps + src
-         + '<span class="meta">' + esc(c.id) + '</span>' + lat + extra + '</div>';
-  }).join(""));
-
-  busy = cmds.some(function(c){ return c.state === "queued" || c.state === "sent"; });
-  renderSd();          /* 存储面板跟着最近一条 sd_ls 的结果走 */
-  var lastSet = cmds.filter(function(c){ return c.name === "led_set" && c.state === "done"; })[0];
-  if (lastSet && lastSet.params) ledSteady = !!lastSet.params.on;
-  syncButtons();
-}
-
-/* ---------------- 事件流 ---------------- */
-var evHTML = "";
-function renderEvents(evts){
-  if (!evts || !evts.length) return;
-  var h = evts.slice(0,40).map(function(ev){
-    var k = "k-" + (ev.kind || "info");
-    var time = new Date(ev.ts*1000).toLocaleTimeString("zh-CN", {hour12:false});
-    return '<div class="item"><span class="k ' + k + '"></span><span class="t">' + time + '</span>'
-         + '<span>' + esc(ev.text) + '</span></div>';
-  }).join("");
-  if (h !== evHTML){
-    evHTML = h;
-    $("feed").innerHTML = h;
-    $("evcount").textContent = "最近 " + evts.length + " 条";
-  }
-}
-
-/* ---------------- 设备列表（多板） ---------------- */
-/* selDevice = null 表示"自动跟随最近上报的那台"（单板场景就是这样，永远不用点）。
-   用户点过某台之后就固定看它，直到那台消失。 */
-var selDevice = null, devHTML = "";
-
-function devQuery(){
-  return selDevice ? "?device=" + encodeURIComponent(selDevice) : "";
-}
-
-function renderDevices(list, current){
-  var card = $("devcard");
-  /* 这一帧没带设备列表就**什么都别做**，尤其别动可见性。
-     曾经因为 `/api/latest` 不带 devices，这里被当成"0 台"处理 →
-     多板场景下这块区域以取数频率（100ms）反复藏/显，而且大部分时间不可见。
-     现在服务端两个通道都带 devices 了，这条只是**防御性兜底**：
-     以后再加新通道、忘了带 devices 时，页面不会再闪。 */
-  if (!Array.isArray(list)) return;
-  /* 只有一台板时不显示这块 —— 单板课堂不该凭空多出一张卡片 */
-  if (list.length <= 1){ card.hidden = true; devHTML = ""; return; }
-  card.hidden = false;
-
-  var online = 0;
-  var h = list.map(function(d){
-    if (d.online) online++;
-    var color = d.online ? cssVar("--color-still") : cssVar("--color-fall");
-    var title = d.activity || "";
-    /* 记住每台的档位，供"方向档位"控件显示 */
-    if (d.orient !== null && d.orient !== undefined) devOrient[d.id] = d.orient;
-    var oTxt = (d.orient === null || d.orient === undefined) ? "" : (" · o" + d.orient);
-    var checked = selDevices[d.id] ? " checked" : "";
-    return '<div class="dev' + (d.id === current ? " sel" : "") + '" data-dev="' + esc(d.id) + '">'
-      + '<input type="checkbox" class="devchk" data-chk="' + esc(d.id) + '"' + checked + '>'
-      + '<span class="dot' + (d.online ? "" : " off") + '" style="background:' + color + '"></span>'
-      + '<span class="did">' + esc(d.id) + '</span>'
-      + '<span class="meta">' + (d.online ? "在线" : "离线") + ' · ' + ago(d.age)
-      + (d.source && d.source !== "-" ? " · " + esc(d.source) : "") + esc(oTxt) + '</span>'
-      + '<span class="meta">' + esc(title) + '</span>'
-      + '</div>';
-  }).join("");
-
-  $("devcount").textContent = list.length + " 台 · 在线 " + online;
-  if (h === devHTML) return;
-  devHTML = h;
-  var host = $("devs");
-  host.innerHTML = h;
-  Array.prototype.forEach.call(host.querySelectorAll(".dev"), function(el){
-    el.onclick = function(ev){
-      /* 点复选框是"勾选下发目标"，不该顺带切换查看的设备 */
-      if (ev.target && ev.target.classList && ev.target.classList.contains("devchk")) return;
-      selectDevice(el.getAttribute("data-dev"));
-    };
-    /* 键盘可达：这一行是 div，不给 tabindex 的话键盘用户根本选不了设备。
-       Enter / 空格 都要能用（div 不像 <button> 会自己处理空格）。 */
-    el.tabIndex = 0;
-    el.setAttribute("role", "button");
-    el.onkeydown = function(ev){
-      if (ev.key === "Enter" || ev.key === " " || ev.key === "Spacebar"){
-        ev.preventDefault();
-        selectDevice(el.getAttribute("data-dev"));
-      }
-    };
-  });
-  Array.prototype.forEach.call(host.querySelectorAll(".devchk"), function(cb){
-    cb.onclick = function(ev){
-      ev.stopPropagation();
-      var id = cb.getAttribute("data-chk");
-      if (cb.checked) selDevices[id] = 1; else delete selDevices[id];
-      syncDevAll();
-    };
-  });
-  syncDevAll();
-  /* 档位显示也要在这里刷：它读的是 `devOrient`，而那个表是**本函数**填的。
-   * 只在初始化时调一次 syncOrient() 的话，设备列表后到就永远显示"还没收到档位"
-   * （2026-09-23 浏览器 E2E 抓到的时序 bug）。 */
-  syncOrient();
-}
-
-/* 「全选」按钮：全都勾上 / 全都取消。文案随状态变，避免用户看不出当前是哪种。 */
-function syncDevAll(){
-  var n = Object.keys(selDevices).length;
-  var btn = $("devall");
-  if (btn) btn.textContent = n ? ("取消全选（已选 " + n + "）") : "全选";
-  var host = $("devs");
-  if (host) Array.prototype.forEach.call(host.querySelectorAll(".devchk"), function(cb){
-    var id = cb.getAttribute("data-chk");
-    cb.checked = !!selDevices[id];
-  });
-}
-function toggleDevAll(){
-  var boxes = $("devs") ? $("devs").querySelectorAll(".devchk") : [];
-  if (Object.keys(selDevices).length){
-    selDevices = {};
-  } else {
-    Array.prototype.forEach.call(boxes, function(cb){ selDevices[cb.getAttribute("data-chk")] = 1; });
-  }
-  syncDevAll();
-}
-
-function selectDevice(id){
-  if (!id || id === selDevice) return;
-  selDevice = id;
-  devHTML = "";        /* 清掉缓存，让选中态立刻重画 */
-  pull();              /* 先拉一次快照，不必等下一帧 SSE */
-  stream();            /* SSE 是按设备过滤的，换设备要重连 */
-}
-
-/* ---------------- 主刷新 ---------------- */
-var aiReply = "";
-/* ---------------- 计时（第 6 周） ----------------
-   课程第 6 周要求语音任务能「澄清、停止、迟到结果隔离、**计时**」。
-   板子屏幕上只有回复正文，看不到"等了多久"——识别慢还是模型慢，用户没法判断，
-   也没法解释"为什么板子半天没反应"。所以把三段耗时摆到网页上：
-   识别多久、生成多久、整个语音任务端到端多久。 */
-function fmtMs(ms){
-  ms = Number(ms) || 0;
-  if (ms <= 0) return "";
-  /* 900 ms 比 0.9 s 直观，3.4 s 比 3400 ms 好读 —— 分界点放在 1 秒 */
-  if (ms < 1000) return Math.round(ms) + " ms";
-  return (ms / 1000).toFixed(1) + " s";
-}
-
-function renderTiming(s){
-  var el = $("timing");
-  if (!el) return;
-  var parts = [];
-  var v = fmtMs(s.voice_ms), a = fmtMs(s.ai_ms), t = fmtMs(s.total_ms);
-  if (v) parts.push("识别 " + v);
-  if (a) parts.push("生成 " + a);
-  if (t) parts.push("共 " + t);
-  if (!parts.length){
-    /* 没有数据（比如只按了 BOOT 键、走的是规则AI）就把整块收起来，不占位 */
-    el.hidden = true;
-    el.textContent = "";
-    return;
-  }
-  el.textContent = parts.join(" · ");
-  el.hidden = false;
-}
-
-function render(s){
-  /* 服务端实际给的是哪台：若和我们选的不一致（选中的被淘汰/改名了），跟着它走，
-     免得页面一直停在一个已经不存在的设备上。 */
-  if (selDevice && s.device && s.device !== selDevice){
-    selDevice = s.device;
-    devHTML = "";
-  }
-  renderDevices(s.devices, s.device || selDevice);
-
-  devOnline = !!s.device_online;
-  var dev = $("dev");
-  /* 只在"在线状态真的翻转"时才重写这个胶囊。
-     无脑 10Hz 重写会**每秒把里面的 <i> 重建十遍** ——
-     `.pill.off i` 的呼吸动画（breathe 1.7s）于是每次都被从头开始，
-     看起来完全不像在呼吸，像卡住了。 */
-  if (dev.__on !== devOnline){
-    dev.__on = devOnline;
-    dev.className = "pill " + (devOnline ? "on" : "off");
-    dev.innerHTML = "<i></i>" + (devOnline ? "在线" : "离线");
-  }
-  if (selDevice) dev.title = selDevice;
-  /* **必须在这里也刷一次按钮**：`b.disabled = busy || !devOnline` 只在
-   * syncButtons() 里算，而 syncButtons() 原来只在"按钮构建时"和 renderCmds()
-   * 末尾被调用 —— 页面加载时设备还没上报，按钮被设成 disabled 之后就**再也没刷新过**，
-   * 于是设备上线后按钮一直是灰的（2026-09-23 浏览器 E2E 抓到的真 bug）。 */
-  syncButtons();
-
-  $("src").textContent = (s.source && s.source !== "-") ? s.source : "—";
-  $("hzp").textContent = s.sample_hz ? (s.sample_hz + " Hz") : "— Hz";
-  $("postsp").textContent = "↑" + (s.posts_ok !== undefined ? s.posts_ok : 0) + " 帧";
-  $("steps").textContent = s.step_count;
-  $("shakes").textContent = s.shake_count;
-  $("mode").textContent = (s.ai_mode || "规则AI") + (s.ai_pending ? " · 生成中…" : "");
-
-  var a = classify(s.activity || "");
-  if (a.word !== lastAct){
-    lastAct = a.word;
-    var e = $("act");
-    e.textContent = a.word;
-    e.style.color = a.color;
-    $("ring").style.stroke = a.color;
-    /* hero 舞台的底色与活动色联动（CSS 变量），活动词淡入一次 */
-    var stage = document.querySelector(".stage");
-    if (stage) {
-      stage.style.setProperty("--act-rgb", a.rgb);
-      stage.style.setProperty("--act-color", a.color);
-    }
-    lastActColor = "rgb(" + a.rgb + ")";
-    e.classList.remove("pop");
-    void e.offsetWidth;
-    e.classList.add("pop");
-  }
-
-  /* 有真回复才高亮并加 has；空回复回到引导语（dim），与板端一致 */
-  if (s.ai_reply && s.ai_reply !== aiReply){
-    aiReply = s.ai_reply;
-    $("reply").textContent = aiReply;
-    speakReply(aiReply);            /* 第 5 周：让它把回答"说"出来 */
-  } else if (!s.ai_reply && aiReply !== ""){
-    aiReply = "";
-    $("reply").textContent = "还没有提问。";
-  }
-  var rbox = $("replybox");
-  rbox.className = "reply" + (s.ai_pending ? " pending" : "") + (s.ai_reply ? " has" : "");
-
-  /* 语音链路的状态提示（第 4 周）。服务端只知道「识别中」这一步；
-     「录音 / 上传」发生在板子本地，网页看不到 —— 那两态由板子屏幕显示。 */
-  var vs = s.voice_state || "idle";
-  var vh = $("voicehint");
-  if (vs === "transcribing"){
-    vh.textContent = "正在识别语音…";
-  } else if (vs === "thinking"){
-    vh.textContent = "识别到「" + (s.voice_text || "") + "」，正在想…";
-  } else if (s.voice_err){
-    vh.textContent = s.voice_err;
-  } else if (s.voice_text){
-    vh.textContent = "识别到「" + s.voice_text + "」";
-  } else {
-    vh.textContent = "回复同时显示在板子屏幕上";
-  }
-  /* 「停止」只在真的有事可停时出现 —— 常驻一个灰按钮只是噪音 */
-  $("aicancel").hidden = !s.ai_pending;
-  renderTiming(s);                       /* 第 6 周：识别 / 生成 / 端到端耗时 */
-
-  if (s.latest){
-    var x = s.latest[1], y = s.latest[2], z = s.latest[3];
-    var mag = Math.sqrt(x*x + y*y + z*z);
-    setRing(mag); setBall(x, y, mag); setTilt(z, mag); update3d(x, y, z);
-    setBar(0, x); setBar(1, y); setBar(2, z);
-  }
-  renderCmds(s.commands);
-  renderEvents(s.events);
-}
-
-/* ---------------- 语音播报（第 5 周） ----------------
-   板子**没有喇叭**（BSP_CAPS_AUDIO_SPEAKER=0），所以"听到回答"这一步放在
-   浏览器里做（Web Speech API）：零依赖、不用 API key、离线也能用 ——
-   正好对上课程说的"设备音频未就绪时使用电脑音频，但明确运行位置"。
-   运行位置是**这台电脑的浏览器**，不是板子，网页上要写清楚。 */
-var ttsOn = true;          /* 默认开：课程要的是"从说到听"的完整闭环 */
-var spokenText = "";       /* 上次念过的内容，避免每帧重复念同一句 */
-
-function speakable(t){
-  /* 占位文案不念 —— 念出来只是"正在思考…"这种噪音 */
-  return !!t && t !== "正在思考…" && t !== "已停止"
-         && t.indexOf("我还在想上一个问题") !== 0;
-}
-
-function speakReply(t){
-  if (!ttsOn || !speakable(t) || t === spokenText) return;
-  if (!window.speechSynthesis) return;     /* 浏览器不支持就安静降级，不报错 */
-  spokenText = t;
-  try{
-    speechSynthesis.cancel();              /* 新回答来了，旧的那句立刻掐掉 */
-    var u = new SpeechSynthesisUtterance(t);
-    u.lang = "zh-CN";
-    u.rate = 1.05;
-    speechSynthesis.speak(u);
-  }catch(e){}
-}
-
-function stopSpeaking(){
-  try{ if (window.speechSynthesis) speechSynthesis.cancel(); }catch(e){}
-  spokenText = "";
-}
-
-/* 文字入口：**同一句任务，两条入口** —— 这里发文字，板子上三击发音频，
-   服务端都是同一个 request_ai()，所以解析和行为完全一致（课程第 5 周要求）。 */
-function sendAsk(){
-  var el = $("asktext");
-  var t = el ? String(el.value || "").trim() : "";
-  if (!t) return;
-  el.value = "";
-  fetch("/api/ask" + devQuery(), {
-    method: "POST",
-    headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({text: t})
-  }).then(function(r){ return r.json(); }).then(function(d){
-    if (d && d.reply){
-      aiReply = d.reply;                   /* 直接生效，不等下一次轮询 */
-      $("reply").textContent = d.reply;
-      speakReply(d.reply);
-    }
-    pull();
-  }).catch(function(){});
-}
-
-function pull(){
-  fetch("/api/latest" + devQuery()).then(function(r){ return r.json(); }).then(function(s){
-    samples = s.samples || [];
-    drawChart();
-    render(s);
-  }).catch(function(){});
-}
-
-/* 换设备要重连 SSE（服务端按 ?device= 过滤）。用世代号防止旧连接的回调
-   把新连接的画面覆盖掉 —— 否则点一下设备，屏幕会闪回上一台的数据。 */
-var streamGen = 0, es = null;
-function stream(){
-  var gen = ++streamGen;
-  if (es){ try{ es.close(); }catch(e){} es = null; }
-  var s = new EventSource("/api/stream" + devQuery());
-  es = s;
-  s.onmessage = function(e){
-    if (gen !== streamGen) return;
-    render(JSON.parse(e.data));
-  };
-  s.onerror = function(){
-    if (gen !== streamGen) return;
-    try{ s.close(); }catch(e){}
-    if (es === s) es = null;
-    setTimeout(stream, 2000);
-  };
-}
-
-/* ---------------- 启动 ---------------- */
-$("host").textContent = location.host;
-/* 主题：初始值已由 head 里那段内联脚本在首次绘制前定好（默认明亮）。
-   这里只负责把按钮文案对齐、以及接上点击切换。 */
-applyTheme(_themeName());
-if ($("theme")) $("theme").onclick = function(){
-  var next = _themeName() === "dark" ? "light" : "dark";
-  try { localStorage.setItem("rw1-theme", next); } catch (e) { /* 存不了也照样切换 */ }
-  applyTheme(next);
-};
-fitCanvas();
-fetch("/api/logs").then(function(r){ return r.json(); }).then(function(l){
-  if (l && l.dir) $("logdir").textContent = "落盘 " + l.dir;
-}).catch(function(){});
-fetch("/api/commands" + devQuery()).then(function(r){ return r.json(); }).then(function(d){
-  cmdNames = d.names || ["capture_once"];
-  if ($("devall")) $("devall").onclick = toggleDevAll;
-  if ($("sdrefresh")) $("sdrefresh").onclick = function(){ sendCmd("sd_ls"); };
-  /* 摄像头接线放最后：它依赖 IndexedDB 等浏览器能力，**万一出错也不能
-     中断上面的初始化**（曾经插在 init3d() 之前，一出错整个回调就断了，
-     #devall / #cmdbts / 3D 全都不执行）。 */
-  try {
-    if ($("camshot")) $("camshot").onclick = camShot;
-    if ($("camlive")) $("camlive").onclick = function(){ camSetLive(!camOn); };
-    /* 正在推流时改帧率 → 立刻重发一次命令，不用先关再开。
-     * 没在推流就什么都不做：等用户点「开启实时画面」时会带上新帧率。 */
-    if ($("camfps")) $("camfps").onchange = function(){ if (camOn) camSetLive(true); };
-    renderShots();
-  } catch (e) {
-    if (window.console) console.warn("摄像头初始化失败（不影响其它功能）: " + e);
-  }
-  init3d();
-  /* 板子设置：只把**填了**的项发过去（空着 = 不改那一项）。 */
-  if ($("cfgurl")) $("cfgurl").placeholder = location.origin;   /* 提示当前地址 */
-  if ($("cfgapply")) $("cfgapply").onclick = function(){
-    var p = {};
-    var ssid = ($("cfgssid").value || "").trim();
-    var pass = $("cfgpass").value || "";
-    var url = ($("cfgurl").value || "").trim();
-    var per = parseInt($("cfgper").value, 10);
-    if (ssid) p.ssid = ssid;
-    if (pass) p.pass = pass;
-    if (url) p.url = url;
-    if (!isNaN(per)) p.period_ms = per;
-    if (!Object.keys(p).length){
-      $("cfghint").textContent = "什么都没填，不改。";
-      return;
-    }
-    $("cfghint").textContent = (p.ssid ? "下发中…（改 WiFi 会先试连，最多 8 秒）" : "下发中…");
-    sendCmd("set_config", null, p);
-    $("cfgpass").value = "";     /* 密码不留在这 */
-  };
-  if ($("orientapply")) $("orientapply").onclick = function(){
-    var v = parseInt($("orientsel").value, 10);
-    if (isNaN(v)) return;
-    sendCmd("set_orient", this, {o: v});
-  };
-  /* 「停止」：打断正在生成的大模型回复（第 4 周）。服务端用令牌作废那次回答，
-     板端下一帧就会看到「已停止」—— 这里发一次请求即可，不用等返回。
-     第 6 周补上「停止播报」：光让服务端停下、喇叭里还在念，用户会觉得没停。 */
-  if ($("aicancel")) $("aicancel").onclick = function(){
-    var btn = this;
-    btn.disabled = true;
-    stopSpeaking();
-    fetch("/api/ask/cancel" + devQuery(), {method:"POST"})
-      .then(function(){ btn.disabled = false; })
-      .catch(function(){ btn.disabled = false; });
-  };
-  /* 第 5 周：文字入口 + 播报开关 */
-  if ($("asksend")) $("asksend").onclick = sendAsk;
-  if ($("asktext")) $("asktext").onkeydown = function(e){
-    if (e.key === "Enter"){ e.preventDefault(); sendAsk(); }
-  };
-  if ($("ttsbtn")) $("ttsbtn").onclick = function(){
-    ttsOn = !ttsOn;
-    this.textContent = "播报 " + (ttsOn ? "开" : "关");
-    this.setAttribute("aria-pressed", ttsOn ? "true" : "false");
-    if (!ttsOn) stopSpeaking();
-  };
-  syncOrient();
-  $("names").textContent = cmdNames.join(" / ");
-  renderButtons();
-  renderCmds(d.commands);
-}).catch(function(){
-  cmdNames = ["capture_once"];
-  renderButtons();
-});
-pull();
-/* 刷新率可调：原来硬编码 2000ms（0.5Hz），3D 看着一顿一顿的。
- * 注意这是"页面从服务器取数"的频率，真正决定跟手程度的是**板端上报周期**
- * （板子设置里那个"灵敏度"，默认 500ms = 2Hz）—— 两个都要够快才跟手。
- * 选 20Hz 时若板端还是 500ms，看到的仍然是 2Hz 的数据，只是取数更勤。 */
-var pollTimer = null;
-function setPoll(ms){
-  if (pollTimer) { clearInterval(pollTimer); }
-  pollTimer = setInterval(pull, ms);
-  pull();
-}
-if ($("pollsel")) {
-  $("pollsel").onchange = function(){ setPoll(parseInt(this.value, 10) || 100); };
-}
-setPoll(parseInt(($("pollsel") || {}).value, 10) || 100);
-stream();
-})();
-</script>
-</body>
-</html>
-"""
+# --------------------------------------------------------------------------
+# 网页仪表盘：从 server/web/index.html 读（不再内嵌成三引号字符串）
+#
+# 2026-10-30 拆出来的三个理由：
+#   1. 2952 行 HTML/CSS/JS 住在 Python 字符串里 —— **没有语法高亮、没有 ESLint、
+#      没有格式化**，改一行 JS 只能靠肉眼；
+#   2. 它逼出一条古怪的规矩"页面里禁止出现反斜杠"（`\n` 会被 Python 先吃成真换行），
+#      新人第一次写必然踩，而且报错位置指不到真正的原因；
+#   3. 字符串在 import 时就固化了，**改样式必须重启服务端**。
+#
+# 现在按 mtime 缓存：改完刷新浏览器就生效。读取用文本模式，所以 git 在 Windows 上
+# 检出成 CRLF 也不影响（Python 的 universal newlines 会归一成 \n）。
+# --------------------------------------------------------------------------
+_WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
+_DASH_CACHE = {"mtime": None, "html": ""}
+
+
+def dashboard_html():
+    """返回仪表盘页面；文件改动后自动重新加载。"""
+    path = os.path.join(_WEB_DIR, "index.html")
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        # 文件丢了要**说清楚**，而不是抛 500 让页面白屏 —— 这个仓库的原则是
+        # 出错也要给人一句能读的话。
+        return ('<!doctype html><meta charset="utf-8"><title>缺文件</title>'
+                '<h1>仪表盘文件缺失</h1><p>预期位置：%s</p>'
+                '<p>跑 <code>git status</code> 看是不是被删了。</p>' % path)
+    if mtime != _DASH_CACHE["mtime"]:
+        with open(path, encoding="utf-8") as fh:
+            _DASH_CACHE["html"] = fh.read()
+        _DASH_CACHE["mtime"] = mtime
+    return _DASH_CACHE["html"]
 
 
 # --------------------------------------------------------------------------
@@ -4607,17 +2987,43 @@ def main():
     print("   AI模式:  %s" % llm)
     print("   指令超时: %.0f 秒" % CMD_TIMEOUT_S)
     print("   多设备:  最多 %d 台；?device=<名字> 可指定，不带则用最近上报的那台" % MAX_DEVICES)
-    print("   落盘:    %s%s" % (args.data_dir,
-          "（仅事件）" if args.no_log_telemetry else "（波形 %.0fHz + 事件，保留 %d 天）"
-          % (args.log_hz, args.retain_days)))
+    # `--retain-days 0` 的语义是"不自动清理"，直接印"保留 0 天"会读成"立刻删"。
+    _what = "仅事件" if args.no_log_telemetry else "波形 %.0fHz + 事件" % args.log_hz
+    _retain_txt = ("保留 %d 天" % args.retain_days) if args.retain_days > 0 else "不自动清理"
+    print("   落盘:    %s（%s，%s）" % (args.data_dir, _what, _retain_txt))
+    # 落盘量预估。**这个数必须给出来**：老师很可能把数据目录放在 C 盘或 U 盘上，
+    # 而"保留 7 天"听起来很小 —— 实测一个班 8 小时就是 170 MB 量级，
+    # 满 7 天是 1 GB 以上（2026-11-01 用 load_classroom 实测锚定，见 jsonl_log.py）。
+    _est = estimate_mb(20, 8, args.log_hz, log_telemetry=not args.no_log_telemetry)
+    if args.retain_days > 0:
+        _keep = _est * args.retain_days
+        _keep_txt = ("，保留 %d 天约 %.1f GB" % (args.retain_days, _keep / 1024.0)
+                     if _keep >= 1024 else
+                     "，保留 %d 天约 %.0f MB" % (args.retain_days, _keep))
+    else:
+        _keep_txt = ""            # 上一行已经说了"不自动清理"，别重复
+    print("   空间:    一个班 20 块板 × 8 小时 ≈ %.0f MB%s" % (_est, _keep_txt))
     print("=" * 66)
+    # SIGTERM（systemd / docker stop / 关机）也走"优雅收尾"这条路：
+    # 默认行为是直接杀进程，队列里没落盘的记录就没了。
+    def _on_sigterm(*_args):
+        raise KeyboardInterrupt
+
+    try:
+        signal.signal(signal.SIGTERM, _on_sigterm)
+    except (ValueError, OSError, AttributeError):
+        pass          # 非主线程 / 平台不支持：保持默认行为，不影响启动
+
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
         print("\nbye")
+    finally:
+        srv.server_close()
+        if LOGGER is not None:
+            written = LOGGER.close()
+            print("   日志已收尾：本次共写 %d 行，丢弃 %d 行" % (written, LOGGER.dropped))
 
 
 if __name__ == "__main__":
     main()
-
-# PROBE_MARKER_12345

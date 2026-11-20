@@ -21,6 +21,7 @@
 #include "cJSON.h"
 #include "esp_http_client.h"
 #include "esp_log.h"
+#include "esp_random.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -61,6 +62,22 @@ static const char *TAG = "transport";
  * telemetry periods) instead of retrying forever. */
 #define TX_ASK_MAX_ATTEMPTS 3
 
+/* 板端等 AI 回复的上限（毫秒）。服务端自己的大模型超时是 10 s（LLM_BOARD_TIMEOUT），
+ * 再加排队与一帧上报的余量给到 20 s。超过它就在屏幕上明确说"超时"——
+ * 不许让界面停在上一条回复上，也不许一直转圈。 */
+#define AI_WAIT_TIMEOUT_MS 20000
+
+/* 上报周期的合法范围（毫秒）。**两个调用点共用这一份**：
+ *   1. run_set_config() —— 接受 set_config 参数时；
+ *   2. transport_reload_config() —— 从 NVS 读出来时的兜底夹取。
+ *
+ * 2026-10-30 之前只有第 2 处改成了 100、第 1 处还留着 50，于是出现
+ * "服务端发 50 → 写进 NVS → 运行时被静默夹成 500 → 日志仍打印 period=50"
+ * 的半改状态：NVS 和内存两份值对不上，看日志根本查不出来。
+ * 服务端 sanitize_params 用的是同一组数字（100/2000），改这里记得同步那边。 */
+#define RW1_PERIOD_MIN_MS 100
+#define RW1_PERIOD_MAX_MS 2000
+
 /* Samples held for one upload. 128 @ 10 ms = 1.28 s, comfortably more than the
  * default 500 ms period; the batch is flushed early if it fills up. */
 #define TX_BATCH_MAX 128
@@ -84,12 +101,14 @@ static const char *TAG = "transport";
 #define CAPTURE_N 20
 #define CAPTURE_TIMEOUT_MS 2000
 
-/* Remote-command state. Only touched from the transport task, so no lock. */
+/* Remote-command state. Written by transport/upload tasks; fields are simple
+ * and readers use the ready/rid snapshot protocol (see build_body). */
 typedef struct {
     /* command being executed right now */
     char       id[TRANSPORT_CMD_ID_LEN];
     bool       running;
     uint8_t    state;          /* transport_cmd_state_t，给 UI 看（不随 ready 复位） */
+    uint8_t    kind;           /* cmd_kind_t：超时的判据要知道在跑的是不是采集类 */
     TickType_t started;
     int        n;
     float      sum[3];         /* Σx, Σy, Σz (screen frame) */
@@ -114,6 +133,14 @@ static SemaphoreHandle_t s_lock;
 static volatile bool s_ask_pending;
 static int s_ask_attempts;
 static char s_ask_text[64] = "我现在的运动状态怎么样？";
+/* 一次提问/语音从"发起到拿到结果"期间为 true；停表判超时用。
+ * 读写都在 s_lock 里（见 ai_state_set / transport_get_status）。 */
+static bool       s_ai_active;
+static TickType_t s_ai_started;
+/* 提问那一刻屏幕上的旧回复。服务端还没处理 ask 时，仍会把**上一句**当
+ * ai_reply 回给我们；不比对这一份，UI 会先闪一下旧答案再跳新答案。 */
+static char       s_ai_base_reply[TRANSPORT_REPLY_LEN];
+static bool       s_ai_saw_pending;
 static uint32_t s_post_count;
 static int s_btn_pending;      /* 自上次成功上报以来 BOOT 被按了几次（第 3 周） */
 static uint32_t s_bad_samples; /* 累计丢弃的不可用样本数（P1-4，只统计不上报） */
@@ -121,6 +148,11 @@ static char s_url[NET_URL_MAX];/* 上报地址：来自 net_config（运行期�
 /* 设备 id：服务端按它分片（多板场景下仪表盘区分板子的唯一依据）。
  * 由 net_config_device_id() 解析：配网页填了就用填的，留空则按 MAC 生成 rw1-XXXX。 */
 static char s_device[NET_DEV_MAX];
+/* 同上，但**已做 URL 百分号编码**，只给"拼进查询串"的两个接口用
+ * （/api/audio 与 /api/frame）。遥测走 JSON body，用的是上面那个原始值。
+ * 为什么要两份：见 url_encode() 的注释 —— 课堂里最常见的设备名是
+ * 「第三组-07」，原样拼进 URL 会让同一块板在服务端裂成两台。 */
+static char s_device_url[NET_DEV_MAX * 3 + 1];
 static uint32_t s_poll_fail;   /* 连续 accel_input_poll 失败次数（真实源读失败） */
 static char s_last_reply[TRANSPORT_REPLY_LEN];   /* 上一次看到过的服务器回复 */
 /* 语音任务：按钮一按就唤醒它去录音。**必须是独立任务** —— 录音要阻塞 3 秒，
@@ -158,6 +190,84 @@ static void status_lock(void)
 static void status_unlock(void)
 {
     xSemaphoreGive(s_lock);
+}
+
+/* 设置 AI 显示状态。**调用方必须已持有 s_lock**（该状态由多个任务读写：
+ * 按钮任务置 PENDING、上报任务置 OK/FAILED、UI 任务读）。 */
+static void ai_state_set(uint8_t state, const char *note)
+{
+    s_st.ai_state = state;
+    if (note != NULL && note[0] != '\0') {
+        utf8_strlcpy(s_st.ai_note, note, sizeof(s_st.ai_note));
+    } else {
+        s_st.ai_note[0] = '\0';
+    }
+}
+
+/* ---------------- 跨任务读配置：一律"锁内拷一份" ---------------------------
+ *
+ * 背景：transport_reload_config() 由**配网的 httpd 任务**调用（配网保存后立即
+ * 生效），而真正发请求的是 upload_task / voice_task。`s_device` 早就加了锁，
+ * `s_url` 却一直是裸读 —— 读到半截就会拼出 `http://192.168.1.` 这种 URL，
+ * 表现为"偶发一次上报失败"，几乎不可能复现。
+ *
+ * 三个小 helper 把这件事收敛成一个口径：**调用方永远拿本地副本**。
+ * 每次开销只是一次 mutex take（2 Hz 量级，可以忽略）。
+ */
+static void copy_url(char *dst, size_t cap)
+{
+    status_lock();
+    strlcpy(dst, s_url, cap);
+    status_unlock();
+}
+
+static void copy_device_url(char *dst, size_t cap)
+{
+    status_lock();
+    strlcpy(dst, s_device_url, cap);
+    status_unlock();
+}
+
+/* 把设备名编码成 URL 查询串可用的形式（RFC 3986 的 unreserved 之外一律 %XX）。
+ *
+ * **为什么必须有**：设备名是用户在配网页手填的，课堂里最常见的就是「第三组-07」。
+ * 遥测把设备名放在 JSON body 里，没问题；但 /api/audio 和 /api/frame 是把它
+ * **拼进 URL** 的。原始 UTF-8 字节写进请求行之后，Python 的 http.server 用
+ * latin-1 解请求行，同一个「第三组-07」在服务端变成「ç¬¬ä¸ç»„-07」——
+ * 于是同一块板在仪表盘上裂成两台：遥测一台、画面/语音另一台，
+ * 实时画面永远 404、照片存进乱码目录。
+ *
+ * ASCII 的 unreserved 字符原样保留（日志里仍然可读），只编码真正需要编码的字节。
+ * 目标缓冲至少要 `sizeof(src) * 3 + 1`。
+ *
+ * 返回 false 表示**放不下、被截断了**（调用方应当告警）。注意编码是"整字节
+ * 进整字节出"的：三个字节的 %XX 要么全写、要么不写，绝不会留下半个转义。
+ * 但截断出来的仍是一个"合法但不同的设备名"，那会把一块板悄悄变成另一台，
+ * 所以调用方必须知道这件事。 */
+static bool url_encode(const char *src, char *dst, size_t cap)
+{
+    static const char hex[] = "0123456789ABCDEF";
+    size_t o = 0;
+
+    for (const unsigned char *p = (const unsigned char *)src; *p != '\0'; ++p) {
+        const bool plain = (*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
+                           (*p >= '0' && *p <= '9') ||
+                           *p == '-' || *p == '_' || *p == '.' || *p == '~';
+        const size_t need = plain ? 1u : 3u;
+        if (o + need + 1u > cap) {
+            dst[o] = '\0';
+            return false;
+        }
+        if (plain) {
+            dst[o++] = (char)*p;
+        } else {
+            dst[o++] = '%';
+            dst[o++] = hex[(*p >> 4) & 0x0F];
+            dst[o++] = hex[*p & 0x0F];
+        }
+    }
+    dst[o] = '\0';
+    return true;
 }
 
 /* ---------------- remote commands (week 2 起) ----------------------------- */
@@ -218,6 +328,12 @@ typedef struct {
     bool     ask;
     bool     had_result;
     char     cmd_rid[TRANSPORT_CMD_ID_LEN];
+    /* 本批要上报的 BOOT 按键次数。在采样侧 flush 时**锁内快照并清零**：
+     * 原先是 upload_task 发送成功后无锁 `s_btn_pending = 0`，而按钮任务是
+     * 锁内读-改-写 —— 两者交错的那一瞬间到达的按键会被清零吞掉（计数想做到
+     * "绝不吞按键"）。快照进 job 之后，发送失败时在 upload_task 里加回，
+     * 与 ask 的重试同一个套路。 */
+    int      btn;
 } tx_job_t;
 
 static tx_job_t          s_tx_slot;
@@ -230,10 +346,22 @@ static void tx_job_post(const tx_job_t *job)
 {
     if (xSemaphoreTake(s_tx_mutex, pdMS_TO_TICKS(50)) != pdTRUE) {
         s_tx_dropped++;                 /* 拿不到锁：宁可丢帧，绝不卡采样 */
+        /* 这一批没进邮箱：把快照出来的按键计数还回去，别吞按键。
+         * （旧实现计数留在全局量上，丢批天然不丢计数；快照进 job 之后
+         *  每一条"job 没发出去"的路径都得把计数还回去，这里是第一条。） */
+        status_lock();
+        s_btn_pending += job->btn;
+        status_unlock();
         return;
     }
     if (s_tx_ready) {
         s_tx_dropped++;                 /* 上一批还没发走 → 用新的覆盖 */
+        /* 被覆盖的那一批连同它的按键计数一起没了：加回去，下一批补报。
+         * 锁序说明：这里持 s_tx_mutex 之内再取 status_lock —— 全工程没有
+         * 反向（持 status_lock 等 s_tx_mutex）的路径，不会死锁。 */
+        status_lock();
+        s_btn_pending += s_tx_slot.btn;
+        status_unlock();
     }
     s_tx_slot = *job;
     s_tx_ready = true;
@@ -261,8 +389,11 @@ static char s_cfg_url[NET_URL_MAX];
 static int  s_cfg_period;
 
 /* 上报周期（毫秒）—— 做成变量而不是 const，好让 set_config 在运行时改掉它。
- * 「灵敏度」本质上就是这个：周期越短，网页小球跟得越紧。 */
-static TickType_t s_post_ticks;
+ * 「灵敏度」本质上就是这个：周期越短，网页小球跟得越紧。
+ * volatile 的理由：由配网的 httpd 任务在锁内写、由采样循环每 10ms 读。
+ * TickType_t 是 32 位且自然对齐，单次读写在 Xtensa 上是原子的 —— 只会读到
+ * "旧值"或"新值"，不会读到半截；字符串才有这个问题（所以 s_url 走 copy_url）。 */
+static volatile TickType_t s_post_ticks;
 
 /* led_blink 的可选 pattern 参数：让服务端能表达"这是告警/确认/错误"的语义，
  * 而不是只丢一个"闪 N 次"过来。板端映射到对应的预置图案——
@@ -315,7 +446,9 @@ static bool json_bool(const cJSON *obj, const char *key, bool dflt)
  * （led_blink / led_set 这类没有测量值）。 */
 static void finish_command(bool ok, bool with_measurement, const char *err)
 {
-    s_cmd.ready = true;
+    /* ready 必须**最后**置位：采样循环在另一个任务里拿它当"结果字段已全部写好"
+     * 的信号（快照进 job → build_body）。原来它写在第一行，于是 ready=true 与
+     * xyz/std/err 就位之间有几微秒的窗口，那一帧上报可能带走半截结果。 */
     s_cmd.ok = ok;
     strlcpy(s_cmd.rid, s_cmd.id, sizeof(s_cmd.rid));
     s_cmd.rn = s_cmd.n;
@@ -337,8 +470,9 @@ static void finish_command(bool ok, bool with_measurement, const char *err)
         strlcpy(s_cmd.err, ok ? "" : (err ? err : "command failed"), sizeof(s_cmd.err));
     }
 
-    s_cmd.running = false;
     s_cmd.state = ok ? TRANSPORT_CMD_DONE : TRANSPORT_CMD_FAILED;
+    s_cmd.ready = true;          /* 见函数开头的注释：结果字段就位之后才许被看见 */
+    s_cmd.running = false;
     if (!ok) {
         led_feedback_play(LED_FB_ERROR);      /* 失败给一个能看见的物理信号 */
     }
@@ -509,10 +643,11 @@ static void run_set_config(const char *id)
     if (s_cfg_url[0] != '\0') {
         utf8_strlcpy(cfg.url, s_cfg_url, sizeof(cfg.url));
     }
-    /* 下限从 100ms 放宽到 50ms —— 50ms = 20Hz。用户要 20Hz 的实时感，
-     * 100ms 只能到 10Hz。注意 50ms 已接近 WiFi 单次往返的量级，
-     * 实际能跑多快取决于现场网络，跑不到也别指望更低了。 */
-    if (s_cfg_period >= 50 && s_cfg_period <= 2000) {
+    /* 下限 100ms（不是 50）—— 原因见文件顶部的 RW1_PERIOD_MIN_MS。
+     * 这里曾经放宽到 50ms（20Hz）追求"更跟手"，代价不对等：50ms 时每批只剩
+     * 5 个样本，"批量上报"的红利消失；32 块板 × 20 POST/s 配上 Connection: close
+     * 会在服务端堆出数万 TIME_WAIT。 */
+    if (s_cfg_period >= RW1_PERIOD_MIN_MS && s_cfg_period <= RW1_PERIOD_MAX_MS) {
         cfg.period_ms = (uint16_t)s_cfg_period;
     }
     if (!net_config_save(&cfg)) {
@@ -539,6 +674,9 @@ static void run_command(cmd_kind_t kind, const char *id,
         ESP_LOGW(TAG, "cmd %s ignored: %s still running", id, s_cmd.id);
         return;
     }
+    /* 先记类型再置 running：feed_capture / check_capture_timeout（在采样任务里跑）
+     * 要靠它区分"采集类"与"慢指令本来就要几秒"（sd_format / 带换 WiFi 的 set_config）。 */
+    s_cmd.kind = (uint8_t)kind;
 
     switch (kind) {
     case CMD_CAPTURE:
@@ -596,7 +734,15 @@ static void run_command(cmd_kind_t kind, const char *id,
             finish_command(false, false, "拍照失败（没插卡 / 摄像头不可用？）");
             break;
         }
-        camera_post_frame(s_url, s_device, true);   /* 留档用，失败不影响结果 */
+        {
+            /* s_url / 设备名都拷出来再用（配网任务随时可能改写它们），
+             * 设备名还要用 **URL 编码** 的那一份 —— 见 url_encode 的注释。 */
+            char base[NET_URL_MAX];
+            char dev[sizeof(s_device_url)];
+            copy_url(base, sizeof(base));
+            copy_device_url(dev, sizeof(dev));
+            camera_post_frame(base, dev, true);   /* 留档用，失败不影响结果 */
+        }
         snprintf(s_cmd.note, sizeof(s_cmd.note), "已存 %s", name);
         status_lock();
         s_st.cmd_count++;
@@ -719,7 +865,7 @@ static void run_command(cmd_kind_t kind, const char *id,
 /* Feed one freshly sampled point into the running capture. */
 static void feed_capture(const float xyz[3])
 {
-    if (!s_cmd.running) {
+    if (!s_cmd.running || s_cmd.kind != CMD_CAPTURE) {
         return;
     }
     s_cmd.sum[0] += xyz[0];
@@ -734,10 +880,13 @@ static void feed_capture(const float xyz[3])
     }
 }
 
-/* Give up on a capture that is not getting its samples (e.g. IMU went quiet). */
+/* Give up on a capture that is not getting its samples (e.g. IMU went quiet).
+ * **只对采集类指令生效**：sd_format / 带换 WiFi 的 set_config 正常就要跑几秒，
+ * 不区分类型的话它们会被这条超时抢先强判 "not enough samples" 失败，
+ * 而真正的结果随后才到 —— 服务端会先收到一个假失败（2026-11-03 通读发现）。 */
 static void check_capture_timeout(void)
 {
-    if (s_cmd.running &&
+    if (s_cmd.running && s_cmd.kind == CMD_CAPTURE &&
         pdTICKS_TO_MS(xTaskGetTickCount() - s_cmd.started) > CAPTURE_TIMEOUT_MS) {
         finish_command(false, true, "not enough samples");
     }
@@ -795,15 +944,19 @@ static bool sanitize3(float x, float y, float z, float out[3])
  * with 15 significant digits, so a float 0.012f comes out as
  * "0.0120000001634057" and a 50-sample batch balloons to ~2.7 kB. "%.3f" gives
  * exactly the precision the analysis needs (1 mg) in a third of the bytes. */
-static char *build_body(const tx_job_t *job, const char *source)
+static char *build_body(const tx_job_t *job, const char *source, const char *device,
+                        const char *ask_text)
 {
     const int n = (int)job->n;
     if (n <= 0) {
         return NULL;
     }
-    size_t cap = 256 + (size_t)n * 28 + strlen(s_ask_text) * 2 + 64
+    if (device == NULL) {
+        device = "";
+    }
+    size_t cap = 256 + (size_t)n * 28 + strlen(ask_text) * 2 + 64
                  + (job->had_result ? (320 + CMD_NOTE_LEN + 24) : 0) + 32
-                 + strlen(s_device) * 6 + 24;   /* "dev" 字段：设备名是用户输入，转义后可能翻倍 */
+                 + strlen(device) * 6 + 24;   /* "dev" 字段：设备名是用户输入，转义后可能翻倍 */
     char *buf = malloc(cap);
     if (buf == NULL) {
         return NULL;
@@ -815,7 +968,7 @@ static char *build_body(const tx_job_t *job, const char *source)
      * 服务端找 device"这种对不上的静默失败（verify_server.py 的固件格式契约用例
      * 就是钉这个的）。 */
     int off = snprintf(buf, cap, "{\"device\":\"");
-    if (!json_escape_append(buf, cap, &off, s_device)) {
+    if (!json_escape_append(buf, cap, &off, device)) {
         free(buf);
         return NULL;
     }
@@ -857,7 +1010,7 @@ static char *build_body(const tx_job_t *job, const char *source)
             return NULL;
         }
         off += snprintf(buf + off, cap - (size_t)off, ",\"q\":\"");
-        if (!json_escape_append(buf, cap, &off, s_ask_text)) {
+        if (!json_escape_append(buf, cap, &off, ask_text)) {
             free(buf);
             return NULL;
         }
@@ -910,14 +1063,14 @@ static char *build_body(const tx_job_t *job, const char *source)
         off += snprintf(buf + off, cap - (size_t)off, "}");
     }
 
-    /* 按键触发（第 3 周）：自上次上报以来 BOOT 被按了几次。
+    /* 按键触发（第 3 周）：本批快照到的 BOOT 按键次数（见 tx_job_t.btn 的注释）。
      * 让服务端/网页能看见"物理动作真的发生了"，而不只是间接看到 ask。 */
-    if (s_btn_pending > 0) {
+    if (job->btn > 0) {
         if ((size_t)off + 24 > cap) {
             free(buf);
             return NULL;
         }
-        off += snprintf(buf + off, cap - (size_t)off, ",\"btn\":%d", s_btn_pending);
+        off += snprintf(buf + off, cap - (size_t)off, ",\"btn\":%d", job->btn);
     }
 
     /* Close with an explicit write (not snprintf) so a full buffer can never
@@ -1051,7 +1204,33 @@ static void apply_response(const char *body, size_t len)
         strlcpy(s_st.activity, activity, sizeof(s_st.activity));
     }
     if (reply[0] != '\0') {
-        strlcpy(s_st.reply, reply, sizeof(s_st.reply));
+        utf8_strlcpy(s_st.reply, reply, sizeof(s_st.reply));
+    }
+    /* 回复的显示状态：只有 OK 才显示正文；失败/超时必须给出明确原因。
+     * 注意 apply_response(NULL,0)（HTTP 失败）也会走到这里，所以下面要按
+     * fail_streak 判断"是不是真连不上"，偶发一次断网不立刻判死。 */
+    if (ok) {
+        if (pending) {
+            ai_state_set(TRANSPORT_AI_PENDING, NULL);
+            s_ai_saw_pending = true;
+        } else if (reply[0] != '\0' &&
+                   (!s_ai_active || s_ai_saw_pending ||
+                    strcmp(reply, s_ai_base_reply) != 0)) {
+            /* 有正文、且不是"提问前的那一句"（或已经见过 pending）才算本次结果 */
+            ai_state_set(TRANSPORT_AI_OK, NULL);
+            s_ai_active = false;
+            s_ai_saw_pending = false;
+        } else if (s_ai_active) {
+            /* 服务端说"不在生成了"却没有新正文：这轮就是空回复，
+             * 不能把上一句旧回答当成本次结果留在屏幕上。 */
+            ai_state_set(TRANSPORT_AI_FAILED, "服务器没有回复");
+            s_ai_active = false;
+            s_ask_pending = false;
+        }
+    } else if (s_ai_active && s_st.fail_streak >= TX_ASK_MAX_ATTEMPTS) {
+        ai_state_set(TRANSPORT_AI_FAILED, "连不上服务器");
+        s_ai_active = false;
+        s_ask_pending = false;
     }
     /* 活动词在锁内取一份，给下面的"活动变化"事件用（采样循环那边的留档另有取值） */
     char log_act[sizeof(s_st.activity)];
@@ -1106,15 +1285,25 @@ static esp_err_t http_event_handler(esp_http_client_event_t *evt)
 
 static bool post_batch(const tx_job_t *job)
 {
-    char url[NET_URL_MAX + 16];
-    snprintf(url, sizeof(url), "%s%s", s_url, TX_PATH);
-
+    /* 四个字段一次锁内拷完：url / 原始设备名 / source / 问句都可能被别的任务改
+     * （见 copy_url 上面那段注释）。拷出来的副本在本函数里不再变化，
+     * 之后的 build_body 也就没有"读到半截"的可能了。 */
+    char base[NET_URL_MAX];
+    char device[NET_DEV_MAX];
     char source[16];
+    char ask[sizeof(s_ask_text)];   /* 问句也走"锁内拷一份"：按钮任务在锁内写它，
+                                       这边不拷的话可能读到半新半旧的问句 */
     status_lock();
+    strlcpy(base, s_url, sizeof(base));
+    strlcpy(device, s_device, sizeof(device));
     strlcpy(source, s_st.source, sizeof(source));
+    strlcpy(ask, s_ask_text, sizeof(ask));
     status_unlock();
 
-    char *body = build_body(job, source);
+    char url[NET_URL_MAX + 16];
+    snprintf(url, sizeof(url), "%s%s", base, TX_PATH);
+
+    char *body = build_body(job, source, device, ask);
     if (body == NULL) {
         ESP_LOGE(TAG, "out of memory building telemetry body");
         return false;
@@ -1174,8 +1363,16 @@ static bool post_batch(const tx_job_t *job)
  */
 static bool post_audio(const uint8_t *pcm, size_t len)
 {
-    char url[NET_URL_MAX + 64];
-    snprintf(url, sizeof(url), "%s%s?device=%s", s_url, VOICE_PATH, s_device);
+    /* 设备名必须用**已编码**的那一份：这是拼进查询串的。若用原始值，
+     * 「第三组-07」会在服务端被 latin-1 解成乱码，语音就挂到另一台幽灵设备上
+     * （见 url_encode 的注释）。缓冲按 NET_URL_MAX + 128 算：
+     * 128(地址) + 10(路径) + 9("?device=") + 72(编码后设备名最长) < 224。 */
+    char base[NET_URL_MAX];
+    char dev[sizeof(s_device_url)];
+    char url[NET_URL_MAX + 128];
+    copy_url(base, sizeof(base));
+    copy_device_url(dev, sizeof(dev));
+    snprintf(url, sizeof(url), "%s%s?device=%s", base, VOICE_PATH, dev);
 
     /* 不能和 post_batch 共用那块 static —— 两者跑在不同任务里，会互相踩。
      * 同样不放栈上：栈只有 6 KB，4 KB 响应缓冲放上去就没余量了。 */
@@ -1222,15 +1419,24 @@ static void voice_task(void *arg)
         }
         if (!wifi_link_is_up()) {
             ESP_LOGW(TAG, "语音：WiFi 没连上，这次跳过");
+            status_lock();
+            ai_state_set(TRANSPORT_AI_FAILED, "Wi-Fi 没连上");
+            s_ai_active = false;
+            status_unlock();
             continue;
         }
         if (!audio_ready()) {
             ESP_LOGW(TAG, "语音：麦克风不可用（看上面的 audio 日志）");
+            status_lock();
+            ai_state_set(TRANSPORT_AI_FAILED, "麦克风不可用");
+            s_ai_active = false;
+            status_unlock();
             continue;
         }
 
         status_lock();
         s_st.voice_state = TRANSPORT_VOICE_RECORDING;
+        ai_state_set(TRANSPORT_AI_PENDING, "正在录音…");
         status_unlock();
         led_feedback_play(LED_FB_ACK);
 
@@ -1240,13 +1446,25 @@ static void voice_task(void *arg)
         status_lock();
         s_st.voice_state = (pcm != NULL && n > 0) ? TRANSPORT_VOICE_UPLOADING
                                                   : TRANSPORT_VOICE_IDLE;
+        if (pcm != NULL && n > 0) {
+            ai_state_set(TRANSPORT_AI_PENDING, "正在识别…");
+        }
         status_unlock();
 
         if (pcm == NULL || n == 0) {
             ESP_LOGW(TAG, "语音：没录到数据");
+            status_lock();
+            ai_state_set(TRANSPORT_AI_FAILED, "没录到声音");
+            s_ai_active = false;
+            status_unlock();
             continue;
         }
-        post_audio(pcm, n);
+        if (!post_audio(pcm, n)) {
+            status_lock();
+            ai_state_set(TRANSPORT_AI_FAILED, "语音上传失败");
+            s_ai_active = false;
+            status_unlock();
+        }
         /* 往后就交给服务端了：识别 → 大模型 → 回复随遥测帧回来。
          * 板端把状态交还给服务端，UI 后续按 ai_pending / reply 显示。 */
     }
@@ -1300,6 +1518,26 @@ static void transport_task(void *arg)
     TickType_t last_post = xTaskGetTickCount();
     int n = 0;
     const char *last_source = "?";   /* IMU 型号，只在变化时才写进状态 */
+
+    /* ---- 开机错峰 ------------------------------------------------------------
+     *
+     * 一个班 20~32 块板通常是**同一秒上电**的，而节拍器只看"距上次上报多久"，
+     * 于是所有板子的相位完全一致：每 500 ms 在同一瞬间一起 POST。
+     * 服务端只有一把全局锁，analyze 又要几百微秒到几毫秒，32 个请求一字排开，
+     * 最后那几块就得等几百毫秒 —— 实测 `tools/load_classroom.py --boards 32`：
+     * **p95 = 476 ms、最慢 626 ms**，已经逼近板端 1 s 的 HTTP 超时；
+     * 教室 WiFi 再慢一点就会开始丢批（丢批 = 计步/跌落漏检）。
+     *
+     * 修法：开机时随机偏移 0~1 个上报周期，把相位摊开。之后每次 flush 都会
+     * 重置 last_post，所以这个偏移会一直保持，稳态也是散的。
+     * 代价只是第一帧晚到最多半个周期（屏幕这段时间显示"等待数据…"）。
+     */
+    if (s_post_ticks > 1) {
+        const uint32_t period_ms = (uint32_t)pdTICKS_TO_MS(s_post_ticks);
+        const uint32_t jitter = (period_ms > 1) ? (esp_random() % period_ms) : 0;
+        ESP_LOGI(TAG, "开机错峰 %u ms（避免全班同一瞬间上报）", (unsigned)jitter);
+        vTaskDelay(pdMS_TO_TICKS(jitter));
+    }
 
     while (true) {
         accel_input_sample_t sample = {0};
@@ -1384,6 +1622,13 @@ static void transport_task(void *arg)
             memcpy(job.xyz, s_batch, (size_t)n * sizeof(s_batch[0]));
             job.n = (uint16_t)n;
             job.ask = s_ask_pending;
+            /* 按键计数锁内快照并清零（原先是 upload_task 成功后无锁清零，
+             * 会与按钮任务的锁内 ++ 交错吞掉一次按键，见 tx_job_t.btn）。
+             * 发送失败时 upload_task 会把它加回去 —— 计数只许换批、不许丢。 */
+            status_lock();
+            job.btn = s_btn_pending;
+            s_btn_pending = 0;
+            status_unlock();
             job.had_result = s_cmd.ready;
             if (job.had_result) {
                 strlcpy(job.cmd_rid, s_cmd.rid, sizeof(job.cmd_rid));
@@ -1419,8 +1664,14 @@ static void upload_task(void *arg)
         if (xSemaphoreTake(s_tx_wake, pdMS_TO_TICKS(100)) != pdTRUE) {
             if (s_cam_stream &&
                 (xTaskGetTickCount() - s_cam_last) >= s_cam_interval) {
+                /* 同 run_command 里的 cam_capture：URL 与设备名都要"锁内拷一份"，
+                 * 设备名用 URL 编码后的值。 */
+                char base[NET_URL_MAX];
+                char dev[sizeof(s_device_url)];
                 s_cam_last = xTaskGetTickCount();
-                camera_post_frame(s_url, s_device, false);
+                copy_url(base, sizeof(base));
+                copy_device_url(dev, sizeof(dev));
+                camera_post_frame(base, dev, false);
             }
             continue;
         }
@@ -1436,15 +1687,19 @@ static void upload_task(void *arg)
             ok = post_batch(&job);
         }
 
-        /* 结果与按键计数只在成功送达后才清；失败就下一批重发
-         * （与 ask 的重试策略一致，不丢东西）。
+        /* 结果只在成功送达后才清；失败就下一批重发（与 ask 的重试策略一致）。
          * 按 rid 精确比对：POST 期间可能已经有新命令覆盖了 s_cmd，
-         * 那时 s_cmd.rid != job.cmd_rid，**绝不能清** —— 那清掉的是别人的结果。 */
+         * 那时 s_cmd.rid != job.cmd_rid，**绝不能清** —— 那清掉的是别人的结果。
+         * 按键计数已经在采样侧快照进 job.btn（那边同时清零），这里只在
+         * **发送失败**时把它加回去 —— 成功路径无需再碰 s_btn_pending。 */
         if (ok) {
             if (job.had_result && strcmp(s_cmd.rid, job.cmd_rid) == 0) {
                 s_cmd.ready = false;
             }
-            s_btn_pending = 0;
+        } else if (job.btn > 0) {
+            status_lock();
+            s_btn_pending += job.btn;
+            status_unlock();
         }
 
         status_lock();
@@ -1483,6 +1738,11 @@ static void upload_task(void *arg)
                 ESP_LOGW(TAG, "ask dropped after %d failed uploads", s_ask_attempts);
                 s_ask_pending = false;
                 s_ask_attempts = 0;
+                /* 屏幕要给明确结论：发了三次都没发出去，不能停在上一句话上 */
+                status_lock();
+                ai_state_set(TRANSPORT_AI_FAILED, "问答没发出去");
+                s_ai_active = false;
+                status_unlock();
             } else {
                 ESP_LOGW(TAG, "ask upload failed, retry %d/%d",
                          s_ask_attempts, TX_ASK_MAX_ATTEMPTS);
@@ -1534,34 +1794,48 @@ void transport_start(void)
 
 void transport_reload_config(void)
 {
-    /* 地址与设备 id 都来自 net_config（NVS 优先 / 回退 Kconfig），配网改完立即生效。
-     * 缓存成静态而不是每次上报都读 NVS：post_batch 和采样循环在同一个任务里，
-     * 每次 2 Hz 去开关 NVS 句柄会白占锁、拖慢采样。 */
+    /* 地址与设备 id 都来自 net_config（配网写进 NVS，是唯一来源），配网改完立即生效。
+     * **每次 2 Hz 去读 NVS 是不可接受的开销**，所以缓存成静态量；但本函数会被
+     * 配网的 httpd 任务调用，读它的却是 upload_task / voice_task ——
+     * 所以三个字段全部在锁内写、锁内拷（见 copy_url/copy_device 的注释）。 */
     net_config_t cfg;
     net_config_load(&cfg);
-    strlcpy(s_url, cfg.url, sizeof(s_url));
 
-    /* 上报周期也在这里刷新：`set_config` 改完周期后调本函数即可生效，
-     * 不用重启。夹到 100..2000ms —— 太短会把 WiFi 压满，太长界面就不跟手了。 */
+    /* 上报周期：夹到 RW1_PERIOD_MIN_MS..RW1_PERIOD_MAX_MS。**下限从 50 提到 100**
+     * （2026-10-30）：50ms = 20Hz 时每批只剩 5 个样本，"批量上报"的红利消失；
+     * 而 32 块板 × 20 POST/s = 640 连接/秒，配上服务端 `Connection: close`（它先关）
+     * 会在服务端侧堆出数万个 TIME_WAIT。三处（网页 / 服务端 / 这里）必须一致，
+     * 否则会出现"网页选了 100 但板端还是 50"这种对不上的静默偏差。 */
     int per = (int)cfg.period_ms;
-    if (per < 50 || per > 2000) {
+    if (per < RW1_PERIOD_MIN_MS || per > RW1_PERIOD_MAX_MS) {
         per = CONFIG_RW1_TELEMETRY_PERIOD_MS;
     }
-    s_post_ticks = pdMS_TO_TICKS(per);
 
     /* 设备 id：本函数会被 provisioning 的 httpd 任务调用，而 build_body 在 transport
-     * 任务里读它。**值没变就不写** —— 开机写一次之后基本不再变动，把并发窗口压到最小
-     * （万一真读到半截，服务端只会多出一个设备条目，随后自然过期淘汰，不影响数据）。 */
+     * 任务里读它。**值没变就不写** —— 开机写一次之后基本不再变动，把并发窗口压到最小。 */
     char dev[NET_DEV_MAX];
     net_config_device_id(&cfg, dev, sizeof(dev));
-    if (strcmp(dev, s_device) != 0) {
-        status_lock();
-        strlcpy(s_device, dev, sizeof(s_device));
-        status_unlock();
+    char dev_url[sizeof(s_device_url)];
+    if (!url_encode(dev, dev_url, sizeof(dev_url))) {
+        /* 缓冲按 3 倍留的，正常名字（中文 3 字节 → 9 字符）绝不会到这里。
+         * 真到了就说明设备名太长，截断后服务端会把它当成另一台板 —— 必须可见。 */
+        ESP_LOGW(TAG, "设备名编码后被截断（缓冲 %u 字节）：'%s'",
+                 (unsigned)sizeof(dev_url), dev_url);
     }
 
-    ESP_LOGI(TAG, "server url -> '%s' device -> '%s' (source=%s)",
-             s_url, s_device, net_config_source());
+    status_lock();
+    strlcpy(s_url, cfg.url, sizeof(s_url));
+    s_post_ticks = pdMS_TO_TICKS(per);
+    if (strcmp(dev, s_device) != 0) {
+        strlcpy(s_device, dev, sizeof(s_device));
+        strlcpy(s_device_url, dev_url, sizeof(s_device_url));
+    } else if (strcmp(dev_url, s_device_url) != 0) {
+        strlcpy(s_device_url, dev_url, sizeof(s_device_url));
+    }
+    status_unlock();
+
+    ESP_LOGI(TAG, "server url -> '%s' device -> '%s' (url=%s, %d ms, source=%s)",
+             cfg.url, dev, dev_url, per, net_config_source());
 }
 
 void transport_request_ask(const char *question)
@@ -1579,6 +1853,11 @@ void transport_request_ask(const char *question)
     s_ask_attempts = 0;
     s_ask_pending = true;
     s_btn_pending++;          /* 让服务端/网页能看见"物理按键发生了" */
+    s_ai_active = true;
+    s_ai_started = xTaskGetTickCount();
+    s_ai_saw_pending = false;
+    strlcpy(s_ai_base_reply, s_st.reply, sizeof(s_ai_base_reply));
+    ai_state_set(TRANSPORT_AI_PENDING, NULL);
     status_unlock();
 
     ESP_LOGI(TAG, "ask queued: %s", s_ask_text);
@@ -1589,6 +1868,13 @@ void transport_request_voice(void)
     /* 只置信号量，**绝不在按钮任务里录音** —— 录音要阻塞 3 秒，
      * 会把 iot_button 的任务按住，长按/双击在那 3 秒里全部失灵。 */
     if (s_voice_wake != NULL) {
+        status_lock();
+        s_ai_active = true;
+        s_ai_started = xTaskGetTickCount();
+        s_ai_saw_pending = false;
+        strlcpy(s_ai_base_reply, s_st.reply, sizeof(s_ai_base_reply));
+        ai_state_set(TRANSPORT_AI_PENDING, "正在录音…");
+        status_unlock();
         xSemaphoreGive(s_voice_wake);
         ESP_LOGI(TAG, "语音录制已排队");
     }
@@ -1602,5 +1888,14 @@ void transport_get_status(transport_status_t *out)
     }
     status_lock();
     memcpy(out, &s_st, sizeof(*out));
+    /* 等回复超时：**在读取侧判定**，不改状态机 —— 迟到的回复照样能把它覆盖成 OK。
+     * 没有这一条，服务端一直不回（断网/大模型卡住）时屏幕会永远停在"正在思考…"。 */
+    if (out->ai_state == TRANSPORT_AI_PENDING && s_ai_active &&
+        (xTaskGetTickCount() - s_ai_started) > pdMS_TO_TICKS(AI_WAIT_TIMEOUT_MS)) {
+        out->ai_state = TRANSPORT_AI_FAILED;
+        strlcpy(out->ai_note, "等回复超时，再试一次", sizeof(out->ai_note));
+        s_ask_pending = false;
+        s_ask_attempts = 0;
+    }
     status_unlock();
 }

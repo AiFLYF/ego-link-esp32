@@ -11,10 +11,13 @@
  *             （font-family 写对了但字体没送到浏览器 = 静默退回系统字体，最阴的一种）
  *   颜色   —— 令牌用 OKLCH 定义；没有纯黑/纯白大面积；主色只有一个
  *   圆角   —— 全站非圆形圆角值不超过 3 种，且只能是 6 / 10 / 14
- *   字号   —— hero ≥ 正文 × 3；标题层级步进落在 1.25~1.5
+ *   字号   —— hero ≥ 正文 × 3；标题层级步进落在 1.25~1.5；
+ *             且**页面里不许有裸 px 字号**（全部走 --fs-* 令牌，表单控件的
+ *             16px 是平台约束、单独放行）
  *   间距   —— 令牌严格落在 8px 基准网格上；section 上下 padding ≥ 64
  *   对齐   —— 标题默认左对齐，不居中
- *   布局   —— 1600/1280/900/390/320 五档都不横向溢出
+ *   布局   —— 七档宽度（含两个断点两侧 1281 / 1201）都不横向溢出；
+ *             1280 宽时 AI 卡片必须与读数同一行（两列档门槛不许往上挪）
  *   对比度 —— 关键文字/背景组合过 WCAG AA（正文 4.5、大字 3.0）
  *   弹窗   —— 破坏性操作真的弹自定义弹窗（不是 window.confirm），能开能关
  *   隐藏   —— 带 hidden 的元素必须真的 display:none（作者样式的 display 会盖掉它）
@@ -42,8 +45,11 @@ const logs = [];
 function start(args, tag) {
   const env = Object.assign({}, process.env, {
     no_proxy: '127.0.0.1,localhost', NO_PROXY: '127.0.0.1,localhost',
+    // 与 e2e_dashboard 同一道门禁隔离：.env 里的真实 LLM key 不许进测试子进程。
+    RW1_LLM_API_KEY: '',
   });
   const fs = require('fs');
+  fs.mkdirSync(SHOT_DIR, { recursive: true });
   const logPath = path.join(SHOT_DIR, 'design-' + tag + '.log');
   const fd = fs.openSync(logPath, 'w');
   logs.push(logPath);
@@ -293,7 +299,14 @@ const CONTRAST = `(function(rgb1, rgb2){
 
   page.on('console', m => { if (m.type() === 'error') problems.push('CONSOLE: ' + m.text()); });
   page.on('pageerror', e => problems.push('PAGEERROR: ' + e.message));
-  page.on('requestfailed', r => problems.push('REQFAIL: ' + r.url()));
+  // 同 e2e_dashboard.js：页面收尾会掐断在飞请求，Chrome 报 net::ERR_ABORTED，
+  // 那不是服务端故障。2026-10-30 A/B 实测：未改动的版本同样随机报
+  // /api/stream、/api/latest。只放过 ERR_ABORTED，其余失败照报。
+  page.on('requestfailed', r => {
+    const why = (r.failure() && r.failure().errorText) || '';
+    if (why.indexOf('ERR_ABORTED') >= 0) return;
+    problems.push('REQFAIL: ' + r.url() + ' (' + why + ')');
+  });
   const fontHits = [];
   page.on('response', r => {
     if (r.url().indexOf('/vendor/fonts/') >= 0) fontHits.push([r.status(), r.url()]);
@@ -412,6 +425,40 @@ const CONTRAST = `(function(rgb1, rgb2){
     console.log('     标题步进 ' + steps.map(s => s.toFixed(3) + '×').join('  '));
   });
 
+  await step('字号全部走令牌（页面里没有裸 px 字号）', async () => {
+    /* 2026-10-11 补。设计系统声明"字号只 4 级"，但当时实际散着
+       10.5 / 11 / 11.5px 三种硬编码（13 处）—— 声明和现实对不上，
+       "冻结"就等于半个空话：改一处得找十处，也没人拦得住第 14 处。
+       现在全部归到 --fs-micro / --fs-meta，这条断言守住"以后别再写裸 px"。
+       唯一放行：表单控件上的 16px —— iOS 对上焦时会把 < 16px 的输入框
+       强制放大页面，这是**平台约束**，不是排版选择。 */
+    const r = await page.evaluate(() => {
+      const css = [...document.querySelectorAll('style')]
+        .map(s => s.textContent).join('\n')
+        .replace(/\/\*[\s\S]*?\*\//g, ' ');   // 注释里也会提到 px，先剥掉
+      const bad = [], allowed = [];
+      const re = /\bfont(?:-size)?\s*:\s*([^;{}]*)/g;
+      let m;
+      while ((m = re.exec(css)) !== null) {
+        for (const v of m[1].match(/[\d.]+px/g) || []) {
+          /* 这条声明属于哪个选择器：先找开这条规则的 `{`，
+             再往前找它前面那个 `}`/`{` —— 选择器在 `{` **前面**。
+             （写成"`{` 之后到声明之间"会切出空串，见下面 bad 里 why 字段。） */
+          const before = css.slice(0, m.index);
+          const open = before.lastIndexOf('{');
+          const prev = Math.max(before.lastIndexOf('}', open - 1),
+                                before.lastIndexOf('{', open - 1));
+          const sel = css.slice(prev + 1, open).trim();
+          if (v === '16px' && /(^|,)\s*(input|select)\b/.test(sel)) allowed.push(v);
+          else bad.push(sel.slice(0, 40) + ' → ' + m[1].trim().slice(0, 40));
+        }
+      }
+      return { bad: bad.slice(0, 5), nBad: bad.length, nAllowed: allowed.length };
+    });
+    if (r.nBad) throw new Error('还有 ' + r.nBad + ' 处裸 px 字号：' + JSON.stringify(r.bad));
+    console.log('     字号全部来自令牌（表单控件 16px 例外 ' + r.nAllowed + ' 处）');
+  });
+
   await step('间距令牌全部落在 8px 基准网格上', async () => {
     const r = await page.evaluate(() => {
       const cs = getComputedStyle(document.documentElement);
@@ -458,14 +505,39 @@ const CONTRAST = `(function(rgb1, rgb2){
     console.log('     ' + JSON.stringify(r));
   });
 
-  await step('1600/1280/900/390/320 五档都不横向溢出', async () => {
-    for (const w of [1600, 1280, 900, 390, 320]) {
+  await step('七档宽度都不横向溢出（含两个断点两侧 1281 / 1201）', async () => {
+    /* 只测"整数档"会漏掉断点：两列档门槛降到 1200 之后，最窄的三列布局
+       出现在 1201 —— 那才是最容易挤到溢出的宽度。断点两侧各测一档。 */
+    for (const w of [1600, 1281, 1280, 1201, 900, 390, 320]) {
       await page.setViewportSize({ width: w, height: 900 });
       await sleep(600);
       await assertNoOverflow(w + 'px 下');
     }
     await page.setViewportSize({ width: 1600, height: 1000 });
     await sleep(400);
+  });
+
+  /* 设备列表必须有高度上限（2026-10-11 补）。
+     这张列表原来没有上限：**20 台设备时它有 1117 px 高（窄屏 2116 px）**，
+     把 AI 卡片、曲线、3D 全顶到首屏外面去 —— 而这个项目的第一需求恰恰就是
+     「一个班 20 块板子」，课堂里永远是这个数。当时没人发现，是因为本套 E2E
+     只起 2 块假板子（见 tools/probe_20dev.py：那个才真的喂 20 台进去看）。
+     这里守的是**上限本身**：没有 max-height 就直接红。 */
+  await step('设备列表有高度上限（20 台时不会把主内容顶出首屏）', async () => {
+    const r = await page.evaluate(() => {
+      const el = document.getElementById('devs');
+      if (!el) return { err: '找不到 #devs' };
+      const cs = getComputedStyle(el);
+      return { maxHeight: cs.maxHeight, overflowY: cs.overflowY };
+    });
+    if (r.err) throw new Error(r.err);
+    if (!r.maxHeight || r.maxHeight === 'none') {
+      throw new Error('#devs 没有 max-height —— 设备一多就会把整页撑开（' + r.maxHeight + '）');
+    }
+    if (r.overflowY !== 'auto' && r.overflowY !== 'scroll') {
+      throw new Error('#devs 限了高却没开滚动（overflow-y:' + r.overflowY + '），设备会够不着');
+    }
+    console.log('     max-height:' + r.maxHeight + '  overflow-y:' + r.overflowY);
   });
 
   await step('带 hidden 的元素真的不显示（作者 display 没盖掉它）', async () => {
@@ -496,6 +568,32 @@ const CONTRAST = `(function(rgb1, rgb2){
     }, TO_RGB);
     if (r.solid.length !== 1) throw new Error('实心主色按钮有 ' + r.solid.length + ' 个：' + JSON.stringify(r.solid));
     console.log('     ' + r.total + ' 个按钮里，实心的只有「' + r.solid[0] + '」');
+  });
+
+  await step('1280 宽时 AI 卡片仍与读数同一行（两列档的门槛不许往上挪）', async () => {
+    /* 2026-10-11。两列档的门槛原来是 1280 —— 正好是常见笔记本宽度，
+       于是 1280 宽的窗口里 .hero-ai 被 grid-column:1/-1 挤到第二行；
+       再叠上课堂场景那 20 台设备的设备列表，AI 卡片直接掉出首屏
+       （实测：1280 宽 top=1188 / 首屏 900；1281 宽 top=803 / 在首屏内 ——
+       差 1px、差 385px）。门槛已降到 1200，这条断言钉住"1280 必须还是同一行"。 */
+    await page.setViewportSize({ width: 1280, height: 900 });
+    await sleep(600);
+    const r = await page.evaluate(() => {
+      const top = s => {
+        const e = document.querySelector(s);
+        return e ? Math.round(e.getBoundingClientRect().top) : -1;
+      };
+      const cols = getComputedStyle(document.querySelector('.stage-grid'))
+        .gridTemplateColumns.split(' ').length;
+      return { cols, ai: top('.hero-ai'), readout: top('.hero-readout') };
+    });
+    if (r.cols < 3) throw new Error('1280 宽时 .stage-grid 只有 ' + r.cols + ' 列（要求 3 列）');
+    if (r.ai < 0 || r.readout < 0) throw new Error('页面里找不到 .hero-ai / .hero-readout');
+    if (Math.abs(r.ai - r.readout) > 2) {
+      throw new Error('1280 宽时 AI 卡片被挤到第二行：读数 top=' + r.readout
+                      + ' / AI top=' + r.ai + '（两列档门槛是不是被调回 1280 了？）');
+    }
+    console.log('     1280 宽：' + r.cols + ' 列，AI 卡片与读数同一行（top=' + r.ai + '）');
   });
 
   await step('主操作在首屏内（900px 高的笔记本也不用滚）', async () => {
@@ -545,15 +643,41 @@ const CONTRAST = `(function(rgb1, rgb2){
   await checkContrast();
 
   console.log('\n【弹窗】');
+  let nativeCalled = false;              // 供下面的诊断读到（原生 confirm 有没有被调用）
+  /* 等自定义确认弹窗出现。**失败时把现场一起带出来**（2026-10-11 补）：
+     这一步曾偶发红（5 次里 1 次），报的却是干巴巴的
+     `waitForSelector: Timeout 5000ms exceeded` —— 看不出是"按钮被禁用"、
+     "点到的是被重渲染掉的旧节点"、还是"弹窗弹了但选择器不对"。
+     断言本身不放松（还是 5 秒 + 还是必须出现），只是让失败自带证据。 */
+  const waitConfirmOpen = async (timeout = 5000) => {
+    try {
+      await page.waitForSelector('dialog.modal[open]', { timeout });
+    } catch (e) {
+      const diag = await page.evaluate(() => {
+        const b = document.querySelector('#cmdbts button[data-cmd="sd_format"]');
+        const d = document.querySelector('dialog.modal');
+        return {
+          btnFound: !!b, btnDisabled: b ? b.disabled : null,
+          btnText: b ? b.textContent.trim() : null,
+          dlgs: document.querySelectorAll('dialog.modal').length,
+          hasOpenAttr: d ? d.hasAttribute('open') : null,
+          bodyHasModal: document.body.classList.contains('modal-open'),
+        };
+      });
+      throw new Error('弹窗 5 秒内没出现；现场=' + JSON.stringify(diag)
+                      + '；原生 confirm 被调用=' + nativeCalled
+                      + '；上报错=' + e.message.split('\n')[0]);
+    }
+  };
   await step('破坏性操作弹自定义弹窗（不是 window.confirm），能开能关', async () => {
-    let nativeCalled = false;
+    nativeCalled = false;
     page.on('dialog', async d => { nativeCalled = true; await d.dismiss(); });
     const sentBefore = [];
     page.on('request', r => {
       if (r.method() === 'POST' && r.url().indexOf('/api/command') >= 0) sentBefore.push(r.postData());
     });
     await page.click('#cmdbts button[data-cmd="sd_format"]');
-    await page.waitForSelector('dialog.modal[open]', { timeout: 5000 });
+    await waitConfirmOpen();
     if (nativeCalled) throw new Error('弹的是原生 window.confirm');
     const title = await page.textContent('#cfm-title');
     if (title.indexOf('格式化') < 0) throw new Error('弹窗标题不对：' + title);
@@ -566,7 +690,7 @@ const CONTRAST = `(function(rgb1, rgb2){
     if (sentBefore.length) throw new Error('取消之后居然还是下发了：' + JSON.stringify(sentBefore));
     // Esc 也能关（原生 dialog 行为）
     await page.click('#cmdbts button[data-cmd="sd_format"]');
-    await page.waitForSelector('dialog.modal[open]', { timeout: 5000 });
+    await waitConfirmOpen();
     await page.keyboard.press('Escape');
     await page.waitForFunction(() => !document.querySelector('dialog.modal[open]'),
                               { polling: 100, timeout: 5000 });
@@ -702,6 +826,68 @@ const CONTRAST = `(function(rgb1, rgb2){
     await assertNoOverflow('320px 离线状态下');
     console.log('     320px 窄屏：hero ' + m.hero + 'px / 正文 ' + m.body + 'px = '
                 + (m.hero / m.body).toFixed(2) + '×，无溢出');
+  });
+
+  /* 动效令牌：2026-10-11 新增。原先时长散落成 8 个硬编码值（.06~.7s），
+     收敛成 4 档（dur-1~4）+ 2 条缓动（ease-out / ease-in-out）。
+     这条断言防止"以后有人加新动画时直接写 .3s 而不用令牌" ——
+     时长一旦散开，"精致感"就散了，而且很难再收回来。 */
+  await step('动效令牌已定义且 transition/animation 用令牌', async () => {
+    const r = await page.evaluate(() => {
+      const cs = getComputedStyle(document.documentElement);
+      const d1 = cs.getPropertyValue('--dur-1').trim();
+      const d2 = cs.getPropertyValue('--dur-2').trim();
+      const d3 = cs.getPropertyValue('--dur-3').trim();
+      const d4 = cs.getPropertyValue('--dur-4').trim();
+      const eo = cs.getPropertyValue('--ease-out').trim();
+      const ei = cs.getPropertyValue('--ease-in-out').trim();
+      /* 令牌必须全部存在且非空 */
+      if (!d1 || !d2 || !d3 || !d4 || !eo || !ei) {
+        return { ok: false, reason: '令牌缺失', d1, d2, d3, d4, eo, ei };
+      }
+      /* 扫所有元素的 transition 和 animation，看有没有硬编码秒数 */
+      const violators = [];
+      const all = document.querySelectorAll('*');
+      for (const el of all) {
+        const s = getComputedStyle(el);
+        const tr = s.transition;
+        const an = s.animation;
+        /* transition 里出现 Nms / Ns 但不是 var(--dur-*) 的 → 违规 */
+        /* 注意：getComputedStyle 会把 var() 解析成计算值，所以这里查的是
+           计算后的值 —— 如果值等于某个令牌的值，算通过 */
+        for (const decl of [tr, an]) {
+          if (!decl || decl === 'all 0s ease 0s' || decl === 'none') continue;
+          /* 提取时长部分，检查是否落在 4 档之内 */
+          const times = decl.match(/\d+\.?\d*(ms|s)/g) || [];
+          for (const t of times) {
+            /* 允许的时长值（令牌的最终值） */
+            const allowed = ['150ms', '300ms', '450ms', '700ms', '0.9s', '0s'];
+            /* 0.15s = 150ms, 0.3s = 300ms 等 —— getComputedStyle 可能用秒 */
+            const num = parseFloat(t);
+            const unit = t.endsWith('ms') ? 'ms' : 's';
+            const inMs = unit === 'ms' ? num : num * 1000;
+            if (inMs === 0) continue; /* delay 0s 无所谓 */
+            if (![150, 300, 450, 700, 900].includes(inMs)) {
+              const cn = (el.className && typeof el.className === 'string')
+                ? '.' + el.className.split(/\s+/)[0] : '';
+              violators.push({
+                el: el.tagName + cn,
+                decl: decl.slice(0, 80),
+                time: t,
+              });
+            }
+          }
+        }
+      }
+      if (violators.length > 0) {
+        return { ok: false, reason: '硬编码时长', violators: violators.slice(0, 5) };
+      }
+      return { ok: true, d1, d2, d3, d4 };
+    });
+    if (!r.ok) {
+      throw new Error(r.reason + ': ' + JSON.stringify(r).slice(0, 300));
+    }
+    console.log('     dur-1=' + r.d1 + ' dur-2=' + r.d2 + ' dur-3=' + r.d3 + ' dur-4=' + r.d4);
   });
 
   await step('服务端全程没挂（否则上面的"请求失败"全是它引起的假象）', async () => {

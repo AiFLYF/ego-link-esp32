@@ -4,8 +4,9 @@
  * WiFi STA + Aliyun SNTP (same pattern as biaopan main/time_sync.c, but the
  * link state is exposed as a simple up/down flag for the transport task).
  *
- * 第 4 周：凭据改从 net_config 取（NVS 优先 / 回退 Kconfig），并新增
- * 配网用的 try_sta() —— 见 wifi_link.h 的说明。
+ * 第 4 周：凭据改从 net_config 取；第 5 周起**只**从 NVS 来（Kconfig 回退
+ * 已删 —— 固件里永远不含 WiFi 密码），并新增配网用的 try_sta()
+ * —— 见 wifi_link.h 的说明。
  */
 #include "wifi_link.h"
 
